@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/guswjd/sp/chain/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

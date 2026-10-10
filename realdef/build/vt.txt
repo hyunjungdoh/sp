@@ -1,0 +1,84 @@
+call off=16 found=1 slotStores=131
+  baseIsLoad=1 slotOff=0
+  slotObjs=12
+    obj arg _ZN15decoder_context26decode_slice_unit_parallelEP10image_unitP10slice_unit
+    obj arg _ZN15decoder_context10decode_NALEP8NAL_unit
+    obj arg _ZN15decoder_context14read_slice_NALER9bitreaderP8NAL_unitR10nal_header
+    obj arg de265_decode_data
+    obj arg _ZN15decoder_context11decode_someEPb
+    obj arg _ZN15decoder_context28decode_slice_unit_sequentialEP10image_unitP10slice_unit
+    obj arg _ZN24Algo_CB_MergeIndex_Fixed7analyzeEP15encoder_contextR19context_model_tableP6enc_cb
+    obj inst de265_new_decoder
+    obj arg de265_decode
+  hit store in _ZN12base_contextC2Ev gv=_ZTV12base_context gvOff=16
+  hit store in _ZN15decoder_contextC2Ev gv=_ZTV15decoder_context gvOff=16
+  hits0=2
+  ctor _ZN12base_contextC2Ev off=0 gvOff=16 baseObjs=5 callers=2 gv=_ZTV12base_context
+      caller _ZN15decoder_contextC2Ev
+      caller _ZN15encoder_contextC2Ev
+      arg _ZN15encoder_contextC2Ev
+      en265_new_encoder
+      arg _ZN15decoder_contextC2Ev
+      de265_new_decoder
+      arg _ZN12base_contextC2Ev
+  ctor _ZN15decoder_contextC2Ev off=0 gvOff=16 baseObjs=2 callers=1 gv=_ZTV15decoder_context
+      caller de265_new_decoder
+      de265_new_decoder
+      arg _ZN15decoder_contextC2Ev
+  fn _ZNK15decoder_context9get_imageEi
+call off=16 found=1 slotStores=131
+  baseIsLoad=1 slotOff=0
+  slotObjs=12
+    obj arg _ZN15decoder_context26decode_slice_unit_parallelEP10image_unitP10slice_unit
+    obj inst de265_new_decoder
+    obj arg _ZN15decoder_context10decode_NALEP8NAL_unit
+    obj arg _ZN15decoder_context14read_slice_NALER9bitreaderP8NAL_unitR10nal_header
+    obj arg de265_decode_data
+    obj arg _ZN15decoder_context11decode_someEPb
+    obj arg _ZN15decoder_context28decode_slice_unit_sequentialEP10image_unitP10slice_unit
+    obj arg _ZN24Algo_CB_MergeIndex_Fixed7analyzeEP15encoder_contextR19context_model_tableP6enc_cb
+    obj arg de265_decode
+  hit store in _ZN12base_contextC2Ev gv=_ZTV12base_context gvOff=16
+  hit store in _ZN15decoder_contextC2Ev gv=_ZTV15decoder_context gvOff=16
+  hits0=2
+  ctor _ZN12base_contextC2Ev off=0 gvOff=16 baseObjs=5 callers=2 gv=_ZTV12base_context
+      caller _ZN15decoder_contextC2Ev
+      caller _ZN15encoder_contextC2Ev
+      arg _ZN15encoder_contextC2Ev
+      en265_new_encoder
+      arg _ZN15decoder_contextC2Ev
+      de265_new_decoder
+      arg _ZN12base_contextC2Ev
+  ctor _ZN15decoder_contextC2Ev off=0 gvOff=16 baseObjs=2 callers=1 gv=_ZTV15decoder_context
+      caller de265_new_decoder
+      de265_new_decoder
+      arg _ZN15decoder_contextC2Ev
+  fn _ZNK15decoder_context9get_imageEi
+call off=16 found=1 slotStores=131
+  baseIsLoad=1 slotOff=0
+  slotObjs=12
+    obj arg _ZN15decoder_context26decode_slice_unit_parallelEP10image_unitP10slice_unit
+    obj arg _ZN15decoder_context10decode_NALEP8NAL_unit
+    obj arg _ZN15decoder_context14read_slice_NALER9bitreaderP8NAL_unitR10nal_header
+    obj inst de265_new_decoder
+    obj arg de265_decode_data
+    obj arg _ZN15decoder_context11decode_someEPb
+    obj arg _ZN15decoder_context28decode_slice_unit_sequentialEP10image_unitP10slice_unit
+    obj arg _ZN24Algo_CB_MergeIndex_Fixed7analyzeEP15encoder_contextR19context_model_tableP6enc_cb
+    obj arg de265_decode
+  hit store in _ZN12base_contextC2Ev gv=_ZTV12base_context gvOff=16
+  hit store in _ZN15decoder_contextC2Ev gv=_ZTV15decoder_context gvOff=16
+  hits0=2
+  ctor _ZN12base_contextC2Ev off=0 gvOff=16 baseObjs=5 callers=2 gv=_ZTV12base_context
+      caller _ZN15decoder_contextC2Ev
+      caller _ZN15encoder_contextC2Ev
+      arg _ZN15encoder_contextC2Ev
+      en265_new_encoder
+      arg _ZN15decoder_contextC2Ev
+      de265_new_decoder
+      arg _ZN12base_contextC2Ev
+  ctor _ZN15decoder_contextC2Ev off=0 gvOff=16 baseObjs=2 callers=1 gv=_ZTV15decoder_context
+      caller de265_new_decoder
+      de265_new_decoder
+      arg _ZN15decoder_contextC2Ev
+  fn _ZNK15decoder_context9get_imageEi
