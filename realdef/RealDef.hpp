@@ -17,6 +17,10 @@ struct Def {
   std::string file;
   unsigned line = 0;
   std::string kind;
+  // Argument index when the external object is a parameter. -1 otherwise.
+  int arg = -1;
+  // Chop parameter this input reaches. -1 when this def is not that input.
+  int chopArg = -1;
 };
 
 struct UseDef {
@@ -31,7 +35,9 @@ struct UseDef {
 /// (or out-parameter) is passed into a later upstream argument. Its body
 /// is not part of the points-to fixpoint. A slot the application can write
 /// — a global it can name, an argument it passes, or an object it hands in —
-/// has an external def beside the library stores. A direct call exposes the
+/// has an external def beside the library stores. The named object is a
+/// global the application can name, or a parameter of a function the
+/// downstream calls that reaches the function containing the sink. A direct call exposes the
 /// arguments of that upstream function. An indirect call whose target does
 /// not reduce exposes the objects passed at that call. A slot that reaches
 /// none of those has only the library stores. An object that does not reduce

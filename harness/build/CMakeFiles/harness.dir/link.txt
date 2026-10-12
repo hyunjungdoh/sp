@@ -1,0 +1,2 @@
+/usr/bin/ar qc libharness.a CMakeFiles/harness.dir/Harness.cpp.o
+/usr/bin/ranlib libharness.a

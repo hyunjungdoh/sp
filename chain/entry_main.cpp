@@ -63,7 +63,7 @@ int main(int argc, char **argv) {
     return 1;
   }
   auto chop = chain::findChops(*upstream, *downstream, file, line);
-  auto groups = chain::findEntries(*downstream, chop.chops);
+  auto groups = chain::findEntries(*downstream, *upstream, chop.chops);
   std::string text = chain::formatEntries(chop, groups);
   fs::create_directories(outDir);
   std::ofstream out(outDir / "entry.txt");

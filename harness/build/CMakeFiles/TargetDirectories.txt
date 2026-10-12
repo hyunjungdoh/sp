@@ -1,0 +1,5 @@
+/home/guswjd/sp/harness/build/CMakeFiles/harness.dir
+/home/guswjd/sp/harness/build/CMakeFiles/harness_spec_test.dir
+/home/guswjd/sp/harness/build/CMakeFiles/harness_spec.dir
+/home/guswjd/sp/harness/build/CMakeFiles/edit_cache.dir
+/home/guswjd/sp/harness/build/CMakeFiles/rebuild_cache.dir

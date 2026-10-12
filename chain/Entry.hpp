@@ -123,13 +123,74 @@ namespace chain {
 // left unresolved at another object is not a callee of this load: the same
 // LLVM function type is not the same object. Residual is empty unless a
 // callee remains after that distinction. The distinction is kept.
+//
+// The bytes a query chooses are the parameters of one initial state. An
+// initial state is a strong export that reaches the chop and is a maximal
+// element of that export set: every other strong export that reaches it is
+// reached from it. Exports that reach each other stay. An export reached
+// from outside that class is a later transition, and its parameter is not
+// the external byte.
+//
+// An input line is a root of one chop callsite's actual, walked backward
+// inside the functions reachable from that one export. The walk follows
+// copies: casts, a field address, phi and select, the stored value of a
+// must-alias store, the return of a defined callee, and the actual at a
+// callsite in the cone. A phi is that parameter only when every incoming
+// value has the same roots. A formal is the roots of the actuals passed at
+// the callsites in the cone. A constant operand is not a root. One
+// callsite does not erase another callsite. A declaration in this module
+// has a body when the upstream module defines the same name. That body is
+// the function. A store whose address is derived from the formal that
+// received the object writes the stored pointer into the object. memcpy
+// and memmove do the same with their source. A callee that has no body in
+// either module does not make its other arguments the contents, and its
+// return is not those arguments. A constant or a local argument is not a
+// root. An argument that does not reduce stays open and does not erase an
+// argument that does. The returned pointer is not those arguments. A load
+// whose address did not reduce stays open. A local is not a second input:
+// the roots are the values stored into it before the call.
+// A nameable global is an input only when no parameter of this export is a
+// root of the same actual. Anything that does not reduce stays open, on
+// that export.
+struct Input {
+  std::string func;
+  int arg = -1;
+  int chopArg = -1;
+};
+
+// One may reaching-definition path from the bytes of a chop argument, as
+// read by an export that did not reduce, back to an argument of another
+// export. It is an existential fact: a harness that passes the same object
+// to `func` (argument `arg`) and then to `entry` has a path on which the
+// sink reads those bytes. It is not the determinacy that `input` states;
+// other definitions of the same bytes may still exist. `func` is the symbol
+// name of the export, so the line stays one token per field.
+struct Witness {
+  std::string entry;
+  std::string func;
+  int arg = -1;
+  int chopArg = -1;
+  // The fewest identity-losing steps on any path: a field merged over
+  // every object of its type, or a formal continued into more than one
+  // caller. Zero means the object was followed as one object throughout.
+  int cost = 0;
+};
+
 struct EntryGroup {
   std::string chop;
   std::vector<std::string> entries;
+  std::vector<std::string> initial;
   std::vector<std::string> residual;
+  bool flow = false;
+  std::vector<Input> inputs;
+  // An actual of this export that did not reduce. func is the export.
+  std::vector<Input> unreduced;
+  std::vector<int> openArgs;
+  std::vector<Witness> witnesses;
 };
 
-std::vector<EntryGroup> findEntries(llvm::Module &downstream, const std::vector<std::string> &chops);
+std::vector<EntryGroup> findEntries(llvm::Module &downstream, llvm::Module &upstream,
+                                   const std::vector<std::string> &chops);
 
 std::string formatEntries(const ChopResult &chop, const std::vector<EntryGroup> &groups);
 

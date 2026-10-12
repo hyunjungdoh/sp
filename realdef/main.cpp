@@ -62,6 +62,8 @@ static int runOne(const fs::path &bc, const std::string &file, unsigned line) {
       llvm::outs() << "    def " << d.kind << " " << d.func;
       if (!d.file.empty())
         llvm::outs() << " " << d.file << ":" << d.line;
+      if (d.arg >= 0)
+        llvm::outs() << " arg " << d.arg;
       llvm::outs() << "\n";
     }
   }

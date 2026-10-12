@@ -1,5 +1,6 @@
 #include "RealDef.hpp"
 
+#include "llvm/Demangle/Demangle.h"
 #include "llvm/Analysis/CGSCCPassManager.h"
 #include "llvm/Analysis/LoopAnalysisManager.h"
 #include "llvm/IR/DataLayout.h"
@@ -410,6 +411,53 @@ public:
         return true;
     }
     return false;
+  }
+
+  // Functions that can call `sink`, including `sink`. A callee of the sink
+  // is not in this set.
+  std::unordered_set<const Function *> reaching(const Function *sink) const {
+    std::unordered_set<const Function *> reach;
+    if (!sink)
+      return reach;
+    std::vector<const Function *> q{sink};
+    reach.insert(sink);
+    for (size_t i = 0; i < q.size(); ++i) {
+      auto it = callers_.find(q[i]);
+      if (it == callers_.end())
+        continue;
+      for (const CallBase *C : it->second) {
+        const Function *P = C->getFunction();
+        if (P && reach.insert(P).second)
+          q.push_back(P);
+      }
+    }
+    return reach;
+  }
+
+  // The named object is a global the application can name, or a parameter of
+  // a function the downstream calls that reaches the function containing the
+  // sink. Another allocation that merely aliases the pointer is not that
+  // parameter.
+  std::vector<const Value *> exposedPlaces(const RootSet &want, const Function *sinkFn) const {
+    std::vector<const Value *> out;
+    if (!ds_ || want.empty() || !sinkFn)
+      return out;
+    ensureExposed();
+    const auto reach = reaching(sinkFn);
+    for (const Value *v : want) {
+      if (const auto *GV = dyn_cast<GlobalVariable>(v)) {
+        if (!GV->hasLocalLinkage() && !GV->hasHiddenVisibility())
+          out.push_back(v);
+        continue;
+      }
+      const auto *A = dyn_cast<Argument>(v);
+      if (!A)
+        continue;
+      const Function *P = A->getParent();
+      if (dsCalled_.count(P) && reach.count(P))
+        out.push_back(v);
+    }
+    return out;
   }
 
   void ensureExposed() const {
@@ -4305,6 +4353,56 @@ std::vector<const LoadInst *> usesOf(const Instruction *sink) {
   return loads;
 }
 
+std::string pretty(StringRef n) {
+  if (n.empty())
+    return {};
+  std::string d = llvm::demangle(n.str());
+  if (d.empty() || d == n)
+    return n.str();
+  return d;
+}
+
+Def externalDef(const Value *v) {
+  Def d;
+  d.kind = "external";
+  if (!v)
+    return d;
+  if (const auto *GV = dyn_cast<GlobalVariable>(v)) {
+    d.func = pretty(GV->getName());
+    return d;
+  }
+  if (const auto *A = dyn_cast<Argument>(v)) {
+    d.func = pretty(A->getParent()->getName());
+    d.arg = static_cast<int>(A->getArgNo());
+    return d;
+  }
+  if (const auto *I = dyn_cast<Instruction>(v)) {
+    d.func = pretty(I->getFunction()->getName());
+    if (const DebugLoc &dl = I->getDebugLoc()) {
+      d.line = dl.getLine();
+      if (dl->getScope() && dl->getScope()->getFile())
+        d.file = baseName(dl->getScope()->getFile()->getFilename());
+    }
+    return d;
+  }
+  d.func = pretty(v->getName());
+  return d;
+}
+
+void noteExternal(UseDef &ud, const RootSet &want, const Flow &flow, const Function *sinkFn) {
+  if (!flow.exposed(want))
+    return;
+  auto ws = flow.exposedPlaces(want, sinkFn);
+  if (ws.empty()) {
+    Def ext;
+    ext.kind = "external";
+    ud.defs.push_back(std::move(ext));
+    return;
+  }
+  for (const Value *v : ws)
+    ud.defs.push_back(externalDef(v));
+}
+
 Def fromInst(const Instruction *I, StringRef kind) {
   Def d;
   d.kind = kind.str();
@@ -4479,7 +4577,8 @@ std::vector<UseDef> findDefs(Module &M, const std::string &file, unsigned line, 
     std::unordered_set<std::string> uniq;
     std::vector<Def> deduped;
     for (const Def &d : ud.defs) {
-      std::string k = d.kind + " " + d.func + " " + d.file + ":" + std::to_string(d.line);
+      std::string k = d.kind + " " + d.func + " " + d.file + ":" + std::to_string(d.line) + "#" +
+                      std::to_string(d.arg);
       if (uniq.insert(k).second)
         deduped.push_back(d);
     }
@@ -4504,11 +4603,7 @@ std::vector<UseDef> findDefs(Module &M, const std::string &file, unsigned line, 
       RootSet want = flow.objects(cur->getPointerOperand());
       auto stores = flow.aliasingStores(cur->getPointerOperand(), cur->getType(), want);
       auto inits = flow.aliasingInits(cur->getPointerOperand(), cur->getType(), want);
-      if (flow.exposed(want)) {
-        Def ext;
-        ext.kind = "external";
-        ud.defs.push_back(std::move(ext));
-      }
+      noteExternal(ud, want, flow, L->getFunction());
       if (stores.empty() && inits.empty())
         continue;
       takeStores(ud, cur, stores, work, reported);
@@ -4535,11 +4630,7 @@ std::vector<UseDef> findDefs(Module &M, const std::string &file, unsigned line, 
         if (!followed.insert(cur).second)
           continue;
         RootSet want = flow.objects(cur->getPointerOperand());
-        if (flow.exposed(want)) {
-          Def ext;
-          ext.kind = "external";
-          ud.defs.push_back(std::move(ext));
-        }
+        noteExternal(ud, want, flow, C->getFunction());
         auto stores = flow.aliasingStores(cur->getPointerOperand(), cur->getType(), want);
         auto inits = flow.aliasingInits(cur->getPointerOperand(), cur->getType(), want);
         takeStores(ud, C, stores, work, reported);
@@ -4552,11 +4643,7 @@ std::vector<UseDef> findDefs(Module &M, const std::string &file, unsigned line, 
       if (!seenAddr.insert(addr).second)
         continue;
       RootSet want = flow.objects(addr);
-      if (flow.exposed(want)) {
-        Def ext;
-        ext.kind = "external";
-        ud.defs.push_back(std::move(ext));
-      }
+      noteExternal(ud, want, flow, C->getFunction());
       std::optional<uint64_t> nlen;
       if (addr == src && C->arg_size() >= 3)
         if (const auto *CI = dyn_cast<ConstantInt>(C->getArgOperand(2)))
