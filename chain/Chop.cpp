@@ -553,7 +553,7 @@ void fillCallers(
               }
               suffix += LC->getSExtValue() * (int64_t)DL.getTypeAllocSize(A2->getElementType());
               cur = A2->getElementType();
-            } else {
+  } else {
               ok = false;
               break;
             }
@@ -567,7 +567,7 @@ void fillCallers(
             sawField = true;
           }
           ok = false;
-          break;
+      break;
         }
         if (ok && sawField)
           deltas.push_back(delta);
@@ -649,7 +649,7 @@ void fillCallers(
     unsigned n = std::min<unsigned>(C->arg_size(), F->arg_size());
     for (unsigned i = 0; i < n; ++i) {
       if (!C->getArgOperand(i)->getType()->isPointerTy())
-        continue;
+      continue;
       if (!F->getArg(i)->getType()->isPointerTy())
         continue;
       copies[C->getArgOperand(i)].push_back(F->getArg(i));
@@ -789,8 +789,8 @@ void fillCallers(
           on[w] = 0;
           comp.push_back(w);
           if (w == u)
-            break;
-        }
+    break;
+  }
         sccs.push_back(std::move(comp));
       }
     };
@@ -871,10 +871,10 @@ void fillCallers(
       std::unordered_set<const llvm::Value *> carriers;
       bool ok = true;
       for (const llvm::Value *rv : rets[&F]) {
-        std::unordered_set<const llvm::Value *> seen;
+    std::unordered_set<const llvm::Value *> seen;
         if (!fresh(fresh, rv, seen)) {
           ok = false;
-          break;
+        break;
         }
         carriers.insert(seen.begin(), seen.end());
       }
@@ -1106,7 +1106,7 @@ void fillCallers(
             for (const llvm::Value *dst : it->second)
               notify(dst);
         }
-        continue;
+      continue;
       }
       if (auto it = copies.find(v); it != copies.end()) {
         auto &cs = it->second;
@@ -1194,7 +1194,7 @@ void fillCallers(
                   give(g.dst, any(ext(st)));
               } else
                 give(g.dst, any(m0));
-              continue;
+        continue;
             }
             if (g.elem)
               continue;
@@ -1800,13 +1800,13 @@ void fillCallers(
 
     std::unordered_set<const llvm::Function *> seeds;
     for (llvm::Function &F : M) {
-      if (F.isDeclaration())
-        continue;
+    if (F.isDeclaration())
+      continue;
       const Org &org = ensureOrg(&F);
       for (const llvm::Instruction &I : llvm::instructions(F)) {
-        const auto *S = llvm::dyn_cast<llvm::StoreInst>(&I);
-        if (!S)
-          continue;
+      const auto *S = llvm::dyn_cast<llvm::StoreInst>(&I);
+      if (!S)
+        continue;
         unsigned a = 0;
         if (isGenStore(S, org, a) || isKillStore(S, org, a))
           seeds.insert(&F);
@@ -1833,7 +1833,7 @@ void fillCallers(
           for (const llvm::Instruction &I : llvm::instructions(*E)) {
             const auto *C = llvm::dyn_cast<llvm::CallBase>(&I);
             if (!C || !C->isIndirectCall())
-              continue;
+        continue;
             bool hit = false;
             dumpPts(C->getCalledOperand(), [&](P p) {
               if (p.k == 2 && live.count(static_cast<const llvm::Function *>(p.obj)))
@@ -1863,7 +1863,7 @@ void fillCallers(
         std::vector<const Mem *> r;
         auto take = [&](const llvm::Value *v) {
           if (!v)
-            return;
+      return;
           dumpPts(v, [&](P p) {
             if (p.k == 0 && p.off == 0)
               r.push_back(static_cast<const Mem *>(p.obj));
@@ -1935,7 +1935,7 @@ void fillCallers(
       auto spread = [&](const llvm::Function *F, State &st) {
         auto git = groups.find(F);
         if (git == groups.end())
-          return;
+      return;
         for (const auto &g : git->second) {
           St u;
           for (const Key &k : g) {
@@ -1967,7 +1967,7 @@ void fillCallers(
       auto takeFn = [&](const llvm::Function *F, St &s, const llvm::Value *v) {
         if (!v) {
           s.top = true;
-          return;
+      return;
         }
         const llvm::Value *x = v;
         std::unordered_set<const llvm::Value *> seen;
@@ -2011,7 +2011,7 @@ void fillCallers(
           // A callee path that is not a parameter or one field of the caller
           // is outside the paths this summary names. It does not rewrite them.
           if (!translate(caller, call, kv.first, ck))
-            continue;
+      continue;
           const St &sm = kv.second;
           St got;
           if (!sm.kill) {
@@ -2100,7 +2100,7 @@ void fillCallers(
             for (const llvm::BasicBlock *pred : llvm::predecessors(BB)) {
               auto pit = edge.find(pred);
               if (pit == edge.end())
-                continue;
+      continue;
               auto eit = pit->second.find(BB);
               if (eit == pit->second.end())
                 continue;
@@ -2152,7 +2152,7 @@ void fillCallers(
                     take = wantsEq ? eqv : !eqv;
                   }
                   if (!take)
-                    continue;
+      continue;
                   State one = applySum(F, cur, p.st, split);
                   acc = first ? std::move(one) : joinState(acc, one);
                   first = false;
@@ -2263,9 +2263,9 @@ void fillCallers(
           return;
         stackF.insert(F);
         for (const llvm::Instruction &I : llvm::instructions(*F)) {
-          const auto *C = llvm::dyn_cast<llvm::CallBase>(&I);
-          if (!C)
-            continue;
+      const auto *C = llvm::dyn_cast<llvm::CallBase>(&I);
+      if (!C)
+        continue;
           for (const llvm::Function *T : targetsOf(C))
             if (live.count(T) && !stackF.count(T))
               dfs(T);
@@ -2378,15 +2378,15 @@ void fillCallers(
           for (const llvm::Instruction &I : llvm::instructions(*F)) {
             const auto *C = llvm::dyn_cast<llvm::CallBase>(&I);
             if (!C)
-              continue;
+        continue;
             auto at = atCall.find(C);
             for (const llvm::Function *G : targetsOf(C)) {
               if (!live.count(G))
-                continue;
+        continue;
               for (const Key &k : mentioned(G)) {
                 Key ck;
                 if (!translate(F, C, k, ck))
-                  continue;
+          continue;
                 const St *sp = nullptr;
                 if (at != atCall.end())
                   if (auto it = at->second.find(ck); it != at->second.end())
@@ -2407,7 +2407,7 @@ void fillCallers(
         while (v) {
           if (const auto *C = llvm::dyn_cast<llvm::CastInst>(v)) {
             v = C->getOperand(0);
-            continue;
+          continue;
           }
           if (const auto *Fr = llvm::dyn_cast<llvm::FreezeInst>(v)) {
             v = Fr->getOperand(0);
@@ -2607,10 +2607,10 @@ bool mixedStruct(const llvm::StructType *ST) {
 void noteField(FieldMap &field, const llvm::DataLayout &DL, const llvm::StructType *ST, int64_t off,
                const llvm::Function *F, const std::string &spec, bool init) {
   if (!mixedStruct(ST) || !F || off < 0)
-    return;
+      return;
   auto sz = DL.getTypeAllocSize(const_cast<llvm::StructType *>(ST));
   if (sz.isScalable() || sz.getFixedValue() == 0)
-    return;
+      return;
   int64_t o = off % (int64_t)sz.getFixedValue();
   if (o < 0)
     o += (int64_t)sz.getFixedValue();
@@ -2827,10 +2827,10 @@ ChopResult findChops(llvm::Module &upstream, llvm::Module &downstream, const std
       // The target does not reduce to one callee. The functions that reach
       // this operand do. The LLVM function type is not that set.
       if (C->isInlineAsm() || !C->isIndirectCall())
-        continue;
+          continue;
       reachCall(C->getCalledOperand(), C, upstream, fields, called);
+      }
     }
-  }
   r.called = (unsigned)called.size();
 
   promote(upstream);

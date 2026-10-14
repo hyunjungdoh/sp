@@ -1,4 +1,5 @@
 #include "Entry.hpp"
+#include "Points.hpp"
 
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/MemoryBuiltins.h"
@@ -16,6 +17,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/Passes/PassBuilder.h"
+#include "llvm/Transforms/Utils/BuildLibCalls.h"
 #include <algorithm>
 #include <cstdint>
 #include <functional>
@@ -3544,10 +3546,7 @@ bool byteCopy(const llvm::CallBase *C, const llvm::Value *&dst, const llvm::Valu
 // A call that returns fresh storage. The memory it returns holds no bytes
 // yet, so an allocation without a body is not an outside source of bytes.
 // This is the compiler's own library model, under the same rules as above.
-bool allocates(const llvm::CallBase *C) {
-  const llvm::Function *F = C ? C->getCalledFunction() : nullptr;
-  if (!F)
-    return false;
+const llvm::TargetLibraryInfo *libraryInfo(const llvm::Function *F) {
   static std::string triple;
   static std::unique_ptr<llvm::TargetLibraryInfoImpl> impl;
   static std::unique_ptr<llvm::TargetLibraryInfo> info;
@@ -3557,7 +3556,132 @@ bool allocates(const llvm::CallBase *C) {
     impl = std::make_unique<llvm::TargetLibraryInfoImpl>(llvm::Triple(t));
     info = std::make_unique<llvm::TargetLibraryInfo>(*impl);
   }
-  return llvm::isAllocationFn(C, info.get());
+  return info.get();
+}
+
+// The compiler's model of a library allocation. Since LLVM 16 the
+// allocating library functions are described by the attributes the
+// compiler infers for them (allockind, allocsize, allocptr) rather than by
+// a table; modules compiled without optimization carry none of those, so
+// they are inferred here on a copy of the declaration, in a scratch module
+// with the same layout, leaving the analysed modules untouched. The
+// remaining table entries (operator new, strdup) are still found by the
+// library-info lookup.
+struct LibAlloc {
+  bool alloc = false;    // returns fresh memory
+  bool realloc = false;  // ... holding the contents of its pointer argument
+  int ptrArg = -1;       // the argument a reallocation replaces
+  std::optional<unsigned> sizeArg, countArg;  // allocsize operands
+};
+const LibAlloc &libAlloc(const llvm::Function *F) {
+  static std::map<std::pair<std::string, const llvm::FunctionType *>, LibAlloc> memo;
+  auto key = std::make_pair(F->getName().str(), F->getFunctionType());
+  auto it = memo.find(key);
+  if (it != memo.end())
+    return it->second;
+  LibAlloc m;
+  // A scratch module of the function's context, alive only for this
+  // question: one kept across calls would outlive the context.
+  llvm::LLVMContext &Ctx = F->getContext();
+  auto S = std::make_unique<llvm::Module>("libmodel", Ctx);
+  S->setDataLayout(F->getParent()->getDataLayout());
+  S->setTargetTriple(F->getParent()->getTargetTriple());
+  llvm::Function *copy =
+      llvm::Function::Create(F->getFunctionType(), llvm::GlobalValue::ExternalLinkage, F->getName(), *S);
+  llvm::inferNonMandatoryLibFuncAttrs(*copy, *libraryInfo(F));
+  if (copy->hasFnAttribute(llvm::Attribute::AllocKind)) {
+    const llvm::AllocFnKind k = copy->getFnAttribute(llvm::Attribute::AllocKind).getAllocKind();
+    m.alloc = (k & llvm::AllocFnKind::Alloc) != llvm::AllocFnKind::Unknown;
+    m.realloc = (k & llvm::AllocFnKind::Realloc) != llvm::AllocFnKind::Unknown;
+  }
+  if (copy->hasFnAttribute(llvm::Attribute::AllocSize)) {
+    auto sz = copy->getFnAttribute(llvm::Attribute::AllocSize).getAllocSizeArgs();
+    m.sizeArg = sz.first;
+    m.countArg = sz.second;
+  }
+  for (unsigned i = 0; i < copy->arg_size(); ++i)
+    if (copy->getArg(i)->hasAttribute(llvm::Attribute::AllocatedPointer))
+      m.ptrArg = static_cast<int>(i);
+  copy->eraseFromParent();
+  return memo.emplace(key, m).first->second;
+}
+
+// A call that returns fresh storage, by the compiler's library model.
+bool allocates(const llvm::CallBase *C) {
+  const llvm::Function *F = C ? C->getCalledFunction() : nullptr;
+  if (!F)
+    return false;
+  if (llvm::isAllocationFn(C, libraryInfo(F)))
+    return true;
+  const LibAlloc &m = libAlloc(F);
+  return m.alloc || m.realloc;
+}
+
+// The memory whose contents an allocating call's result holds. A plain
+// allocation (malloc, calloc, new) holds none; a reallocation holds the
+// memory it replaces; a string duplication holds the string.
+const llvm::Value *allocSource(const llvm::CallBase *C) {
+  const llvm::Function *F = C ? C->getCalledFunction() : nullptr;
+  if (!F)
+    return nullptr;
+  const llvm::TargetLibraryInfo *TLI = libraryInfo(F);
+  const LibAlloc &m = libAlloc(F);
+  if (m.realloc && m.ptrArg >= 0 && static_cast<unsigned>(m.ptrArg) < C->arg_size())
+    return C->getArgOperand(static_cast<unsigned>(m.ptrArg));
+  if (m.alloc || m.realloc)
+    return nullptr;
+  if (!llvm::isAllocationFn(C, TLI) || llvm::isMallocOrCallocLikeFn(C, TLI))
+    return nullptr;
+  for (const llvm::Value *a : C->args())
+    if (a->getType()->isPointerTy())
+      return a;
+  return nullptr;
+}
+
+// The operands of an allocating call that give its size.
+std::optional<std::pair<unsigned, std::optional<unsigned>>> allocSizeArgs(const llvm::CallBase *C) {
+  const llvm::Function *F = C ? C->getCalledFunction() : nullptr;
+  if (!F)
+    return std::nullopt;
+  const LibAlloc &m = libAlloc(F);
+  if (m.sizeArg)
+    return std::make_pair(*m.sizeArg, m.countArg);
+  return std::nullopt;
+}
+
+// The size an allocating call requests, when it is a constant.
+std::optional<uint64_t> allocSize(const llvm::CallBase *C) {
+  const llvm::Function *F = C ? C->getCalledFunction() : nullptr;
+  if (!F)
+    return std::nullopt;
+  const LibAlloc &m = libAlloc(F);
+  if (m.sizeArg) {
+    if (*m.sizeArg >= C->arg_size())
+      return std::nullopt;
+    const auto *S = llvm::dyn_cast<llvm::ConstantInt>(C->getArgOperand(*m.sizeArg));
+    if (!S || S->getValue().getActiveBits() > 62)
+      return std::nullopt;
+    uint64_t sz = S->getZExtValue();
+    if (m.countArg) {
+      if (*m.countArg >= C->arg_size())
+        return std::nullopt;
+      const auto *N = llvm::dyn_cast<llvm::ConstantInt>(C->getArgOperand(*m.countArg));
+      if (!N || N->getValue().getActiveBits() > 62)
+        return std::nullopt;
+      llvm::APInt prod = S->getValue().zext(128) * N->getValue().zext(128);
+      if (prod.getActiveBits() > 62)
+        return std::nullopt;
+      sz = prod.getZExtValue();
+    }
+    return sz;
+  }
+  const llvm::TargetLibraryInfo *TLI = libraryInfo(F);
+  if (!llvm::isAllocationFn(C, TLI))
+    return std::nullopt;
+  std::optional<llvm::APInt> sz = llvm::getAllocSize(C, TLI);
+  if (!sz || sz->getActiveBits() > 62)
+    return std::nullopt;
+  return sz->getZExtValue();
 }
 
 void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
@@ -7604,64 +7728,35 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
   std::unordered_map<std::string, std::unordered_set<std::string>> seenIn;
   std::unordered_map<std::string, std::unordered_set<std::string>> seenOpen;
   std::unordered_map<std::string, std::unordered_set<std::string>> seenWit;
-  // Module-wide facts for the existential witness. `sites` above is limited
-  // to the functions that reach the chop; a function that only prepares the
-  // object another export later reads is outside that set, so its calls
-  // and its stores are indexed here over the whole module, once.
-  struct FieldKey {
-    const llvm::Type *ty = nullptr;
-    std::vector<uint64_t> idx;
-    bool operator<(const FieldKey &o) const {
-      if (ty != o.ty)
-        return ty < o.ty;
-      return idx < o.idx;
+  // The witness walk asks where memory comes from: which object a pointer
+  // points at, and which stores write that object. Those questions are
+  // answered by one points-to analysis over both modules, by allocation
+  // site and byte offset, shared by every entry. A call through a pointer
+  // reaches the functions the solution puts in that pointer, and nothing
+  // else: binding every function of the call's type as well would merge
+  // every object such calls are handed into one. Its bodies are looked up
+  // across the two modules; its harness formals are the exports' formals.
+  std::unique_ptr<Points> points;
+  auto pointsOf = [&]() -> Points & {
+    if (!points) {
+      Points::Hooks h;
+      h.body = [&](const llvm::Function *F) { return definedBody(F); };
+      h.harness = [&](const llvm::Function *F) { return F && F->getParent() == &M && strongExport(F); };
+      h.allocates = [](const llvm::CallBase *C) { return allocates(C); };
+      h.allocSize = [](const llvm::CallBase *C) { return allocSize(C); };
+      h.allocSource = [](const llvm::CallBase *C) { return allocSource(C); };
+      h.allocSizeArgs = [](const llvm::CallBase *C) { return allocSizeArgs(C); };
+      h.byteCopy = [](const llvm::CallBase *C, const llvm::Value *&d, const llvm::Value *&s) {
+        return byteCopy(C, d, s);
+      };
+      points = std::make_unique<Points>(M, upstream, std::move(h));
+      points->saturate();
     }
+    return *points;
   };
-  struct WitIndex {
-    bool built = false;
-    std::unordered_map<const llvm::Function *, std::vector<const llvm::CallBase *>> callers;
-    // Stores and byte copies into a field, by its struct type and path.
-    std::map<FieldKey, std::vector<const llvm::Instruction *>> defs;
-    // Pointer loads from a field, by its struct type and path. The buffer a
-    // field holds is written through whichever load of that field.
-    std::map<FieldKey, std::vector<const llvm::LoadInst *>> loads;
-  } witIdx;
-  // Per-function facts for the walk, built once per function on first use.
-  // The walk asks the same questions of a function for many states: which
-  // instructions address a pointer derived from a given value, which stores
-  // hold a given value, which values flow to a return, and which stores
-  // and copies hit a given cell. Each is indexed by its key so one state
-  // costs its answers rather than a scan of the function.
-  struct FnWit {
-    bool built = false;
-    std::unordered_map<const llvm::Value *, std::vector<const llvm::Instruction *>> byBase;
-    std::unordered_map<const llvm::Value *, std::vector<const llvm::StoreInst *>> storedAs;
-    std::unordered_set<const llvm::Value *> returned;
-    struct CellDef {
-      std::vector<uint64_t> idx;
-      const llvm::Instruction *inst = nullptr;
-    };
-    std::unordered_map<const llvm::Value *, std::vector<CellDef>> cells;
-    // Pointer loads from a cell, by root.
-    std::unordered_map<const llvm::Value *, std::vector<CellDef>> cellLoads;
-  };
-  std::unordered_map<const llvm::Function *, FnWit> fnWit;
   // The witness of a chop actual depends on that value alone; every export
   // whose walk reaches the same call shares it.
   std::unordered_map<const llvm::Value *, std::map<std::pair<std::string, int>, int>> witMemo;
-  // The pointers stored into a cell, found by following the cell's
-  // object while it is one object (locals, formals through their actual or
-  // their one caller, call results through their callees, callees handed
-  // the object). Each pointer comes with the context it was found in and
-  // the cost of the path to it; merged is the least cost at which the
-  // object could not be followed further, or -1 when it was followed
-  // completely.
-  struct Prov {
-    bool done = false;
-    std::map<std::pair<const llvm::Value *, const llvm::CallBase *>, int> vals;
-    int merged = -1;
-  };
-  std::map<std::tuple<const llvm::Value *, const llvm::Type *, std::vector<uint64_t>, const llvm::CallBase *>, Prov> provMemo;
   for (size_t id = 0; id < entryFns.size(); ++id) {
     ei = static_cast<int>(id);
     entryFn = entryFns[id];
@@ -13619,305 +13714,26 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
         w.cost = cost;
         witnesses[chop].push_back(std::move(w));
       };
-      // A cell named by its object root, the struct type the first index
-      // selects from, and the constant index path. The type and path are the
-      // field identity shared by every object of that type.
-      auto typedCell = [&](const llvm::Value *addr, const llvm::Type *&ty,
-                           std::vector<uint64_t> &idx) -> const llvm::Value * {
-        ty = nullptr;
-        idx.clear();
-        const llvm::Value *cur = peel(addr);
-        std::unordered_set<const llvm::Value *> sc;
-        while (cur && sc.insert(cur).second) {
-          if (const auto *G = llvm::dyn_cast<llvm::GEPOperator>(cur)) {
-            std::vector<uint64_t> add;
-            bool all = true;
-            for (unsigned oi = 1; oi < G->getNumOperands(); ++oi) {
-              const auto *CI = llvm::dyn_cast<llvm::ConstantInt>(G->getOperand(oi));
-              if (!CI) {
-                all = false;
-                break;
-              }
-              add.push_back(CI->getZExtValue());
-            }
-            if (!all)
-              break;
-            // The path already collected starts with the pointer index of
-            // the getelementptr nearer the field. Under this outer one it
-            // is a step from the field that one selects: zero is that
-            // field itself and is dropped, so the path is one type path;
-            // anything else is pointer arithmetic, and the inner result is
-            // the root.
-            if (!idx.empty()) {
-              if (idx.front() != 0)
-                break;
-              idx.erase(idx.begin());
-            }
-            idx.insert(idx.begin(), add.begin(), add.end());
-            ty = G->getSourceElementType();
-            cur = peel(G->getPointerOperand());
-            continue;
-          }
-          if (const auto *L = llvm::dyn_cast<llvm::LoadInst>(cur)) {
-            if (const auto *AI = llvm::dyn_cast<llvm::AllocaInst>(peel(L->getPointerOperand()))) {
-              if (const llvm::Value *st = spillValue(AI)) {
-                cur = peel(st);
-                continue;
-              }
-            }
-          }
-          break;
-        }
-        return cur;
-      };
-      // The type a path selects inside a struct type: the first index steps
-      // the pointer, each later one selects a member or an element. Null
-      // when the path does not fit the type.
-      auto fieldType = [&](const llvm::Type *ty, const std::vector<uint64_t> &idx) -> const llvm::Type * {
-        if (!ty || idx.empty())
-          return nullptr;
-        const llvm::Type *cur = ty;
-        for (size_t i = 1; i < idx.size(); ++i) {
-          if (const auto *ST = llvm::dyn_cast<llvm::StructType>(cur)) {
-            if (idx[i] >= ST->getNumElements())
-              return nullptr;
-            cur = ST->getElementType(static_cast<unsigned>(idx[i]));
-          } else if (const auto *AT = llvm::dyn_cast<llvm::ArrayType>(cur)) {
-            cur = AT->getElementType();
-          } else if (const auto *VT = llvm::dyn_cast<llvm::VectorType>(cur)) {
-            cur = VT->getElementType();
-          } else {
-            return nullptr;
-          }
-        }
-        return cur;
-      };
-      auto buildWit = [&]() {
-        if (witIdx.built)
-          return;
-        witIdx.built = true;
-        // Both modules: the upstream body registers the callbacks and holds
-        // the fields the sink's library reads; the downstream module holds
-        // the exports and the objects the harness supplies.
-        std::vector<const llvm::Module *> mods{&M, &upstream};
-        for (const llvm::Module *Mod : mods)
-        for (const llvm::Function &F : *Mod) {
-          if (F.isDeclaration())
-            continue;
-          for (const llvm::Instruction &I : llvm::instructions(F)) {
-            if (const auto *C = llvm::dyn_cast<llvm::CallBase>(&I)) {
-              if (C->isInlineAsm())
-                continue;
-              std::vector<const llvm::Function *> cs = solve.callees(C, false);
-              if (const llvm::Function *D = C->getCalledFunction()) {
-                bool have = false;
-                for (const llvm::Function *E : cs)
-                  if (E == D)
-                    have = true;
-                if (!have)
-                  cs.push_back(D);
-              }
-              for (const llvm::Function *D : cs)
-                if (D)
-                  witIdx.callers[D].push_back(C);
-              const llvm::Value *dst = nullptr;
-              const llvm::Value *src = nullptr;
-              if (byteCopy(C, dst, src)) {
-                const llvm::Type *ty = nullptr;
-                std::vector<uint64_t> idx;
-                typedCell(dst, ty, idx);
-                if (ty && !idx.empty())
-                  witIdx.defs[FieldKey{ty, idx}].push_back(C);
-              }
-              continue;
-            }
-            if (const auto *SI = llvm::dyn_cast<llvm::StoreInst>(&I)) {
-              const llvm::Type *ty = nullptr;
-              std::vector<uint64_t> idx;
-              typedCell(SI->getPointerOperand(), ty, idx);
-              if (ty && !idx.empty())
-                witIdx.defs[FieldKey{ty, idx}].push_back(SI);
-              continue;
-            }
-            if (const auto *LI = llvm::dyn_cast<llvm::LoadInst>(&I)) {
-              if (!LI->getType()->isPointerTy())
-                continue;
-              const llvm::Type *ty = nullptr;
-              std::vector<uint64_t> idx;
-              typedCell(LI->getPointerOperand(), ty, idx);
-              if (ty && !idx.empty())
-                witIdx.loads[FieldKey{ty, idx}].push_back(LI);
-            }
-          }
-        }
-      };
       auto alphabet = [&](const llvm::Function *F) { return F && F->getParent() == &M && strongExport(F); };
-      std::unordered_map<const llvm::CallBase *, std::vector<const llvm::Function *>> mayMemo;
-      auto mayCallees = [&](const llvm::CallBase *C) -> const std::vector<const llvm::Function *> & {
-        auto it = mayMemo.find(C);
-        if (it != mayMemo.end())
-          return it->second;
-        std::vector<const llvm::Function *> cs = solve.callees(C, false);
-        if (cs.empty())
-          cs = solve.slotMay(C);
-        return mayMemo.emplace(C, std::move(cs)).first->second;
+      // The bits a choice among n alternatives gives up, in hundredths.
+      auto bits = [](size_t n) -> int {
+        if (n <= 1)
+          return 0;
+        return static_cast<int>(std::lround(std::log2(static_cast<double>(n)) * 100.0));
       };
-      // Call sites are indexed by the function object they name in M; a
-      // body found in the upstream module is looked up through M's
-      // declaration of the same symbol.
-      static const std::vector<const llvm::CallBase *> noCallers;
-      std::unordered_map<const llvm::Function *, std::vector<const llvm::CallBase *>> callersMemo;
-      auto callersOf = [&](const llvm::Function *F) -> const std::vector<const llvm::CallBase *> & {
-        if (!F)
-          return noCallers;
-        auto cm = callersMemo.find(F);
-        if (cm != callersMemo.end())
-          return cm->second;
-        std::vector<const llvm::Function *> names{F};
-        if (F->getParent() != &M && F->hasName()) {
-          if (const llvm::Function *Decl = M.getFunction(F->getName()))
-            names.push_back(Decl);
-        } else if (F->isDeclaration()) {
-          if (const llvm::Function *Body = definedBody(F))
-            if (Body != F)
-              names.push_back(Body);
-        }
-        std::vector<const llvm::CallBase *> all;
-        for (const llvm::Function *N : names) {
-          auto it = witIdx.callers.find(N);
-          if (it != witIdx.callers.end())
-            all.insert(all.end(), it->second.begin(), it->second.end());
-        }
-        return callersMemo.emplace(F, std::move(all)).first->second;
-      };
-      // The functions a pointer field can hold: every value stored into that
-      // field of that struct type, followed through formals to the actuals of
-      // every caller, through phi and select, through a load to the stores of
-      // its cell or to the initializer of its global, and through a call
-      // result to the callee's returns. This resolves a call through a
-      // function pointer that a registration call stored into the object.
-      std::map<FieldKey, std::vector<const llvm::Function *>> fieldFnMemo;
-      auto fieldFns = [&](const llvm::Type *ty,
-                          const std::vector<uint64_t> &idx) -> const std::vector<const llvm::Function *> & {
-        static const std::vector<const llvm::Function *> none;
-        if (!ty || idx.empty())
-          return none;
-        FieldKey key{ty, idx};
-        auto it = fieldFnMemo.find(key);
-        if (it != fieldFnMemo.end())
-          return it->second;
-        std::vector<const llvm::Function *> &slot = fieldFnMemo[key];
-        std::vector<const llvm::Function *> fns;
-        std::unordered_set<const llvm::Value *> seen;
-        std::vector<const llvm::Value *> work;
-        std::set<FieldKey> cellsDone;
-        auto cellDefs = [&](const llvm::Type *t, const std::vector<uint64_t> &i) {
-          if (!t || i.empty() || !cellsDone.insert(FieldKey{t, i}).second)
-            return;
-          auto d = witIdx.defs.find(FieldKey{t, i});
-          if (d == witIdx.defs.end())
-            return;
-          for (const llvm::Instruction *D : d->second)
-            if (const auto *St = llvm::dyn_cast<llvm::StoreInst>(D))
-              work.push_back(St->getValueOperand());
-        };
-        auto globalElem = [&](const llvm::Value *root, const std::vector<uint64_t> &i) {
-          const auto *GV = llvm::dyn_cast<llvm::GlobalVariable>(root);
-          if (!GV || !GV->hasInitializer() || i.empty() || i.front() != 0)
-            return;
-          const llvm::Constant *c = GV->getInitializer();
-          for (size_t k = 1; c && k < i.size(); ++k)
-            c = c->getAggregateElement(static_cast<unsigned>(i[k]));
-          if (c)
-            work.push_back(c);
-        };
-        cellDefs(ty, idx);
-        while (!work.empty()) {
-          const llvm::Value *V = peel(work.back());
-          work.pop_back();
-          if (!V || !seen.insert(V).second)
-            continue;
-          if (const auto *F = llvm::dyn_cast<llvm::Function>(V)) {
-            fns.push_back(F);
-            continue;
-          }
-          if (const auto *A = llvm::dyn_cast<llvm::Argument>(V)) {
-            for (const llvm::CallBase *Call : callersOf(A->getParent()))
-              if (Call && A->getArgNo() < Call->arg_size())
-                work.push_back(Call->getArgOperand(A->getArgNo()));
-            continue;
-          }
-          if (const auto *PN = llvm::dyn_cast<llvm::PHINode>(V)) {
-            for (const llvm::Value *inc : PN->incoming_values())
-              work.push_back(inc);
-            continue;
-          }
-          if (const auto *SI = llvm::dyn_cast<llvm::SelectInst>(V)) {
-            work.push_back(SI->getTrueValue());
-            work.push_back(SI->getFalseValue());
-            continue;
-          }
-          if (const auto *L = llvm::dyn_cast<llvm::LoadInst>(V)) {
-            const auto *AI = llvm::dyn_cast<llvm::AllocaInst>(peel(L->getPointerOperand()));
-            if (const llvm::Value *st = AI ? spillValue(AI) : nullptr) {
-              work.push_back(st);
-              continue;
-            }
-            const llvm::Type *t2 = nullptr;
-            std::vector<uint64_t> i2;
-            const llvm::Value *root = typedCell(L->getPointerOperand(), t2, i2);
-            cellDefs(t2, i2);
-            globalElem(root, i2);
-            continue;
-          }
-          if (const auto *C = llvm::dyn_cast<llvm::CallBase>(V)) {
-            if (C->isInlineAsm())
-              continue;
-            for (const llvm::Function *D0 : mayCallees(C)) {
-              const llvm::Function *D = definedBody(D0);
-              if (!D || D->isDeclaration())
-                continue;
-              for (const llvm::BasicBlock &BB : *D) {
-                const auto *R = llvm::dyn_cast<llvm::ReturnInst>(BB.getTerminator());
-                if (R && R->getReturnValue())
-                  work.push_back(R->getReturnValue());
-              }
-            }
-          }
-        }
-        std::sort(fns.begin(), fns.end());
-        fns.erase(std::unique(fns.begin(), fns.end()), fns.end());
-        slot = std::move(fns);
-        return slot;
-      };
-      // The callees of a call: resolved by the analysis, else the functions
-      // the field it calls through can hold.
-      auto witCallees = [&](const llvm::CallBase *C) -> const std::vector<const llvm::Function *> & {
-        const std::vector<const llvm::Function *> &cs = mayCallees(C);
-        if (!cs.empty())
-          return cs;
-        if (const auto *L = llvm::dyn_cast<llvm::LoadInst>(peel(C->getCalledOperand()))) {
-          const llvm::Type *ft = nullptr;
-          std::vector<uint64_t> fi;
-          typedCell(L->getPointerOperand(), ft, fi);
-          return fieldFns(ft, fi);
-        }
-        return cs;
-      };
-      // One state of the walk. kind 0 is the bytes a value denotes, kind 1
-      // is what is written into the buffer a pointer points at, kind 2 is
-      // what is stored into a cell, kind 3 is the pointer a cell holds. ctx
-      // is the call through which the walk entered the function holding the
-      // value: a formal of that callee is the actual of ctx. A formal
-      // reached any other way is the actual of every caller. The states are
-      // finite -- values, calls, types and type paths -- so the walk
-      // terminates without a step count and without recursion.
+      // One state of the walk. kind 0 is the bytes a value denotes, in the
+      // context of the call through which the walk entered its function (a
+      // formal of that callee is the actual of ctx; a formal reached any
+      // other way is the actual of every caller). The other kinds are
+      // cells of objects, described where they are expanded. States are
+      // finite -- values, calls, objects and segment tree nodes -- so the
+      // walk terminates.
       struct WState {
         int kind = 0;
         const llvm::Value *v = nullptr;
         const llvm::CallBase *ctx = nullptr;
-        const llvm::Type *ty = nullptr;
-        std::vector<uint64_t> idx;
+        unsigned obj = 0;
+        int64_t off = 0;
         bool operator<(const WState &o) const {
           if (kind != o.kind)
             return kind < o.kind;
@@ -13925,63 +13741,58 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
             return v < o.v;
           if (ctx != o.ctx)
             return ctx < o.ctx;
-          if (ty != o.ty)
-            return ty < o.ty;
-          return idx < o.idx;
+          if (obj != o.obj)
+            return obj < o.obj;
+          return off < o.off;
+        }
+        bool operator==(const WState &o) const {
+          return kind == o.kind && v == o.v && ctx == o.ctx && obj == o.obj && off == o.off;
         }
       };
-      // The path of a cell on another root for the same object: the new
-      // root's path to the object followed by the cell's path, which is one
-      // type path only when the former ends at the cell's struct type and
-      // the cell's path starts at the object itself. Otherwise the nearest
-      // enclosing cell on the new root is the new root's own cell. Paths are
-      // type paths, and a type has finitely many, so the states are finite.
-      // The bits a choice among n alternatives gives up, in hundredths.
-      auto bits = [](size_t n) -> int {
-        if (n <= 1)
-          return 0;
-        return static_cast<int>(std::lround(std::log2(static_cast<double>(n)) * 100.0));
-      };
-      auto rebaseCell = [&](const llvm::Type *ty, const std::vector<uint64_t> &idx, const llvm::Value *addr,
-                            const llvm::Type *&nty, std::vector<uint64_t> &nidx) -> const llvm::Value * {
-        const llvm::Type *t2 = nullptr;
-        std::vector<uint64_t> i2;
-        const llvm::Value *r2 = typedCell(addr, t2, i2);
-        if (idx.empty() || !i2.empty()) {
-          nty = t2;
-          nidx = i2;
-          if (!idx.empty() && idx.front() == 0 && ty && fieldType(t2, i2) == ty)
-            nidx.insert(nidx.end(), idx.begin() + 1, idx.end());
-        } else {
-          nty = ty;
-          nidx = idx;
+      struct WHash {
+        size_t operator()(const WState &s) const {
+          size_t h = static_cast<size_t>(s.kind);
+          auto mix = [&](size_t x) { h ^= x + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2); };
+          mix(std::hash<const void *>{}(s.v));
+          mix(std::hash<const void *>{}(s.ctx));
+          mix(std::hash<unsigned>{}(s.obj));
+          mix(std::hash<int64_t>{}(s.off));
+          return h;
         }
-        return r2;
       };
       // Each state carries the cost of the cheapest path to it: the bits
       // of identity the path gives up. A step that keeps one object or one
-      // value -- the same object through one caller or into a callee, an
-      // alias of one pointer, a value's own definitions -- costs nothing. A
-      // step that stands for N alternatives at once -- a formal continued
-      // into N callers, a field merged over its N definitions or N loads
-      // module-wide -- costs log2 N bits, the information needed to pick
-      // the one alternative the concrete path took. Costs are kept in
-      // hundredths of a bit; states are processed in cost order, so a state
-      // is processed first at its least cost and a label records the least
-      // cost of any path to it.
-      auto witnessOf = [&](const llvm::Value *P0) -> Lab {
+      // value -- an alias of one pointer, a value's own definitions, the
+      // stores into one object -- costs nothing. A step that stands for N
+      // alternatives at once -- a formal continued into N callers, a
+      // pointer dereferenced to the N objects it may point at -- costs
+      // log2 N bits, the information needed to pick the one alternative
+      // the concrete path took. Costs are kept in hundredths of a bit;
+      // states are processed in cost order, so a state is processed first
+      // at its least cost and a label records the least cost of any path
+      // to it.
+      auto witnessOf = [&](const llvm::Value *P0) -> std::optional<Lab> {
+        Points &P = pointsOf();
         Lab out;
-        std::map<WState, int> best;
-        // Buckets by cost: the least-cost state is processed first.
+        std::unordered_map<WState, int, WHash> best;
         std::map<int, std::vector<WState>> work;
         int curCost = 0;
         auto pushAt = [&](WState s, int extra) {
-          if (!s.v)
-            return;
-          if (s.kind < 2) {
+          if (s.kind == 0) {
             s.v = peel(s.v);
-            if (!s.v)
+            if (!s.v || llvm::isa<llvm::ConstantData>(s.v))
               return;
+            const llvm::Function *SF = nullptr;
+            if (const auto *I = llvm::dyn_cast<llvm::Instruction>(s.v))
+              SF = I->getFunction();
+            else if (const auto *A = llvm::dyn_cast<llvm::Argument>(s.v))
+              SF = A->getParent();
+            // A call context distinguishes bytes only inside a function
+            // analysed per call. Elsewhere this value is one state, and a
+            // formal stands for the actual of every caller, so a context
+            // carried in from a callee must not hide the other callers.
+            if (!SF || !P.perCall(SF))
+              s.ctx = nullptr;
           }
           int c = curCost + extra;
           auto it = best.find(s);
@@ -13990,7 +13801,13 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
           best[s] = c;
           work[c].push_back(std::move(s));
         };
-        auto push = [&](WState s) { pushAt(std::move(s), 0); };
+        auto val = [&](const llvm::Value *v, const llvm::CallBase *ctx, int extra) {
+          WState s;
+          s.kind = 0;
+          s.v = v;
+          s.ctx = ctx;
+          pushAt(std::move(s), extra);
+        };
         auto note = [&](const std::string &name, int arg) {
           auto it = out.find({name, arg});
           if (it == out.end())
@@ -13999,6 +13816,8 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
             it->second = curCost;
         };
         auto fnOf = [&](const llvm::Value *V) -> const llvm::Function * {
+          if (!V)
+            return nullptr;
           if (const auto *I = llvm::dyn_cast<llvm::Instruction>(V))
             return I->getFunction();
           if (const auto *A = llvm::dyn_cast<llvm::Argument>(V))
@@ -14006,346 +13825,367 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
           return nullptr;
         };
         // Bytes defined by code outside both modules: a callee with no
-        // body, or a call no field resolves. Reported under the function
-        // that was called, or that holds the unresolved call, with -1 for
-        // the argument.
+        // body, or a call no function reaches. Reported under the function
+        // that was called, or that holds the call, with -1 for the
+        // argument.
         auto external = [&](const llvm::Function *F) {
           if (F && F->hasName())
             note(F->getName().str(), -1);
         };
+        auto externalCall = [&](const llvm::CallBase *C) {
+          if (const llvm::Function *D = C->getCalledFunction())
+            external(D);
+          else
+            external(C->getFunction());
+        };
+        // The objects a pointer may point at, each at the cost of picking
+        // it among them. The same pointer is read from many states; the
+        // objects and cells it names do not depend on the path, so they
+        // are recorded once.
+        // When the pointer may point outside both modules, the bytes there
+        // are the harness's or foreign code's: which, is told by where the
+        // pointer itself came from -- the export formal, the call with no
+        // body -- so the pointer's own provenance is followed too.
+        // The locations a pointer names, recorded once per pointer and
+        // context; the walk reads the same pointer from many values.
+        struct DKey {
+          const llvm::Value *p;
+          const llvm::CallBase *ctx;
+          bool operator==(const DKey &o) const { return p == o.p && ctx == o.ctx; }
+        };
+        struct DHash {
+          size_t operator()(const DKey &k) const {
+            return std::hash<const void *>{}(k.p) ^ (std::hash<const void *>{}(k.ctx) * 0x9e3779b97f4a7c15ULL);
+          }
+        };
+        // Many pointers name the same set of locations; the set is kept
+        // once and a pointer refers to it, so that reading the same bytes
+        // behind two such pointers is one read.
+        struct PSet {
+          std::vector<unsigned> ids;         // locations, ascending
+          std::vector<unsigned> objs;        // distinct objects
+          bool outside = false;
+          bool objsPushed = false;           // kExt/kAny of every object taken
+        };
+        std::vector<PSet> sets;
+        std::unordered_map<uint64_t, std::vector<unsigned>> setsByHash;
+        std::unordered_map<DKey, unsigned, DHash> dcache;
+        auto pointees = [&](const llvm::Value *p, const llvm::CallBase *ctx) -> unsigned {
+          DKey key{p, ctx};
+          auto it = dcache.find(key);
+          if (it != dcache.end())
+            return it->second;
+          std::vector<unsigned> ids;
+          uint64_t h = 1469598103934665603ULL;
+          for (unsigned id : P.of(p, ctx)) {
+            ids.push_back(id);
+            h = (h ^ id) * 1099511628211ULL;
+          }
+          std::vector<unsigned> &bucket = setsByHash[h];
+          for (unsigned sid : bucket)
+            if (sets[sid].ids == ids) {
+              dcache.emplace(key, sid);
+              return sid;
+            }
+          PSet ps;
+          std::unordered_set<unsigned> seenObj;
+          for (unsigned id : ids) {
+            const Points::Loc l = P.loc(id);
+            if (P.obj(l.obj).kind == Points::Kind::Outside)
+              ps.outside = true;
+            if (seenObj.insert(l.obj).second)
+              ps.objs.push_back(l.obj);
+          }
+          ps.ids = std::move(ids);
+          const unsigned sid = static_cast<unsigned>(sets.size());
+          sets.push_back(std::move(ps));
+          bucket.push_back(sid);
+          dcache.emplace(key, sid);
+          return sid;
+        };
+        // Cell states. The cells of an object are its regions, the leaves
+        // of the object's segment tree; a byte range of an object is the
+        // nodes tiling it, and the writes covering the range are the
+        // lists at those nodes and at their ancestors. A read of a byte
+        // range therefore pushes O(log n) states, each expanded once at
+        // its least cost like any other state. Expanding on arrival would
+        // walk the object graph depth first and redo every subtree a
+        // cheaper path later reaches.
+        //   kDown  (obj, node): the writes at the node and below it
+        //   kUp    (obj, node): the writes at its ancestors, restricted
+        //                       to the node's bytes
+        //   kExt   (obj):       calls with no body here given a pointer
+        //                       into the object: bytes from outside
+        //   kWhole (obj):       the sink's whole buffer: every cell and
+        //                       the pointer fields the sink's library
+        //                       loads from it
+        //   kLoad  (v):         such a pointer load: the whole of every
+        //                       object it may name, taken once at the
+        //                       least cost of any object it is reached
+        //                       from
+        //   kAny   (obj):       the writes at offset Any: every byte
+        enum { kDown = 1, kUp = 2, kExt = 3, kWhole = 4, kLoad = 5, kAny = 6 };
+        auto cell = [&](int kind, unsigned o, size_t node, int extra) {
+          WState s;
+          s.kind = kind;
+          s.obj = o;
+          s.off = static_cast<int64_t>(node);
+          pushAt(std::move(s), extra);
+        };
+        // Reads already taken. States are expanded in cost order, so the
+        // first time a read is taken is at the least cost of any state
+        // taking it; taking it again later pushes nothing new.
+        struct RKey {
+          unsigned set;
+          int kind;
+          int64_t lo, hi;
+          bool hiInf;
+          bool operator==(const RKey &o) const {
+            return set == o.set && kind == o.kind && lo == o.lo && hi == o.hi && hiInf == o.hiInf;
+          }
+        };
+        struct RHash {
+          size_t operator()(const RKey &k) const {
+            size_t h = k.set;
+            auto mix = [&](size_t x) { h ^= x + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2); };
+            mix(static_cast<size_t>(k.kind));
+            mix(std::hash<int64_t>{}(k.lo));
+            mix(std::hash<int64_t>{}(k.hi));
+            mix(static_cast<size_t>(k.hiInf));
+            return h;
+          }
+        };
+        std::unordered_set<RKey, RHash> readsTaken;
+        // The bytes [lo, hi) behind pointer p (hi unbounded when hiInf;
+        // every byte when lo is Any), at the cost of picking one of the
+        // locations p names. kind 2 is the sink's buffer.
+        auto deref = [&](const llvm::Value *p, int kind, int64_t lo, int64_t hi, bool hiInf,
+                         const llvm::CallBase *ctx) {
+          // A context distinguishes pointers only in a function analysed
+          // per call.
+          const llvm::Function *PF = nullptr;
+          if (const auto *I = llvm::dyn_cast<llvm::Instruction>(p))
+            PF = I->getFunction();
+          else if (const auto *A = llvm::dyn_cast<llvm::Argument>(p))
+            PF = A->getParent();
+          if (!P.perCall(PF))
+            ctx = nullptr;
+          if (lo == Points::Any) {
+            hi = 0;
+            hiInf = true;
+          }
+          const unsigned sid = pointees(p, ctx);
+          // Bytes behind a pointer into memory from outside both modules
+          // are supplied by whoever made the pointer.
+          if (sets[sid].outside)
+            val(p, ctx, 0);
+          if (!readsTaken.insert(RKey{sid, kind, lo, hi, hiInf}).second)
+            return;
+          if (kind == 2) {
+            const std::vector<unsigned> &objs = sets[sid].objs;
+            const int extra = bits(objs.size());
+            for (unsigned o : objs)
+              cell(kWhole, o, 0, extra);
+            return;
+          }
+          // Expanding a cell can add sets; the set is read through its
+          // index below.
+          const int extra = bits(sets[sid].ids.size());
+          if (!sets[sid].objsPushed) {
+            sets[sid].objsPushed = true;
+            const std::vector<unsigned> objs = sets[sid].objs;
+            for (unsigned o : objs) {
+              cell(kExt, o, 0, extra);
+              cell(kAny, o, 0, extra);
+            }
+          }
+          const std::vector<unsigned> &ids = sets[sid].ids;
+          // The leaf runs the read covers, per object. Runs of one object
+          // that overlap or touch are one run: the nodes tiling the union
+          // reach the same writes over the same bytes.
+          struct Run {
+            unsigned obj;
+            size_t a, b;
+            bool operator<(const Run &o) const {
+              if (obj != o.obj)
+                return obj < o.obj;
+              return a < o.a;
+            }
+          };
+          std::vector<Run> runs;
+          std::vector<unsigned> whole;
+          for (unsigned id : ids) {
+            const Points::Loc l = P.loc(id);
+            if (lo == Points::Any || l.off == Points::Any) {
+              whole.push_back(l.obj);
+              continue;
+            }
+            const Points::Regions &R = P.regions(l.obj);
+            const size_t n = R.bounds.size() + 1;
+            const size_t a = static_cast<size_t>(Points::regionIndex(R, l.off + lo) + 1);
+            size_t b;
+            if (hiInf || hi <= lo)
+              b = n - 1;
+            else
+              b = static_cast<size_t>(Points::regionIndex(R, l.off + hi - 1) + 1);
+            if (hi <= lo && !hiInf)
+              b = a;
+            runs.push_back(Run{l.obj, a, b});
+          }
+          std::sort(whole.begin(), whole.end());
+          whole.erase(std::unique(whole.begin(), whole.end()), whole.end());
+          for (unsigned o : whole)
+            cell(kDown, o, 1, extra);
+          std::sort(runs.begin(), runs.end());
+          for (size_t i = 0; i < runs.size();) {
+            Run r = runs[i];
+            size_t j = i + 1;
+            while (j < runs.size() && runs[j].obj == r.obj && runs[j].a <= r.b + 1) {
+              r.b = std::max(r.b, runs[j].b);
+              ++j;
+            }
+            i = j;
+            const size_t leaves = P.regions(r.obj).leaves;
+            for (size_t a = r.a + leaves, b = r.b + leaves + 1; a < b; a >>= 1, b >>= 1) {
+              if (a & 1) {
+                cell(kDown, r.obj, a, extra);
+                cell(kUp, r.obj, a, extra);
+                ++a;
+              }
+              if (b & 1) {
+                --b;
+                cell(kDown, r.obj, b, extra);
+                cell(kUp, r.obj, b, extra);
+              }
+            }
+          }
+        };
+        // A write seen through the bytes [lo, hi) of its object. A store
+        // defines its value; a memset its byte; a byte copy the source
+        // bytes at the same distance -- the part of the copy within
+        // [lo, hi) maps to the source range at the same distance; a copy
+        // of the whole source to all of it. A write made in a context is
+        // walked in that context.
+        auto walkDef = [&](const Points::Def &d, int64_t lo, bool loInf, int64_t hi, bool hiInf) {
+          const llvm::CallBase *wctx = P.site(d.ctx);
+          if (const auto *St = llvm::dyn_cast<llvm::StoreInst>(d.inst)) {
+            val(St->getValueOperand(), wctx, 0);
+            return;
+          }
+          const auto *C = llvm::dyn_cast<llvm::CallBase>(d.inst);
+          if (!C)
+            return;
+          if (const auto *MS = llvm::dyn_cast<llvm::MemSetInst>(C)) {
+            val(MS->getValue(), wctx, 0);
+            return;
+          }
+          const llvm::Value *dst = nullptr;
+          const llvm::Value *src = nullptr;
+          if (!byteCopy(C, dst, src)) {
+            // A reallocation holds the bytes of the memory it replaced.
+            src = allocSource(C);
+            if (!src)
+              return;
+          }
+          if (d.off == Points::Any) {
+            deref(src, 1, Points::Any, 0, true, wctx);
+            return;
+          }
+          const int64_t from = loInf ? 0 : std::max(lo, d.off) - d.off;
+          bool toInf = hiInf;
+          int64_t to = 0;
+          if (!hiInf)
+            to = hi - d.off;
+          if (d.len >= 0 && (toInf || to > d.len)) {
+            to = d.len;
+            toInf = false;
+          }
+          if (!toInf && to <= from)
+            return;
+          deref(src, 1, from, to, toInf, wctx);
+        };
+        auto expandCell = [&](int kind, unsigned o, size_t node) {
+          if (kind == kExt) {
+            for (const llvm::CallBase *C : P.escapes(o))
+              externalCall(C);
+            return;
+          }
+          if (kind == kAny) {
+            const std::vector<Points::Def> ds = P.regions(o).any;
+            for (const Points::Def &d : ds)
+              walkDef(d, 0, true, 0, true);
+            return;
+          }
+          if (kind == kWhole) {
+            cell(kDown, o, 1, 0);
+            cell(kExt, o, 0, 0);
+            cell(kAny, o, 0, 0);
+            const std::vector<Points::PtrLoad> &pls = P.ptrLoads(o);
+            for (const Points::PtrLoad &pl : pls) {
+              if (pl.inst->getFunction()->getParent() == &M)
+                continue;
+              WState s;
+              s.kind = kLoad;
+              s.v = pl.inst;
+              pushAt(std::move(s), 0);
+            }
+            return;
+          }
+          const Points::Regions &R = P.regions(o);
+          // A node of a tree built for an earlier solution; the walk is
+          // restarted on the new one.
+          if (node >= 2 * R.leaves)
+            return;
+          const size_t n = R.bounds.size() + 1;
+          size_t a, b;
+          Points::nodeLeaves(R, node, a, b);
+          if (a >= n)
+            return;
+          b = std::min(b, n - 1);
+          int64_t lo, hi;
+          bool loInf, hiInf;
+          Points::leafBytes(R, a, b, lo, loInf, hi, hiInf);
+          // Local lists: following a copy reads other objects and can
+          // build their regions, which may reallocate regionsOf.
+          if (kind == kDown) {
+            const std::vector<Points::Def> ds = R.tree[node];
+            const size_t leaves = R.leaves;
+            for (const Points::Def &d : ds)
+              walkDef(d, lo, loInf, hi, hiInf);
+            if (node < leaves) {
+              cell(kDown, o, 2 * node, 0);
+              cell(kDown, o, 2 * node + 1, 0);
+            }
+            return;
+          }
+          std::vector<Points::Def> ds;
+          for (size_t A = node >> 1; A >= 1; A >>= 1) {
+            const std::vector<Points::Def> &L = P.regions(o).tree[A];
+            ds.insert(ds.end(), L.begin(), L.end());
+          }
+          for (const Points::Def &d : ds)
+            walkDef(d, lo, loInf, hi, hiInf);
+        };
         auto actualOf = [&](const llvm::Argument *A, const llvm::CallBase *ctx) -> const llvm::Value * {
           if (!ctx || A->getArgNo() >= ctx->arg_size())
             return nullptr;
-          for (const llvm::Function *D0 : witCallees(ctx))
+          for (const llvm::Function *D0 : P.callees(ctx))
             if (definedBody(D0) == A->getParent())
               return ctx->getArgOperand(A->getArgNo());
           return nullptr;
         };
-        auto derivedFromP = [&](const llvm::Value *X, const llvm::Value *P) {
-          std::unordered_set<const llvm::Value *> sc;
-          X = peel(X);
-          while (X && sc.insert(X).second) {
-            if (X == P)
-              return true;
-            if (const auto *G = llvm::dyn_cast<llvm::GEPOperator>(X)) {
-              X = peel(G->getPointerOperand());
-              continue;
-            }
-            if (const auto *L = llvm::dyn_cast<llvm::LoadInst>(X)) {
-              if (const auto *AI = llvm::dyn_cast<llvm::AllocaInst>(peel(L->getPointerOperand())))
-                if (const llvm::Value *st = spillValue(AI)) {
-                  X = peel(st);
-                  continue;
-                }
-            }
-            break;
-          }
-          return false;
-        };
-        // The chain derivedFromP walks: the value itself, each pointer a
-        // getelementptr derives from, and the value a spilled load reads.
-        auto baseChain = [&](const llvm::Value *X) {
-          std::vector<const llvm::Value *> chain;
-          std::unordered_set<const llvm::Value *> sc;
-          X = peel(X);
-          while (X && sc.insert(X).second) {
-            chain.push_back(X);
-            if (const auto *G = llvm::dyn_cast<llvm::GEPOperator>(X)) {
-              X = peel(G->getPointerOperand());
-              continue;
-            }
-            if (const auto *L = llvm::dyn_cast<llvm::LoadInst>(X)) {
-              if (const auto *AI = llvm::dyn_cast<llvm::AllocaInst>(peel(L->getPointerOperand())))
-                if (const llvm::Value *st = spillValue(AI)) {
-                  X = peel(st);
-                  continue;
-                }
-            }
-            break;
-          }
-          return chain;
-        };
-        auto fnIndex = [&](const llvm::Function *Fn) -> const FnWit & {
-          FnWit &W = fnWit[Fn];
-          if (W.built)
-            return W;
-          W.built = true;
-          auto addBase = [&](const llvm::Value *addr, const llvm::Instruction *I) {
-            for (const llvm::Value *b : baseChain(addr))
-              W.byBase[b].push_back(I);
-          };
-          auto addCell = [&](const llvm::Value *addr, const llvm::Instruction *I) {
-            const llvm::Type *t2 = nullptr;
-            FnWit::CellDef d;
-            d.inst = I;
-            const llvm::Value *root = typedCell(addr, t2, d.idx);
-            if (root)
-              W.cells[root].push_back(std::move(d));
-          };
-          for (const llvm::Instruction &I : llvm::instructions(*Fn)) {
-            if (const auto *St = llvm::dyn_cast<llvm::StoreInst>(&I)) {
-              addBase(St->getPointerOperand(), St);
-              addCell(St->getPointerOperand(), St);
-              if (const llvm::Value *val = peel(St->getValueOperand()))
-                W.storedAs[val].push_back(St);
-              continue;
-            }
-            if (const auto *L = llvm::dyn_cast<llvm::LoadInst>(&I)) {
-              if (L->getType()->isPointerTy()) {
-                addBase(L->getPointerOperand(), L);
-                const llvm::Type *t2 = nullptr;
-                FnWit::CellDef d;
-                d.inst = L;
-                const llvm::Value *root = typedCell(L->getPointerOperand(), t2, d.idx);
-                if (root)
-                  W.cellLoads[root].push_back(std::move(d));
-              }
-              continue;
-            }
-            if (const auto *R = llvm::dyn_cast<llvm::ReturnInst>(&I)) {
-              std::vector<const llvm::Value *> q;
-              if (R->getReturnValue())
-                q.push_back(R->getReturnValue());
-              for (size_t qi = 0; qi < q.size(); ++qi) {
-                const llvm::Value *X = peel(q[qi]);
-                if (!X || !W.returned.insert(X).second)
-                  continue;
-                if (const auto *PN = llvm::dyn_cast<llvm::PHINode>(X))
-                  for (const llvm::Value *inc : PN->incoming_values())
-                    q.push_back(inc);
-                else if (const auto *SI = llvm::dyn_cast<llvm::SelectInst>(X)) {
-                  q.push_back(SI->getTrueValue());
-                  q.push_back(SI->getFalseValue());
-                }
-              }
-              continue;
-            }
-            const auto *C = llvm::dyn_cast<llvm::CallBase>(&I);
-            if (!C || C->isInlineAsm())
-              continue;
-            const llvm::Value *dst = nullptr;
-            const llvm::Value *src = nullptr;
-            if (byteCopy(C, dst, src)) {
-              addBase(dst, C);
-              addCell(dst, C);
-              continue;
-            }
-            if (const llvm::Function *D = C->getCalledFunction())
-              if (D->isIntrinsic())
-                continue;
-            std::unordered_set<const llvm::Value *> once;
-            for (unsigned ai = 0; ai < C->arg_size(); ++ai)
-              if (C->getArgOperand(ai)->getType()->isPointerTy())
-                for (const llvm::Value *b : baseChain(C->getArgOperand(ai)))
-                  if (once.insert(b).second)
-                    W.byBase[b].push_back(C);
-          }
-          return W;
-        };
-        // A field's module-wide loads and definitions are the same set
-        // whichever state asks for them, so each field is expanded once per
-        // walk.
-        std::set<FieldKey> loadsDone;
-        std::set<FieldKey> defsDone;
-        auto fieldLoads = [&](const llvm::Type *ty, const std::vector<uint64_t> &idx) {
-          if (!ty || idx.empty() || !loadsDone.insert(FieldKey{ty, idx}).second)
-            return;
-          auto lit = witIdx.loads.find(FieldKey{ty, idx});
-          auto dit = witIdx.defs.find(FieldKey{ty, idx});
-          size_t n = (lit != witIdx.loads.end() ? lit->second.size() : 0) +
-                     (dit != witIdx.defs.end() ? dit->second.size() : 0);
-          const int extra = bits(n);
-          if (lit != witIdx.loads.end())
-            for (const llvm::LoadInst *L2 : lit->second)
-              pushAt(WState{1, L2, nullptr, nullptr, {}}, extra);
-          if (dit != witIdx.defs.end())
-            for (const llvm::Instruction *D : dit->second) {
-              const auto *St = llvm::dyn_cast<llvm::StoreInst>(D);
-              if (St && St->getValueOperand()->getType()->isPointerTy())
-                pushAt(WState{1, St->getValueOperand(), nullptr, nullptr, {}}, extra);
-            }
-        };
-        auto fieldDefs = [&](const llvm::Type *ty, const std::vector<uint64_t> &idx) {
-          if (!ty || idx.empty() || !defsDone.insert(FieldKey{ty, idx}).second)
-            return;
-          auto dit = witIdx.defs.find(FieldKey{ty, idx});
-          if (dit == witIdx.defs.end())
-            return;
-          const int extra = bits(dit->second.size());
-          for (const llvm::Instruction *D : dit->second) {
-            if (const auto *St = llvm::dyn_cast<llvm::StoreInst>(D)) {
-              pushAt(WState{0, St->getValueOperand(), nullptr, nullptr, {}}, extra);
-            } else if (const auto *C = llvm::dyn_cast<llvm::CallBase>(D)) {
-              const llvm::Value *dst = nullptr;
-              const llvm::Value *src = nullptr;
-              if (byteCopy(C, dst, src))
-                pushAt(WState{0, src, nullptr, nullptr, {}}, extra);
-            }
-          }
-        };
-        // The pointers the cell (root, ty, idx) holds, with the object
-        // followed exactly by the same rules as a cell of the main walk.
-        // Memoized: the answer depends only on the cell and the context.
-        std::function<const Prov &(const llvm::Value *, const llvm::Type *, const std::vector<uint64_t> &,
-                                   const llvm::CallBase *)>
-            provOf = [&](const llvm::Value *root, const llvm::Type *ty, const std::vector<uint64_t> &idx,
-                         const llvm::CallBase *ctx0) -> const Prov & {
-          auto key = std::make_tuple(root, ty, idx, ctx0);
-          auto mit = provMemo.find(key);
-          if (mit != provMemo.end())
-            return mit->second;
-          Prov &pr = provMemo[key];
-          struct PState {
-            const llvm::Value *v = nullptr;
-            const llvm::CallBase *ctx = nullptr;
-            const llvm::Type *ty = nullptr;
-            std::vector<uint64_t> idx;
-            bool operator<(const PState &o) const {
-              if (v != o.v)
-                return v < o.v;
-              if (ctx != o.ctx)
-                return ctx < o.ctx;
-              if (ty != o.ty)
-                return ty < o.ty;
-              return idx < o.idx;
-            }
-          };
-          std::map<PState, int> pbest;
-          std::map<int, std::vector<PState>> pwork;
-          auto ppush = [&](PState q, int c) {
-            if (!q.v)
-              return;
-            auto it = pbest.find(q);
-            if (it != pbest.end() && it->second <= c)
-              return;
-            pbest[q] = c;
-            pwork[c].push_back(std::move(q));
-          };
-          ppush(PState{root, ctx0, ty, idx}, 0);
-          while (!pwork.empty()) {
-            auto pb = pwork.begin();
-            int cost = pb->first;
-            PState q = std::move(pb->second.back());
-            pb->second.pop_back();
-            if (pb->second.empty())
-              pwork.erase(pb);
-            auto bq = pbest.find(q);
-            if (bq != pbest.end() && bq->second < cost)
-              continue;
-            const llvm::Value *R = q.v;
-            auto found = [&](const llvm::Value *p, const llvm::CallBase *pctx) {
-              auto k = std::make_pair(p, pctx);
-              auto it = pr.vals.find(k);
-              if (it == pr.vals.end())
-                pr.vals.emplace(k, cost);
-              else if (cost < it->second)
-                it->second = cost;
-            };
-            auto same = [&](const llvm::Value *addr, const llvm::CallBase *ctx, int extra) {
-              PState n;
-              n.ctx = ctx;
-              n.v = rebaseCell(q.ty, q.idx, addr, n.ty, n.idx);
-              ppush(std::move(n), cost + extra);
-            };
-            const llvm::Function *Fn = fnOf(R);
-            if (Fn && !Fn->isDeclaration()) {
-              const FnWit &W = fnIndex(Fn);
-              auto cit = W.cells.find(R);
-              if (cit != W.cells.end())
-                for (const FnWit::CellDef &d : cit->second) {
-                  if (d.idx != q.idx)
-                    continue;
-                  const auto *St = llvm::dyn_cast<llvm::StoreInst>(d.inst);
-                  if (St && St->getValueOperand()->getType()->isPointerTy())
-                    found(St->getValueOperand(), q.ctx);
-                }
-              auto bit = W.byBase.find(R);
-              if (bit != W.byBase.end())
-                for (const llvm::Instruction *I : bit->second) {
-                  const auto *C = llvm::dyn_cast<llvm::CallBase>(I);
-                  if (!C)
-                    continue;
-                  const llvm::Value *dst = nullptr;
-                  const llvm::Value *src = nullptr;
-                  if (byteCopy(C, dst, src))
-                    continue;
-                  for (unsigned ai = 0; ai < C->arg_size(); ++ai) {
-                    if (!C->getArgOperand(ai)->getType()->isPointerTy())
-                      continue;
-                    const llvm::Type *t2 = nullptr;
-                    std::vector<uint64_t> pfx;
-                    if (typedCell(C->getArgOperand(ai), t2, pfx) != R)
-                      continue;
-                    if (pfx.size() > q.idx.size() || !std::equal(pfx.begin(), pfx.end(), q.idx.begin()))
-                      continue;
-                    const llvm::Type *ty2 = q.ty;
-                    std::vector<uint64_t> rest = q.idx;
-                    if (!pfx.empty()) {
-                      if (pfx.size() == q.idx.size())
-                        continue;
-                      ty2 = fieldType(q.ty, pfx);
-                      if (!ty2)
-                        continue;
-                      rest.assign(1, 0);
-                      rest.insert(rest.end(), q.idx.begin() + pfx.size(), q.idx.end());
-                    }
-                    for (const llvm::Function *D0 : witCallees(C)) {
-                      const llvm::Function *D = definedBody(D0);
-                      if (!D || D->isDeclaration() || ai >= D->arg_size())
-                        continue;
-                      ppush(PState{D->getArg(ai), C, ty2, rest}, cost);
-                    }
-                  }
-                }
-            }
-            bool merged = true;
-            if (llvm::isa<llvm::AllocaInst>(R)) {
-              merged = false;
-            } else if (const auto *PN = llvm::dyn_cast<llvm::PHINode>(R)) {
-              merged = false;
-              for (const llvm::Value *in : PN->incoming_values())
-                same(in, q.ctx, 0);
-            } else if (const auto *SI = llvm::dyn_cast<llvm::SelectInst>(R)) {
-              merged = false;
-              same(SI->getTrueValue(), q.ctx, 0);
-              same(SI->getFalseValue(), q.ctx, 0);
-            } else if (const auto *A = llvm::dyn_cast<llvm::Argument>(R)) {
-              // The holder is followed while the object is one object: the
-              // actual of the context, or of the one caller. Into several
-              // callers the identity is lost either way, and the cell is
-              // merged by type rather than followed into each.
-              if (const llvm::Value *act = actualOf(A, q.ctx)) {
-                same(act, nullptr, 0);
-                merged = false;
-              } else {
-                const auto &calls = callersOf(A->getParent());
-                if (calls.size() == 1 && calls.front() && A->getArgNo() < calls.front()->arg_size() &&
-                    !alphabet(A->getParent())) {
-                  same(calls.front()->getArgOperand(A->getArgNo()), nullptr, 0);
-                  merged = false;
-                }
-              }
-            } else if (const auto *CB = llvm::dyn_cast<llvm::CallBase>(R)) {
-              if (!CB->isInlineAsm())
-                for (const llvm::Function *D0 : witCallees(CB)) {
-                  const llvm::Function *D = definedBody(D0);
-                  if (!D || D->isDeclaration())
-                    continue;
-                  merged = false;
-                  for (const llvm::BasicBlock &BB : *D) {
-                    const auto *Rt = llvm::dyn_cast<llvm::ReturnInst>(BB.getTerminator());
-                    if (Rt && Rt->getReturnValue())
-                      same(Rt->getReturnValue(), CB, 0);
-                  }
-                }
-            }
-            if (merged && (pr.merged < 0 || cost < pr.merged))
-              pr.merged = cost;
-          }
-          pr.done = true;
-          return pr;
-        };
-        push(WState{0, P0, nullptr, nullptr, {}});
+        // Queries may extend the points-to solution while the walk runs.
+        // Everything cached here belongs to one solution; when it grows,
+        // the walk starts over on the new one. The solution is finite and
+        // only grows, so this ends.
+        const uint64_t solutionAtStart = P.solution();
+        val(P0, nullptr, 0);
+        // The sink is given this buffer. Its bytes are the object, read
+        // by the sink's library as far as that library loads pointer
+        // fields. Intermediate pointers in the dataflow are not reads.
+        if (const llvm::Value *Root = peel(P0))
+          if (Root->getType()->isPointerTy())
+            deref(Root, 2, Points::Any, 0, true, nullptr);
         while (!work.empty()) {
           auto wb = work.begin();
           int cost = wb->first;
@@ -14357,314 +14197,93 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
           if (bit0 != best.end() && bit0->second < cost)
             continue;
           curCost = cost;
+          if (s.kind == kLoad) {
+            deref(s.v, 2, Points::Any, 0, true, nullptr);
+            continue;
+          }
+          if (s.kind != 0) {
+            expandCell(s.kind, s.obj, static_cast<size_t>(s.off));
+            continue;
+          }
           const llvm::Value *V = s.v;
-          if (s.kind == 0) {
-            if (const auto *A = llvm::dyn_cast<llvm::Argument>(V)) {
-              const llvm::Function *F = A->getParent();
-              // A formal of an export is one argument the harness can pass;
-              // the same formal is also whatever each caller in the module
-              // passes, so the walk records the export and goes on.
-              if (alphabet(F))
-                note(F->getName().str(), static_cast<int>(A->getArgNo()));
-              if (const llvm::Value *act = actualOf(A, s.ctx)) {
-                push(WState{0, act, nullptr, nullptr, {}});
-              } else {
-                const auto &calls = callersOf(F);
-                for (const llvm::CallBase *Call : calls)
-                  if (Call && A->getArgNo() < Call->arg_size())
-                    pushAt(WState{0, Call->getArgOperand(A->getArgNo()), nullptr, nullptr, {}}, bits(calls.size()));
-              }
-              push(WState{1, V, s.ctx, nullptr, {}});
-              continue;
-            }
-            if (const auto *PN = llvm::dyn_cast<llvm::PHINode>(V)) {
-              for (const llvm::Value *inc : PN->incoming_values())
-                push(WState{0, inc, s.ctx, nullptr, {}});
-            } else if (const auto *SI = llvm::dyn_cast<llvm::SelectInst>(V)) {
-              push(WState{0, SI->getTrueValue(), s.ctx, nullptr, {}});
-              push(WState{0, SI->getFalseValue(), s.ctx, nullptr, {}});
-            } else if (const auto *G = llvm::dyn_cast<llvm::GEPOperator>(V)) {
-              push(WState{0, G->getPointerOperand(), s.ctx, nullptr, {}});
-            } else if (const auto *L = llvm::dyn_cast<llvm::LoadInst>(V)) {
-              const auto *AI = llvm::dyn_cast<llvm::AllocaInst>(peel(L->getPointerOperand()));
-              const llvm::Value *st = AI ? spillValue(AI) : nullptr;
-              if (st) {
-                push(WState{0, st, s.ctx, nullptr, {}});
-              } else {
-                const llvm::Type *ty = nullptr;
-                std::vector<uint64_t> idx;
-                const llvm::Value *root = typedCell(L->getPointerOperand(), ty, idx);
-                push(WState{2, root, s.ctx, ty, idx});
-              }
-            } else if (const auto *C = llvm::dyn_cast<llvm::CallBase>(V)) {
-              if (!C->isInlineAsm()) {
-                const auto &cs = witCallees(C);
-                if (cs.empty() && !allocates(C))
-                  external(C->getFunction());
-                for (const llvm::Function *D0 : cs) {
-                  const llvm::Function *D = definedBody(D0);
-                  if (!D || D->isDeclaration()) {
-                    if (!allocates(C))
-                      external(D0);
-                    continue;
-                  }
-                  for (const llvm::BasicBlock &BB : *D) {
-                    const auto *R = llvm::dyn_cast<llvm::ReturnInst>(BB.getTerminator());
-                    if (R && R->getReturnValue())
-                      push(WState{0, R->getReturnValue(), C, nullptr, {}});
-                  }
-                }
-              }
-            }
-            // A pointer denotes the bytes it points at as well as the cell
-            // it was read from.
-            if (V->getType()->isPointerTy())
-              push(WState{1, V, s.ctx, nullptr, {}});
-            continue;
-          }
-          if (s.kind == 1) {
-            const llvm::Function *Fn = fnOf(V);
-            if (Fn && !Fn->isDeclaration()) {
-              // The pointer is one object under every name it takes on the
-              // way forward: the field it is stored into is read back by
-              // loads of that field, and a function that returns it hands
-              // it to each call result. Writes through those names are
-              // writes into this buffer.
-              const FnWit &W = fnIndex(Fn);
-              auto bit = W.byBase.find(V);
-              if (bit != W.byBase.end())
-                for (const llvm::Instruction *I : bit->second) {
-                  if (const auto *St = llvm::dyn_cast<llvm::StoreInst>(I)) {
-                    push(WState{0, St->getValueOperand(), s.ctx, nullptr, {}});
-                    continue;
-                  }
-                  // The bytes the sink's library reads behind this pointer
-                  // include the objects its pointer fields point at, as far
-                  // as that library dereferences them: a pointer loaded
-                  // from this buffer in the upstream module names part of
-                  // what the sink can read. The downstream module only
-                  // supplies the object; its own pointer fields are not
-                  // bytes the sink reads.
-                  if (const auto *L = llvm::dyn_cast<llvm::LoadInst>(I)) {
-                    if (Fn->getParent() != &M)
-                      push(WState{1, L, s.ctx, nullptr, {}});
-                    continue;
-                  }
-                  const auto *C = llvm::dyn_cast<llvm::CallBase>(I);
-                  if (!C)
-                    continue;
-                  const llvm::Value *dst = nullptr;
-                  const llvm::Value *src = nullptr;
-                  if (byteCopy(C, dst, src)) {
-                    push(WState{0, src, s.ctx, nullptr, {}});
-                    continue;
-                  }
-                  std::vector<unsigned> pos;
-                  for (unsigned ai = 0; ai < C->arg_size(); ++ai)
-                    if (C->getArgOperand(ai)->getType()->isPointerTy() && derivedFromP(C->getArgOperand(ai), V))
-                      pos.push_back(ai);
-                  // A call handed the buffer may write it. A callee with no
-                  // body here or upstream is code outside both modules;
-                  // what it writes is reported as such rather than lost.
-                  const auto &cs = witCallees(C);
-                  if (cs.empty() && !allocates(C))
-                    external(C->getFunction());
-                  for (const llvm::Function *D0 : cs) {
-                    const llvm::Function *D = definedBody(D0);
-                    if (!D || D->isDeclaration()) {
-                      if (!allocates(C))
-                        external(D0);
-                      continue;
-                    }
-                    for (unsigned ai : pos)
-                      if (ai < D->arg_size())
-                        push(WState{1, D->getArg(ai), C, nullptr, {}});
-                  }
-                }
-              auto sit = W.storedAs.find(V);
-              // The pointer stored into a cell is read back by every load
-              // of that cell of that object: the buffer is then written
-              // through those loads too.
-              if (sit != W.storedAs.end())
-                for (const llvm::StoreInst *St : sit->second) {
-                  const llvm::Type *ty = nullptr;
-                  std::vector<uint64_t> idx;
-                  const llvm::Value *root = typedCell(St->getPointerOperand(), ty, idx);
-                  if (root)
-                    push(WState{3, root, s.ctx, ty, idx});
-                }
-              if (W.returned.count(V)) {
-                const auto &calls = callersOf(Fn);
-                for (const llvm::CallBase *Call : calls)
-                  if (Call && Call->getType()->isPointerTy())
-                    pushAt(WState{1, Call, nullptr, nullptr, {}}, bits(calls.size()));
-              }
-            }
-            // The buffer a cell holds is one object however the cell is
-            // reached: every load of that cell of that object names it.
-            if (const auto *L = llvm::dyn_cast<llvm::LoadInst>(V)) {
-              const llvm::Type *ty = nullptr;
-              std::vector<uint64_t> idx;
-              const llvm::Value *root = typedCell(L->getPointerOperand(), ty, idx);
-              if (root)
-                push(WState{3, root, s.ctx, ty, idx});
-            }
-            if (const auto *A = llvm::dyn_cast<llvm::Argument>(V)) {
-              if (const llvm::Value *act = actualOf(A, s.ctx)) {
-                push(WState{1, act, nullptr, nullptr, {}});
-              } else {
-                const auto &calls = callersOf(A->getParent());
-                for (const llvm::CallBase *Call : calls)
-                  if (Call && A->getArgNo() < Call->arg_size())
-                    pushAt(WState{1, Call->getArgOperand(A->getArgNo()), nullptr, nullptr, {}}, bits(calls.size()));
-              }
-            } else if (const auto *CB = llvm::dyn_cast<llvm::CallBase>(V)) {
-              // A pointer a call returns is the pointer its callee returns.
-              if (!CB->isInlineAsm())
-                for (const llvm::Function *D0 : witCallees(CB)) {
-                  const llvm::Function *D = definedBody(D0);
-                  if (!D || D->isDeclaration())
-                    continue;
-                  for (const llvm::BasicBlock &BB : *D) {
-                    const auto *R = llvm::dyn_cast<llvm::ReturnInst>(BB.getTerminator());
-                    if (R && R->getReturnValue() && R->getReturnValue()->getType()->isPointerTy())
-                      push(WState{1, R->getReturnValue(), CB, nullptr, {}});
-                  }
-                }
-            }
-            continue;
-          }
-          // kind 2: the stores and copies into this cell of this object.
-          // kind 3: the loads of the pointer this cell of this object holds,
-          // each naming the buffer that pointer points at.
-          // The object is followed as one object: the cell is written or
-          // read in the function holding the root, in every callee handed
-          // the object or a sub-object containing the cell (the path
-          // continues from the formal), and in every caller when the root
-          // is a formal (the path continues from the actual). Only when the
-          // object cannot be followed further -- it is read from the heap,
-          // returned by a call, a global, or a formal of an export or of a
-          // function nothing here calls -- does the cell stand for that
-          // field of every object of its type. A local object is followed
-          // completely and never merged by type.
-          const int kind = s.kind;
-          // A cell with no path is the object the root points at as a
-          // whole, and the stores into it are the writes through every name
-          // of that pointer: the buffer walk, which follows the pointer
-          // through locals, fields, calls and returns exactly.
-          if (kind == 2 && s.idx.empty()) {
-            push(WState{1, V, s.ctx, nullptr, {}});
-            continue;
-          }
-          const llvm::Function *Fn = fnOf(V);
-          if (Fn && !Fn->isDeclaration()) {
-            const FnWit &W = fnIndex(Fn);
-            if (kind == 2) {
-              auto cit = W.cells.find(V);
-              if (cit != W.cells.end())
-                for (const FnWit::CellDef &d : cit->second) {
-                  if (d.idx != s.idx)
-                    continue;
-                  if (const auto *St = llvm::dyn_cast<llvm::StoreInst>(d.inst)) {
-                    push(WState{0, St->getValueOperand(), s.ctx, nullptr, {}});
-                  } else if (const auto *C = llvm::dyn_cast<llvm::CallBase>(d.inst)) {
-                    const llvm::Value *dst = nullptr;
-                    const llvm::Value *src = nullptr;
-                    if (byteCopy(C, dst, src))
-                      push(WState{0, src, s.ctx, nullptr, {}});
-                  }
-                }
-            } else {
-              // The pointer the cell holds is named by every load of the
-              // cell and by every pointer stored into it.
-              auto lit = W.cellLoads.find(V);
-              if (lit != W.cellLoads.end())
-                for (const FnWit::CellDef &d : lit->second)
-                  if (d.idx == s.idx)
-                    push(WState{1, d.inst, s.ctx, nullptr, {}});
-              auto cit = W.cells.find(V);
-              if (cit != W.cells.end())
-                for (const FnWit::CellDef &d : cit->second) {
-                  if (d.idx != s.idx)
-                    continue;
-                  const auto *St = llvm::dyn_cast<llvm::StoreInst>(d.inst);
-                  if (St && St->getValueOperand()->getType()->isPointerTy())
-                    push(WState{1, St->getValueOperand(), s.ctx, nullptr, {}});
-                }
-            }
-          }
-          // The same cell under another name for its object: the actual
-          // behind a formal (through the context, else every caller), the
-          // address a callee returns behind a call result, and the pointers
-          // a cell holds behind a pointer loaded from it.
-          auto sameCell = [&](const llvm::Value *addr, const llvm::CallBase *ctx, int extra) {
-            WState n;
-            n.kind = kind;
-            n.ctx = ctx;
-            n.v = rebaseCell(s.ty, s.idx, addr, n.ty, n.idx);
-            pushAt(std::move(n), extra);
-          };
-          bool merged = true;
-          if (llvm::isa<llvm::AllocaInst>(V)) {
-            merged = false;
-          } else if (const auto *L = llvm::dyn_cast<llvm::LoadInst>(V)) {
-            // The root is a pointer read from memory: the object is each
-            // pointer the cell it was read from holds, as far as that cell
-            // is followed exactly; where it is not, the cell is merged by
-            // type.
-            const llvm::Type *t3 = nullptr;
-            std::vector<uint64_t> i3;
-            const llvm::Value *r3 = typedCell(L->getPointerOperand(), t3, i3);
-            const Prov &pr = provOf(r3, t3, i3, s.ctx);
-            for (const auto &pv : pr.vals)
-              sameCell(pv.first.first, pv.first.second, pv.second);
-            merged = pr.merged >= 0;
-          } else if (const auto *PN = llvm::dyn_cast<llvm::PHINode>(V)) {
-            merged = false;
-            for (const llvm::Value *in : PN->incoming_values())
-              sameCell(in, s.ctx, 0);
-          } else if (const auto *SI = llvm::dyn_cast<llvm::SelectInst>(V)) {
-            merged = false;
-            sameCell(SI->getTrueValue(), s.ctx, 0);
-            sameCell(SI->getFalseValue(), s.ctx, 0);
-          } else if (const auto *A = llvm::dyn_cast<llvm::Argument>(V)) {
+          if (const auto *A = llvm::dyn_cast<llvm::Argument>(V)) {
+            const llvm::Function *F = A->getParent();
+            // A formal of an export is one argument the harness can pass;
+            // the same formal is also whatever each caller passes, so the
+            // walk records the export and goes on.
+            if (alphabet(F))
+              note(F->getName().str(), static_cast<int>(A->getArgNo()));
             if (const llvm::Value *act = actualOf(A, s.ctx)) {
-              sameCell(act, nullptr, 0);
-              merged = false;
+              val(act, nullptr, 0);
             } else {
-              const auto &calls = callersOf(A->getParent());
+              const auto &calls = P.callers(F);
               for (const llvm::CallBase *Call : calls)
                 if (Call && A->getArgNo() < Call->arg_size())
-                  sameCell(Call->getArgOperand(A->getArgNo()), nullptr, bits(calls.size()));
-              merged = calls.empty() || alphabet(A->getParent());
+                  val(Call->getArgOperand(A->getArgNo()), nullptr, bits(calls.size()));
+              // A formal of a function nothing here calls is set by code
+              // outside both modules.
+              if (calls.empty() && !alphabet(F))
+                external(F);
             }
-          } else if (const auto *CB = llvm::dyn_cast<llvm::CallBase>(V)) {
-            if (!CB->isInlineAsm())
-              for (const llvm::Function *D0 : witCallees(CB)) {
+          } else if (const auto *PN = llvm::dyn_cast<llvm::PHINode>(V)) {
+            for (const llvm::Value *inc : PN->incoming_values())
+              val(inc, s.ctx, 0);
+          } else if (const auto *SI = llvm::dyn_cast<llvm::SelectInst>(V)) {
+            val(SI->getTrueValue(), s.ctx, 0);
+            val(SI->getFalseValue(), s.ctx, 0);
+          } else if (const auto *G = llvm::dyn_cast<llvm::GEPOperator>(V)) {
+            val(G->getPointerOperand(), s.ctx, 0);
+          } else if (const auto *L = llvm::dyn_cast<llvm::LoadInst>(V)) {
+            // A load reads the bytes [0, size) behind its address; a store
+            // into any of them defines part of the value.
+            const int64_t size =
+                static_cast<int64_t>(L->getModule()->getDataLayout().getTypeStoreSize(L->getType()));
+            deref(L->getPointerOperand(), 1, 0, size, size <= 0, s.ctx);
+          } else if (const auto *C = llvm::dyn_cast<llvm::CallBase>(V)) {
+            if (C->isInlineAsm()) {
+              external(C->getFunction());
+            } else {
+              if (!allocates(C) && P.unresolved(C))
+                externalCall(C);
+              for (const llvm::Function *D0 : P.callees(C)) {
                 const llvm::Function *D = definedBody(D0);
-                if (!D || D->isDeclaration())
+                if (!D || D->isDeclaration()) {
+                  if (allocates(C))
+                    continue;
+                  // A callee with no body that accesses no memory (the
+                  // IR's memory(none)) computes its result from its
+                  // arguments alone; its result's bytes are theirs.
+                  if (C->doesNotAccessMemory()) {
+                    for (const llvm::Value *a : C->args())
+                      val(a, s.ctx, 0);
+                    continue;
+                  }
+                  external(D0);
                   continue;
-                merged = false;
+                }
                 for (const llvm::BasicBlock &BB : *D) {
                   const auto *R = llvm::dyn_cast<llvm::ReturnInst>(BB.getTerminator());
                   if (R && R->getReturnValue())
-                    sameCell(R->getReturnValue(), CB, 0);
+                    val(R->getReturnValue(), C, 0);
                 }
               }
+            }
+          } else if (const auto *I = llvm::dyn_cast<llvm::Instruction>(V)) {
+            // Arithmetic, comparisons, aggregate and vector operations:
+            // the result's bytes are a function of the operands' bytes.
+            for (const llvm::Value *op : I->operands())
+              if (!llvm::isa<llvm::BasicBlock>(op))
+                val(op, s.ctx, 0);
           }
-          // The cell is also that field of every object of its type, at
-          // the cost of the bits that merge gives up: the exact names above
-          // are the cheaper paths when they exist, and the merge keeps the
-          // stores made through names the walk does not follow -- in
-          // callees handed the object, through the heap, in code outside
-          // the two modules' call graph as resolved here.
-          (void)merged;
-          if (kind == 2)
-            fieldDefs(s.ty, s.idx);
-          else
-            fieldLoads(s.ty, s.idx);
         }
+        if (P.solution() != solutionAtStart)
+          return std::nullopt;
         return out;
+      };
+      auto witnessOfFixed = [&](const llvm::Value *P0) -> Lab {
+        for (;;)
+          if (std::optional<Lab> got = witnessOf(P0))
+            return *got;
       };
       for (size_t i = 0; i < jdgs.size(); ++i) {
         if (suppress.count(i))
@@ -14676,11 +14295,10 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
           addOpen(jdgs[i].chop, jdgs[i].chopArg);
           const llvm::CallBase *C = jdgs[i].C;
           if (C && jdgs[i].chopArg >= 0 && static_cast<unsigned>(jdgs[i].chopArg) < C->arg_size()) {
-            buildWit();
             const llvm::Value *P0 = C->getArgOperand(static_cast<unsigned>(jdgs[i].chopArg));
             auto wit = witMemo.find(P0);
             if (wit == witMemo.end())
-              wit = witMemo.emplace(P0, witnessOf(P0)).first;
+              wit = witMemo.emplace(P0, witnessOfFixed(P0)).first;
             const Lab &got = wit->second;
             for (const auto &w : got)
               addWit(jdgs[i].chop, jdgs[i].chopArg, w.first.first, w.first.second, w.second);
