@@ -176,6 +176,20 @@ struct Witness {
   int cost = 0;
 };
 
+// One field write on an access path. off is the last field's byte offset
+// (Any when the index is not constant). type is that field's struct.
+// path is the field sequence from a pointer formal. fn is set when the
+// stored value is a function.
+struct Cell {
+  int chopArg = -1;
+  int64_t off = 0;
+  int64_t len = -1;
+  std::string func;
+  std::string fn;
+  std::string type;
+  std::string path;
+};
+
 struct EntryGroup {
   std::string chop;
   std::vector<std::string> entries;
@@ -186,11 +200,13 @@ struct EntryGroup {
   // An actual of this export that did not reduce. func is the export.
   std::vector<Input> unreduced;
   std::vector<int> openArgs;
+  std::vector<Cell> cells;
   std::vector<Witness> witnesses;
 };
 
 std::vector<EntryGroup> findEntries(llvm::Module &downstream, llvm::Module &upstream,
-                                   const std::vector<std::string> &chops);
+                                   const std::vector<std::string> &chops, const std::string &sinkFile = {},
+                                   unsigned sinkLine = 0, const std::vector<std::string> &sinkFns = {});
 
 std::string formatEntries(const ChopResult &chop, const std::vector<EntryGroup> &groups);
 

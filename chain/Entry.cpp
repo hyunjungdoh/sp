@@ -1,4 +1,5 @@
 #include "Entry.hpp"
+#include "Field.hpp"
 #include "Points.hpp"
 
 #include "llvm/Analysis/AliasAnalysis.h"
@@ -3691,7 +3692,8 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
                 const std::unordered_map<std::string, std::unordered_set<std::string>> &initialOf,
                 std::unordered_map<std::string, std::vector<Input>> &inputs,
                 std::unordered_map<std::string, std::vector<Input>> &unreduced,
-                std::unordered_map<std::string, std::vector<Witness>> &witnesses) {
+                std::unordered_map<std::string, std::vector<Witness>> &witnesses,
+                std::unordered_map<std::string, std::vector<Cell>> &cells) {
   const llvm::DataLayout &DL = M.getDataLayout();
   // A declaration in M is the function of the same name in the upstream
   // module, when that function has a body. The body is not a callee set.
@@ -7741,7 +7743,13 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
     if (!points) {
       Points::Hooks h;
       h.body = [&](const llvm::Function *F) { return definedBody(F); };
-      h.harness = [&](const llvm::Function *F) { return F && F->getParent() == &M && strongExport(F); };
+      // Export pointer formals contain one harness object, so a store of
+      // a function or of a field (a flag, a pointer) through one export
+      // is visible at the same offset of any other export. Other functions
+      // are entered only when a query's value flows through them.
+      h.harness = [&](const llvm::Function *F) {
+        return F && F->getParent() == &M && strongExport(F);
+      };
       h.allocates = [](const llvm::CallBase *C) { return allocates(C); };
       h.allocSize = [](const llvm::CallBase *C) { return allocSize(C); };
       h.allocSource = [](const llvm::CallBase *C) { return allocSource(C); };
@@ -7750,6 +7758,7 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
         return byteCopy(C, d, s);
       };
       points = std::make_unique<Points>(M, upstream, std::move(h));
+      // Queries solve the values they touch. There is no whole-module pass.
       points->saturate();
     }
     return *points;
@@ -13771,6 +13780,14 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
       // states are processed in cost order, so a state is processed first
       // at its least cost and a label records the least cost of any path
       // to it.
+      struct CellRec {
+        int64_t off = 0;
+        int64_t len = -1;
+        std::string func;
+        std::string fn;
+      };
+      std::vector<CellRec> keptCells;
+      std::unordered_map<const llvm::Value *, std::vector<CellRec>> cellMemo;
       auto witnessOf = [&](const llvm::Value *P0) -> std::optional<Lab> {
         Points &P = pointsOf();
         Lab out;
@@ -13984,8 +14001,13 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
           if (kind == 2) {
             const std::vector<unsigned> &objs = sets[sid].objs;
             const int extra = bits(objs.size());
+            // The harness object is the context the exports share. Its
+            // constant-offset cells are read by the loads on this path.
+            // Reading every byte of it would name every export that stores
+            // at any offset.
             for (unsigned o : objs)
-              cell(kWhole, o, 0, extra);
+              if (P.obj(o).kind != Points::Kind::Harness)
+                cell(kWhole, o, 0, extra);
             return;
           }
           // Expanding a cell can add sets; the set is read through its
@@ -13996,7 +14018,10 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
             const std::vector<unsigned> objs = sets[sid].objs;
             for (unsigned o : objs) {
               cell(kExt, o, 0, extra);
-              cell(kAny, o, 0, extra);
+              // A non-constant store is its own cell. It is not a definition
+              // of a constant field the path read.
+              if (P.obj(o).kind != Points::Kind::Harness)
+                cell(kAny, o, 0, extra);
             }
           }
           const std::vector<unsigned> &ids = sets[sid].ids;
@@ -14066,7 +14091,28 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
         // [lo, hi) maps to the source range at the same distance; a copy
         // of the whole source to all of it. A write made in a context is
         // walked in that context.
-        auto walkDef = [&](const Points::Def &d, int64_t lo, bool loInf, int64_t hi, bool hiInf) {
+        std::vector<CellRec> cellAcc;
+        std::set<std::tuple<int64_t, int64_t, std::string, std::string>> cellSeen;
+        auto noteCell = [&](unsigned obj, const Points::Def &d) {
+          if (P.obj(obj).kind != Points::Kind::Harness || !d.inst)
+            return;
+          const llvm::Function *WF = d.inst->getFunction();
+          if (!WF || !WF->hasName())
+            return;
+          std::string fn;
+          if (const auto *St = llvm::dyn_cast<llvm::StoreInst>(d.inst)) {
+            const llvm::Value *sv = St->getValueOperand()->stripPointerCasts();
+            if (const auto *Fn = llvm::dyn_cast<llvm::Function>(sv))
+              if (Fn->hasName())
+                fn = Fn->getName().str();
+          }
+          std::string func = WF->getName().str();
+          if (!cellSeen.insert({d.off, d.len, func, fn}).second)
+            return;
+          cellAcc.push_back(CellRec{d.off, d.len, std::move(func), std::move(fn)});
+        };
+        auto walkDef = [&](unsigned obj, const Points::Def &d, int64_t lo, bool loInf, int64_t hi, bool hiInf) {
+          noteCell(obj, d);
           const llvm::CallBase *wctx = P.site(d.ctx);
           if (const auto *St = llvm::dyn_cast<llvm::StoreInst>(d.inst)) {
             val(St->getValueOperand(), wctx, 0);
@@ -14113,7 +14159,7 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
           if (kind == kAny) {
             const std::vector<Points::Def> ds = P.regions(o).any;
             for (const Points::Def &d : ds)
-              walkDef(d, 0, true, 0, true);
+              walkDef(o, d, 0, true, 0, true);
             return;
           }
           if (kind == kWhole) {
@@ -14151,7 +14197,7 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
             const std::vector<Points::Def> ds = R.tree[node];
             const size_t leaves = R.leaves;
             for (const Points::Def &d : ds)
-              walkDef(d, lo, loInf, hi, hiInf);
+              walkDef(o, d, lo, loInf, hi, hiInf);
             if (node < leaves) {
               cell(kDown, o, 2 * node, 0);
               cell(kDown, o, 2 * node + 1, 0);
@@ -14164,7 +14210,7 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
             ds.insert(ds.end(), L.begin(), L.end());
           }
           for (const Points::Def &d : ds)
-            walkDef(d, lo, loInf, hi, hiInf);
+            walkDef(o, d, lo, loInf, hi, hiInf);
         };
         auto actualOf = [&](const llvm::Argument *A, const llvm::CallBase *ctx) -> const llvm::Value * {
           if (!ctx || A->getArgNo() >= ctx->arg_size())
@@ -14278,6 +14324,7 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
         }
         if (P.solution() != solutionAtStart)
           return std::nullopt;
+        keptCells = std::move(cellAcc);
         return out;
       };
       auto witnessOfFixed = [&](const llvm::Value *P0) -> Lab {
@@ -14293,16 +14340,6 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
             addIn(jdgs[i].chop, jdgs[i].chopArg, a.first, a.second);
         } else if (jdgs[i].kind == 2) {
           addOpen(jdgs[i].chop, jdgs[i].chopArg);
-          const llvm::CallBase *C = jdgs[i].C;
-          if (C && jdgs[i].chopArg >= 0 && static_cast<unsigned>(jdgs[i].chopArg) < C->arg_size()) {
-            const llvm::Value *P0 = C->getArgOperand(static_cast<unsigned>(jdgs[i].chopArg));
-            auto wit = witMemo.find(P0);
-            if (wit == witMemo.end())
-              wit = witMemo.emplace(P0, witnessOfFixed(P0)).first;
-            const Lab &got = wit->second;
-            for (const auto &w : got)
-              addWit(jdgs[i].chop, jdgs[i].chopArg, w.first.first, w.first.second, w.second);
-          }
         }
       }
     }
@@ -14340,10 +14377,164 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
   }
 }
 
+// One harness object. Every pointer formal in either module may be that
+// object, so a constant-offset store through any of them is a cell. A
+// non-constant address is the Any cell. A pointer loaded from the object
+// is the same object again: the field store on it is kept at its own
+// offset. Nothing is dropped because a query did not read that offset.
+std::vector<Cell> wideCells(llvm::Module &downstream, llvm::Module &upstream) {
+  auto offOf = [](const llvm::GEPOperator *G, const llvm::DataLayout &Layout) -> int64_t {
+    if (!G)
+      return Points::Any;
+    llvm::APInt off(Layout.getIndexSizeInBits(G->getPointerAddressSpace()), 0);
+    if (!G->accumulateConstantOffset(Layout, off))
+      return Points::Any;
+    if (off.getSignificantBits() > 63 && !off.isNegative())
+      return Points::Any;
+    return off.getSExtValue();
+  };
+  auto addOff = [](int64_t k, int64_t d) -> int64_t {
+    if (k == Points::Any || d == Points::Any)
+      return Points::Any;
+    const __int128 s = static_cast<__int128>(k) + d;
+    if (s > INT64_MAX || s < INT64_MIN)
+      return Points::Any;
+    return static_cast<int64_t>(s);
+  };
+
+  std::vector<Cell> out;
+  std::set<std::tuple<int64_t, int64_t, std::string, std::string>> seen;
+  auto emit = [&](const llvm::StoreInst *St, int64_t off) {
+    const llvm::Function *F = St->getFunction();
+    if (!F || !F->hasName())
+      return;
+    std::string fn;
+    if (const auto *Fn = llvm::dyn_cast<llvm::Function>(St->getValueOperand()->stripPointerCasts()))
+      if (Fn->hasName())
+        fn = Fn->getName().str();
+    const int64_t len =
+        static_cast<int64_t>(St->getModule()->getDataLayout().getTypeStoreSize(St->getValueOperand()->getType()));
+    if (!seen.insert({off, len, F->getName().str(), fn}).second)
+      return;
+    Cell c;
+    c.chopArg = -1;
+    c.off = off;
+    c.len = len;
+    c.func = F->getName().str();
+    c.fn = std::move(fn);
+    out.push_back(std::move(c));
+  };
+
+  auto walkFn = [&](llvm::Function &F) {
+    if (F.isDeclaration())
+      return;
+    const llvm::DataLayout &Layout = F.getParent()->getDataLayout();
+    struct WOff {
+      bool any = false;
+      bool have = false;
+      int64_t one = 0;
+    };
+    std::unordered_map<const llvm::Value *, WOff> st;
+    std::vector<std::pair<const llvm::Value *, int64_t>> work;
+    auto enqueue = [&](const llvm::Value *v, int64_t off) {
+      if (!v)
+        return;
+      WOff &s = st[v];
+      if (s.any)
+        return;
+      if (off == Points::Any) {
+        s.any = true;
+        work.emplace_back(v, Points::Any);
+        return;
+      }
+      if (!s.have) {
+        s.have = true;
+        s.one = off;
+        work.emplace_back(v, off);
+        return;
+      }
+      if (s.one == off)
+        return;
+      s.any = true;
+      work.emplace_back(v, Points::Any);
+    };
+    for (llvm::Argument &A : F.args())
+      if (A.getType()->isPointerTy())
+        enqueue(&A, 0);
+    while (!work.empty()) {
+      const llvm::Value *v = work.back().first;
+      const int64_t off = work.back().second;
+      work.pop_back();
+      for (const llvm::User *U : v->users()) {
+        if (const auto *St = llvm::dyn_cast<llvm::StoreInst>(U)) {
+          if (St->getPointerOperand() == v)
+            emit(St, off);
+          else if (St->getValueOperand() == v)
+            if (const auto *AI = llvm::dyn_cast<llvm::AllocaInst>(St->getPointerOperand()))
+              for (const llvm::User *LU : AI->users())
+                if (const auto *Ld = llvm::dyn_cast<llvm::LoadInst>(LU))
+                  if (Ld->getPointerOperand() == AI)
+                    enqueue(Ld, off);
+          continue;
+        }
+        if (const auto *Ld = llvm::dyn_cast<llvm::LoadInst>(U)) {
+          if (Ld->getPointerOperand() == v && Ld->getType()->isPointerTy())
+            enqueue(Ld, 0);
+          continue;
+        }
+        if (const auto *C = llvm::dyn_cast<llvm::CastInst>(U)) {
+          if (C->getType()->isPointerTy())
+            enqueue(C, off);
+          continue;
+        }
+        if (const auto *Fz = llvm::dyn_cast<llvm::FreezeInst>(U)) {
+          if (Fz->getType()->isPointerTy())
+            enqueue(Fz, off);
+          continue;
+        }
+        if (const auto *PN = llvm::dyn_cast<llvm::PHINode>(U)) {
+          if (PN->getType()->isPointerTy())
+            enqueue(PN, off);
+          continue;
+        }
+        if (const auto *Sel = llvm::dyn_cast<llvm::SelectInst>(U)) {
+          if (Sel->getType()->isPointerTy())
+            enqueue(Sel, off);
+          continue;
+        }
+        if (const auto *CE = llvm::dyn_cast<llvm::ConstantExpr>(U)) {
+          if (CE->isCast() && CE->getType()->isPointerTy())
+            enqueue(CE, off);
+          else if (const auto *G = llvm::dyn_cast<llvm::GEPOperator>(CE))
+            if (G->getPointerOperand() == v)
+              enqueue(G, addOff(off, offOf(G, Layout)));
+          continue;
+        }
+        if (const auto *G = llvm::dyn_cast<llvm::GEPOperator>(U))
+          if (G->getPointerOperand() == v)
+            enqueue(G, addOff(off, offOf(G, Layout)));
+      }
+    }
+  };
+  for (llvm::Function &F : downstream)
+    walkFn(F);
+  for (llvm::Function &F : upstream)
+    walkFn(F);
+  std::sort(out.begin(), out.end(), [](const Cell &a, const Cell &b) {
+    if (a.off != b.off)
+      return a.off < b.off;
+    if (a.func != b.func)
+      return a.func < b.func;
+    return a.fn < b.fn;
+  });
+  return out;
+}
+
 } // namespace
 
 std::vector<EntryGroup> findEntries(llvm::Module &downstream, llvm::Module &upstream,
-                                   const std::vector<std::string> &chops) {
+                                   const std::vector<std::string> &chops, const std::string &sinkFile,
+                                   unsigned sinkLine, const std::vector<std::string> &sinkFns) {
   std::unordered_set<std::string> want(chops.begin(), chops.end());
   Solve solve(downstream);
 
@@ -14467,12 +14658,19 @@ std::vector<EntryGroup> findEntries(llvm::Module &downstream, llvm::Module &upst
   std::unordered_map<std::string, std::vector<Input>> inputs;
   std::unordered_map<std::string, std::vector<Input>> unreduced;
   std::unordered_map<std::string, std::vector<Witness>> witnesses;
+  std::unordered_map<std::string, std::vector<Cell>> cells;
   if (!reachAll.empty())
     fillInputs(solve, downstream, upstream, reachAll, namedCallers, entriesOf, initialOf, inputs, unreduced,
-               witnesses);
+               witnesses, cells);
+  std::vector<Cell> wide = fieldCells(downstream, upstream, sinkFile, sinkLine, sinkFns);
+  bool widePlaced = false;
   for (EntryGroup &g : groups) {
     g.inputs = std::move(inputs[g.chop]);
     g.unreduced = std::move(unreduced[g.chop]);
+    if (!widePlaced) {
+      g.cells = std::move(wide);
+      widePlaced = true;
+    }
     g.witnesses = std::move(witnesses[g.chop]);
   }
   return groups;
@@ -14501,6 +14699,21 @@ std::string formatEntries(const ChopResult &chop, const std::vector<EntryGroup> 
       o << "open " << in.chopArg << " " << in.func << "\n";
     for (int a : g.openArgs)
       o << "open " << a << "\n";
+    for (const Cell &c : g.cells) {
+      o << "cell " << c.chopArg << " ";
+      if (c.off == Points::Any)
+        o << "any";
+      else
+        o << c.off;
+      o << " " << c.func << " " << c.len;
+      if (!c.type.empty())
+        o << " " << c.type;
+      if (!c.path.empty())
+        o << " path " << c.path;
+      if (!c.fn.empty())
+        o << " fn " << c.fn;
+      o << "\n";
+    }
     for (const Witness &w : g.witnesses)
     {
       o << "witness " << w.chopArg << " " << w.entry << " ";
