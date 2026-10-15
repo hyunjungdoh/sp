@@ -14662,13 +14662,14 @@ std::vector<EntryGroup> findEntries(llvm::Module &downstream, llvm::Module &upst
   if (!reachAll.empty())
     fillInputs(solve, downstream, upstream, reachAll, namedCallers, entriesOf, initialOf, inputs, unreduced,
                witnesses, cells);
-  std::vector<Cell> wide = fieldCells(downstream, upstream, sinkFile, sinkLine, sinkFns);
+  FieldReport wide = fieldCells(downstream, upstream, sinkFile, sinkLine, sinkFns, chops, inputs);
   bool widePlaced = false;
   for (EntryGroup &g : groups) {
     g.inputs = std::move(inputs[g.chop]);
     g.unreduced = std::move(unreduced[g.chop]);
     if (!widePlaced) {
-      g.cells = std::move(wide);
+      g.cells = std::move(wide.cells);
+      g.seqs = std::move(wide.seqs);
       widePlaced = true;
     }
     g.witnesses = std::move(witnesses[g.chop]);
@@ -14713,7 +14714,11 @@ std::string formatEntries(const ChopResult &chop, const std::vector<EntryGroup> 
       if (!c.fn.empty())
         o << " fn " << c.fn;
       o << "\n";
+      for (const std::string &r : c.roots)
+        o << "root " << r << "\n";
     }
+    for (const std::string &s : g.seqs)
+      o << "seq " << s << "\n";
     for (const Witness &w : g.witnesses)
     {
       o << "witness " << w.chopArg << " " << w.entry << " ";

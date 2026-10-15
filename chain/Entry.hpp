@@ -180,6 +180,9 @@ struct Witness {
 // (Any when the index is not constant). type is that field's struct.
 // path is the field sequence from a pointer formal. fn is set when the
 // stored value is a function.
+// roots is each input argument whose value reaches this write. Each line
+// is pass, the input argument, the field path, the input function, and one
+// call sequence from that input to the write.
 struct Cell {
   int chopArg = -1;
   int64_t off = 0;
@@ -188,6 +191,7 @@ struct Cell {
   std::string fn;
   std::string type;
   std::string path;
+  std::vector<std::string> roots;
 };
 
 struct EntryGroup {
@@ -201,6 +205,8 @@ struct EntryGroup {
   std::vector<Input> unreduced;
   std::vector<int> openArgs;
   std::vector<Cell> cells;
+  // Call sequences from an export through the chop. A sequence does not label a field.
+  std::vector<std::string> seqs;
   std::vector<Witness> witnesses;
 };
 
