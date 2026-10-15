@@ -31,7 +31,14 @@ namespace chain {
 // named struct is that named struct's field. An export argument whose
 // declared type, after peeling pointer, reference, and typedef, is a
 // string or string_view labels only fields of that string. The call
-// sequence from that export through the chop stays a separate fact.
+// sequence is a path in the resolved call graph from that export to the
+// sink function, and it ends at the sink. Use-def selects the export and
+// the chop; it does not insert an edge. A call whose operand denotes a
+// formal targets the functions passed as that formal.
+// A function-pointer slot drops a byte-0 step only when that field's type
+// is the struct the next step indexes. A function stored at a constant
+// index of a global pointer array is a target of a call that loads that
+// index from an object of the same size, including a base embedded at byte 0.
 // A struct of pointers is an object, and its fields stay labeled.
 // A phi takes the deps of the branch conditions that select its incoming edges.
 // A store takes the deps of the branch conditions its block is control-dependent on.

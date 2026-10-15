@@ -15,6 +15,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -136,10 +137,18 @@ struct Pub {
   int box = -1;
 };
 
+// An indirect call whose operand denotes formal `formal` of `home`.
+struct CallArg {
+  int formal = -1;
+  llvm::FunctionType *fty = nullptr;
+};
+
 struct Site {
   llvm::Function *callee = nullptr;
+  llvm::Function *home = nullptr;
   llvm::FunctionType *fty = nullptr;
   int calleeBox = -1;
+  int calleeFormal = -1;
   std::vector<int> calleeKeys;
   std::vector<ArgAt> args;
 };
@@ -161,6 +170,7 @@ struct FnSum {
   std::vector<CopySite> copies;
   std::vector<Site> sites;
   std::vector<Pub> pubs;
+  std::vector<CallArg> callArgs;
   std::vector<int> lineKeys;
   std::vector<int> nameKeys;
   std::vector<int> lineFormals;
@@ -250,6 +260,8 @@ class Engine {
   std::unordered_map<llvm::Function *, int> ord;
   std::unordered_map<llvm::Function *, FnSum> sum;
   std::unordered_map<int, std::unordered_set<llvm::Function *>> fnAt;
+  // Functions passed as a formal, keyed by the callee and the formal index.
+  std::unordered_map<llvm::Function *, std::unordered_map<int, std::unordered_set<llvm::Function *>>> fnPassed;
   // Functions stored through a call, keyed by the object's field chain and the inner slot.
   std::unordered_map<std::uint64_t, std::unordered_set<llvm::Function *>> held;
   std::vector<WRef> extra;
@@ -747,6 +759,100 @@ class Engine {
     };
     scanGlobals(down);
     scanGlobals(up);
+    // A vtable is a global array of functions. The object stores the array
+    // address plus a constant bias. A call loads a constant index from that
+    // address. The target set is the functions at that index whose object has
+    // the receiver's size. A base embedded at byte 0 shares the receiver size.
+    auto fileRelative = [&](llvm::Module &M) {
+      const llvm::DataLayout &DL = M.getDataLayout();
+      constexpr int kRel = 0x40000000;
+      auto pack = [](int sz, int64_t off) -> int64_t {
+        return ((int64_t)sz << 32) | (off & 0xffffffffLL);
+      };
+      for (llvm::GlobalVariable &G : M.globals()) {
+        if (!G.hasInitializer())
+          continue;
+        std::map<int64_t, std::set<int>> byBias;
+        for (llvm::User *U : G.users()) {
+          const auto *GOP = llvm::dyn_cast<llvm::GEPOperator>(U);
+          if (!GOP)
+            continue;
+          llvm::APInt ap(DL.getIndexSizeInBits(GOP->getPointerAddressSpace()), 0);
+          if (!GOP->accumulateConstantOffset(DL, ap) || ap.isNegative())
+            continue;
+          int64_t bias = ap.getSExtValue();
+          for (llvm::User *UU : U->users()) {
+            auto *St = llvm::dyn_cast<llvm::StoreInst>(UU);
+            if (!St || St->getValueOperand()->stripPointerCasts() != U)
+              continue;
+            const llvm::Value *dest = St->getPointerOperand()->stripPointerCasts();
+            std::set<int> sizes;
+            std::set<llvm::StructType *> seenTy;
+            auto addSizes = [&](llvm::StructType *ST, auto &self) -> void {
+              if (!ST || ST->isOpaque() || !seenTy.insert(ST).second)
+                return;
+              int sz = (int)DL.getTypeAllocSize(ST);
+              if (sz > 0)
+                sizes.insert(sz);
+              if (ST->getNumElements() == 0)
+                return;
+              if (DL.getStructLayout(ST)->getElementOffset(0) != 0)
+                return;
+              if (auto *fs = llvm::dyn_cast<llvm::StructType>(ST->getElementType(0)))
+                self(fs, self);
+            };
+            for (llvm::Instruction &I : llvm::instructions(*St->getFunction())) {
+              const auto *GG = llvm::dyn_cast<llvm::GEPOperator>(&I);
+              if (!GG || GG->getPointerOperand()->stripPointerCasts() != dest)
+                continue;
+              if (auto *ST = llvm::dyn_cast<llvm::StructType>(GG->getSourceElementType()))
+                addSizes(const_cast<llvm::StructType *>(ST), addSizes);
+            }
+            if (const auto *A = llvm::dyn_cast<llvm::Argument>(dest)) {
+              if (A->hasAttribute(llvm::Attribute::Dereferenceable)) {
+                uint64_t d = A->getAttribute(llvm::Attribute::Dereferenceable).getDereferenceableBytes();
+                if (d > 0 && d < 0x80000000u)
+                  sizes.insert((int)d);
+              }
+            }
+            byBias[bias].insert(sizes.begin(), sizes.end());
+          }
+        }
+        if (byBias.empty())
+          continue;
+        auto rec = [&](llvm::Constant *C, int64_t at, auto &self) -> void {
+          if (!C)
+            return;
+          if (const auto *CS = llvm::dyn_cast<llvm::ConstantStruct>(C)) {
+            const llvm::StructLayout *SL = DL.getStructLayout(CS->getType());
+            for (unsigned i = 0; i < CS->getNumOperands(); ++i)
+              self(CS->getOperand(i), at + (int64_t)SL->getElementOffset(i), self);
+            return;
+          }
+          if (const auto *CA = llvm::dyn_cast<llvm::ConstantArray>(C)) {
+            int64_t es = (int64_t)DL.getTypeAllocSize(CA->getType()->getElementType());
+            for (unsigned i = 0; i < CA->getNumOperands(); ++i)
+              self(llvm::cast<llvm::Constant>(CA->getOperand(i)), at + (int64_t)i * es, self);
+            return;
+          }
+          const auto *Fn = llvm::dyn_cast<llvm::Function>(C->stripPointerCasts());
+          if (!Fn || !Fn->hasName() || Fn->isIntrinsic())
+            return;
+          for (const auto &bs : byBias) {
+            if (at < bs.first)
+              continue;
+            for (int sz : bs.second) {
+              int slot = slotStep(0, kRel, pack(sz, at - bs.first));
+              if (slot > 0)
+                fnAt[slot].insert(const_cast<llvm::Function *>(Fn));
+            }
+          }
+        };
+        rec(G.getInitializer(), 0, rec);
+      }
+    };
+    fileRelative(down);
+    fileRelative(up);
   }
 
   void callGraph() {
@@ -807,6 +913,10 @@ class Engine {
       h ^= (uint64_t)(unsigned)p.slot * 0xc2b2ae35ULL;
       h ^= (uint64_t)(unsigned)p.box * 0x27d4eb2fULL;
     }
+    for (const CallArg &c : s.callArgs) {
+      h ^= (uint64_t)(unsigned)c.formal * 0x165667b1ULL;
+      h ^= (uint64_t)(uintptr_t)c.fty;
+    }
     return h;
   }
 
@@ -860,6 +970,64 @@ class Engine {
         }
       }
     }
+  }
+
+  // The value denotes a formal when it is that formal, a cast, or a reload of
+  // an alloca that holds only that formal. A field load is a different value.
+  int denotesFormal(const llvm::Value *V) const {
+    std::unordered_set<const llvm::Value *> seen;
+    std::function<int(const llvm::Value *)> walk = [&](const llvm::Value *U) -> int {
+      if (!U || !seen.insert(U).second)
+        return -1;
+      if (const auto *A = llvm::dyn_cast<llvm::Argument>(U))
+        return (int)A->getArgNo();
+      if (const auto *C = llvm::dyn_cast<llvm::CastInst>(U))
+        return walk(C->getOperand(0));
+      if (const auto *CE = llvm::dyn_cast<llvm::ConstantExpr>(U)) {
+        if (CE->isCast())
+          return walk(CE->getOperand(0));
+        return -1;
+      }
+      if (const auto *Fz = llvm::dyn_cast<llvm::FreezeInst>(U))
+        return walk(Fz->getOperand(0));
+      if (const auto *PN = llvm::dyn_cast<llvm::PHINode>(U)) {
+        if (PN->getNumIncomingValues() == 0)
+          return -1;
+        int f = -1;
+        for (unsigned i = 0; i < PN->getNumIncomingValues(); ++i) {
+          int g = walk(PN->getIncomingValue(i));
+          if (g < 0 || (f >= 0 && g != f))
+            return -1;
+          f = g;
+        }
+        return f;
+      }
+      if (const auto *Sel = llvm::dyn_cast<llvm::SelectInst>(U)) {
+        int a = walk(Sel->getTrueValue());
+        int b = walk(Sel->getFalseValue());
+        return a >= 0 && a == b ? a : -1;
+      }
+      if (const auto *Ld = llvm::dyn_cast<llvm::LoadInst>(U)) {
+        const auto *AI = llvm::dyn_cast<llvm::AllocaInst>(Ld->getPointerOperand()->stripPointerCasts());
+        if (!AI)
+          return -1;
+        int f = -1;
+        bool any = false;
+        for (const llvm::User *SU : AI->users()) {
+          const auto *St = llvm::dyn_cast<llvm::StoreInst>(SU);
+          if (!St || St->getPointerOperand()->stripPointerCasts() != AI)
+            continue;
+          int g = walk(St->getValueOperand());
+          if (g < 0 || (f >= 0 && g != f))
+            return -1;
+          f = g;
+          any = true;
+        }
+        return any ? f : -1;
+      }
+      return -1;
+    };
+    return walk(V);
   }
 
   void analyze(llvm::Function &F) {
@@ -988,6 +1156,17 @@ class Engine {
               }
             }
             fnAt[p.slot].insert(nit->second);
+          }
+          for (const CallArg &c : pit->second.callArgs) {
+            if (c.formal < 0 || c.formal >= (int)CB->arg_size())
+              continue;
+            const auto *Fn = llvm::dyn_cast<llvm::Function>(CB->getArgOperand((unsigned)c.formal)->stripPointerCasts());
+            if (!Fn || !Fn->hasName() || !callTypeMatches(Fn, c.fty))
+              continue;
+            auto nit = byName.find(Fn->getName().str());
+            if (nit == byName.end())
+              continue;
+            fnPassed[target][c.formal].insert(nit->second);
           }
         }
         takeRet(target);
@@ -1505,12 +1684,23 @@ class Engine {
           callee = bodyOf(FN);
         Site site;
         site.callee = callee;
+        site.home = &F;
         if (!callee) {
           site.fty = CB->getFunctionType();
+          int denoted = denotesFormal(CB->getCalledOperand());
+          if (denoted >= 0) {
+            site.calleeFormal = denoted;
+            next.callArgs.push_back(CallArg{denoted, CB->getFunctionType()});
+          }
           int slot = fnSlotOf(CB->getCalledOperand(), DL);
           if (slot > 0) {
             site.calleeKeys.push_back(slot);
             next.indirectKeys.push_back(slot);
+          }
+          int vslot = vtableSlot(CB, DL);
+          if (vslot > 0) {
+            site.calleeKeys.push_back(vslot);
+            next.indirectKeys.push_back(vslot);
           }
           auto bit = byVal.find(CB->getCalledOperand());
           if (bit != byVal.end())
@@ -1663,6 +1853,16 @@ class Engine {
                     next.pubs.end());
     std::sort(next.indirectKeys.begin(), next.indirectKeys.end());
     next.indirectKeys.erase(std::unique(next.indirectKeys.begin(), next.indirectKeys.end()), next.indirectKeys.end());
+    std::sort(next.callArgs.begin(), next.callArgs.end(), [](const CallArg &a, const CallArg &b) {
+      if (a.formal != b.formal)
+        return a.formal < b.formal;
+      return (uintptr_t)a.fty < (uintptr_t)b.fty;
+    });
+    next.callArgs.erase(std::unique(next.callArgs.begin(), next.callArgs.end(),
+                                    [](const CallArg &a, const CallArg &b) {
+                                      return a.formal == b.formal && a.fty == b.fty;
+                                    }),
+                        next.callArgs.end());
     next.retSig = retSigOf(next);
     next.fnSig = fnSigOf(next);
     sum[&F] = std::move(next);
@@ -1785,43 +1985,82 @@ class Engine {
     return keyAt(ty, off);
   }
 
+  // holder.field0 is the embedded struct `inner` when their layouts match.
+  bool embeddedHeader(const llvm::StructType *holder, const llvm::StructType *inner, const llvm::DataLayout &DL) const {
+    if (!holder || !inner || holder->isOpaque() || inner->isOpaque() || holder->getNumElements() == 0)
+      return false;
+    const llvm::StructLayout *SL = DL.getStructLayout(const_cast<llvm::StructType *>(holder));
+    for (unsigned i = 0; i < holder->getNumElements(); ++i) {
+      if (SL->getElementOffset(i) != 0)
+        continue;
+      const auto *fs = llvm::dyn_cast<llvm::StructType>(holder->getElementType(i));
+      if (!fs || fs->isOpaque())
+        return false;
+      if (fs == inner)
+        return true;
+      if (fs->getNumElements() != inner->getNumElements())
+        return false;
+      const llvm::StructLayout *A = DL.getStructLayout(const_cast<llvm::StructType *>(fs));
+      const llvm::StructLayout *B = DL.getStructLayout(const_cast<llvm::StructType *>(inner));
+      if (A->getSizeInBytes() != B->getSizeInBytes())
+        return false;
+      for (unsigned j = 0; j < fs->getNumElements(); ++j) {
+        if (A->getElementOffset(j) != B->getElementOffset(j))
+          return false;
+        const llvm::Type *ea = fs->getElementType(j);
+        const llvm::Type *eb = inner->getElementType(j);
+        if (ea->isPointerTy() && eb->isPointerTy())
+          continue;
+        if (ea != eb)
+          return false;
+      }
+      return true;
+    }
+    return false;
+  }
+
   int fnSlotOf(const llvm::Value *V, const llvm::DataLayout &DL) {
     std::set<const llvm::Value *> seen;
-    std::function<int(const llvm::Value *)> walk = [&](const llvm::Value *U) -> int {
+    // `into` is the struct the caller indexes. A byte-0 step is dropped only
+    // when it is that struct embedded at the front of the holder.
+    std::function<int(const llvm::Value *, bool, const llvm::StructType *)> walk =
+        [&](const llvm::Value *U, bool outermost, const llvm::StructType *into) -> int {
       if (!U || !seen.insert(U).second)
         return 0;
       if (const auto *CE = llvm::dyn_cast<llvm::ConstantExpr>(U)) {
         if (CE->isCast())
-          return walk(CE->getOperand(0));
+          return walk(CE->getOperand(0), outermost, into);
         if (CE->getOpcode() != llvm::Instruction::GetElementPtr)
           return 0;
       }
       if (const auto *G = llvm::dyn_cast<llvm::GEPOperator>(U)) {
-        int base = walk(G->getPointerOperand());
         const llvm::Type *src = G->getSourceElementType();
         const auto *ST = llvm::dyn_cast<llvm::StructType>(src);
         if (!ST)
           if (const auto *AT = llvm::dyn_cast<llvm::ArrayType>(src))
             ST = llvm::dyn_cast<llvm::StructType>(AT->getElementType());
-        if (!ST)
-          return base;
-        int ty = internType(ST);
+        int base = walk(G->getPointerOperand(), false, ST);
         int64_t off = Any;
         llvm::APInt ap(DL.getIndexSizeInBits(G->getPointerAddressSpace()), 0);
         if (G->accumulateConstantOffset(DL, ap)) {
           if (ap.getSignificantBits() <= 63 || ap.isNegative())
             off = ap.getSExtValue();
         }
+        if (!ST)
+          return base;
+        int ty = internType(ST);
+        if (off == 0 && !outermost && embeddedHeader(ST, into, DL))
+          return base;
         return slotStep(base, ty, off);
       }
       if (const auto *Ld = llvm::dyn_cast<llvm::LoadInst>(U))
-        return walk(Ld->getPointerOperand());
+        return walk(Ld->getPointerOperand(), false, nullptr);
       if (const auto *AI = llvm::dyn_cast<llvm::AllocaInst>(U)) {
         for (const llvm::User *SU : AI->users()) {
           const auto *St = llvm::dyn_cast<llvm::StoreInst>(SU);
           if (!St || St->getPointerOperand() != AI)
             continue;
-          int k = walk(St->getValueOperand());
+          int k = walk(St->getValueOperand(), true, nullptr);
           if (k > 0)
             return k;
         }
@@ -1848,24 +2087,73 @@ class Engine {
         return 0;
       }
       if (const auto *C = llvm::dyn_cast<llvm::CastInst>(U))
-        return walk(C->getOperand(0));
+        return walk(C->getOperand(0), outermost, into);
       if (const auto *Fz = llvm::dyn_cast<llvm::FreezeInst>(U))
-        return walk(Fz->getOperand(0));
+        return walk(Fz->getOperand(0), outermost, into);
       if (const auto *PN = llvm::dyn_cast<llvm::PHINode>(U)) {
         for (unsigned i = 0; i < PN->getNumIncomingValues(); ++i) {
-          int k = walk(PN->getIncomingValue(i));
+          int k = walk(PN->getIncomingValue(i), outermost, into);
           if (k > 0)
             return k;
         }
         return 0;
       }
       if (const auto *Sel = llvm::dyn_cast<llvm::SelectInst>(U)) {
-        int k = walk(Sel->getTrueValue());
-        return k > 0 ? k : walk(Sel->getFalseValue());
+        int k = walk(Sel->getTrueValue(), outermost, into);
+        return k > 0 ? k : walk(Sel->getFalseValue(), outermost, into);
       }
       return 0;
     };
-    return walk(V);
+    return walk(V, true, nullptr);
+  }
+
+  // Virtual call: load the vptr, then a constant pointer index. The receiver
+  // is the object whose vptr was loaded, and its size is the dereferenceable
+  // byte count on that call argument. The same pair is what fileRelative stores.
+  int vtableSlot(const llvm::CallBase *CB, const llvm::DataLayout &DL) {
+    const llvm::Value *V = CB->getCalledOperand();
+    auto peel = [](const llvm::Value *X) {
+      while (X) {
+        if (const auto *C = llvm::dyn_cast<llvm::CastInst>(X))
+          X = C->getOperand(0);
+        else if (const auto *CE = llvm::dyn_cast<llvm::ConstantExpr>(X)) {
+          if (!CE->isCast())
+            break;
+          X = CE->getOperand(0);
+        } else
+          break;
+      }
+      return X;
+    };
+    V = peel(V);
+    const auto *Ld = llvm::dyn_cast<llvm::LoadInst>(V);
+    if (!Ld)
+      return 0;
+    const auto *G = llvm::dyn_cast<llvm::GEPOperator>(peel(Ld->getPointerOperand()));
+    if (!G || !G->getSourceElementType()->isPointerTy())
+      return 0;
+    llvm::APInt ap(DL.getIndexSizeInBits(G->getPointerAddressSpace()), 0);
+    if (!G->accumulateConstantOffset(DL, ap) || ap.isNegative())
+      return 0;
+    int64_t off = ap.getSExtValue();
+    if (off <= 0)
+      return 0;
+    const auto *vptr = llvm::dyn_cast<llvm::LoadInst>(peel(G->getPointerOperand()));
+    if (!vptr)
+      return 0;
+    const llvm::Value *obj = peel(vptr->getPointerOperand());
+    int sz = 0;
+    for (unsigned i = 0; i < CB->arg_size(); ++i) {
+      if (peel(CB->getArgOperand(i)) != obj)
+        continue;
+      uint64_t d = CB->getParamDereferenceableBytes(i);
+      if (d > 0 && d < 0x80000000u)
+        sz = (int)d;
+      break;
+    }
+    if (sz <= 0)
+      return 0;
+    return slotStep(0, 0x40000000, ((int64_t)sz << 32) | (off & 0xffffffffLL));
   }
 
   // Field key of a function pointer loaded from a global or an argument,
@@ -2285,6 +2573,15 @@ class Engine {
           }
         }
       }
+      if (site.calleeFormal >= 0 && site.home) {
+        auto fit = fnPassed.find(site.home);
+        if (fit != fnPassed.end()) {
+          auto git = fit->second.find(site.calleeFormal);
+          if (git != fit->second.end())
+            for (llvm::Function *T : git->second)
+              take(T);
+        }
+      }
       return tg;
     };
     struct AHit {
@@ -2334,6 +2631,91 @@ class Engine {
       };
       std::vector<Item> rq;
       std::unordered_set<RK, RKHash> seenR;
+      auto passBoxes = [](const Site &site, const std::vector<int> &boxes) {
+        std::vector<int> next(site.args.size(), 0);
+        if (!site.callee)
+          return next;
+        for (unsigned i = 0; i < site.args.size(); ++i) {
+          int c = site.args[i].chain;
+          if (c == 0)
+            for (int f : site.args[i].formals)
+              if (f >= 0 && f < (int)boxes.size() && boxes[(size_t)f] > 0)
+                c = boxes[(size_t)f];
+          next[i] = c;
+        }
+        return next;
+      };
+      auto boxHash = [](const std::vector<int> &boxes) {
+        uint64_t bh = 1469598103934665603ull;
+        for (int c : boxes)
+          bh = (bh ^ (uint64_t)(unsigned)c) * 1099511628211ull;
+        return bh;
+      };
+      // A sequence is a path in the resolved call graph. Use-def names the
+      // export and the chop; it does not add an edge between them.
+      struct FF {
+        llvm::Function *a = nullptr;
+        llvm::Function *b = nullptr;
+        bool operator==(const FF &o) const { return a == o.a && b == o.b; }
+      };
+      struct FFHash {
+        size_t operator()(const FF &k) const { return ((size_t)k.a >> 4) ^ ((size_t)k.b >> 5); }
+      };
+      std::unordered_map<FF, std::vector<llvm::Function *>, FFHash> pathMemo;
+      auto callPath = [&](llvm::Function *from, llvm::Function *to) {
+        auto mit = pathMemo.find(FF{from, to});
+        if (mit != pathMemo.end())
+          return mit->second;
+        std::vector<llvm::Function *> found;
+        if (!from || !to) {
+          pathMemo[FF{from, to}] = found;
+          return found;
+        }
+        if (from == to) {
+          found = {from};
+          pathMemo[FF{from, to}] = found;
+          return found;
+        }
+        struct P {
+          llvm::Function *F = nullptr;
+          std::vector<llvm::Function *> seq;
+          std::vector<int> boxes;
+          uint64_t box = 0;
+        };
+        std::vector<P> q;
+        std::unordered_set<RK, RKHash> seen;
+        P start;
+        start.F = from;
+        start.seq = {from};
+        q.push_back(std::move(start));
+        for (size_t qi = 0; qi < q.size() && qi < 400000; ++qi) {
+          P cur = q[qi];
+          if (!cur.F || !seen.insert(RK{cur.F, from, 0, cur.box}).second)
+            continue;
+          if (cur.F == to) {
+            found = cur.seq;
+            break;
+          }
+          auto sit = sum.find(cur.F);
+          if (sit == sum.end())
+            continue;
+          for (const Site &site : sit->second.sites)
+            for (llvm::Function *T : targetsOf(site, cur.boxes)) {
+              if (!T || T == cur.F)
+                continue;
+              P nxt;
+              nxt.F = T;
+              nxt.seq = cur.seq;
+              nxt.seq.push_back(T);
+              if (site.callee)
+                nxt.boxes = passBoxes(site, cur.boxes);
+              nxt.box = boxHash(nxt.boxes);
+              q.push_back(std::move(nxt));
+            }
+        }
+        pathMemo[FF{from, to}] = found;
+        return found;
+      };
       for (const auto &kvIn : *inMap) {
         llvm::Function *chop = lookupFn(kvIn.first);
         if (!chop)
@@ -2344,11 +2726,16 @@ class Engine {
           llvm::Function *who = lookupFn(in.func);
           if (!who)
             continue;
+          std::vector<llvm::Function *> path = callPath(who, chop);
+          // No call-graph path: keep the chop's own callee cone, and do not
+          // write an edge from the export to the chop.
+          if (path.empty())
+            path = {chop};
           Item it;
           it.F = chop;
           it.r.who = who;
           it.r.arg = in.arg;
-          it.r.seq = {who, chop};
+          it.r.seq = std::move(path);
           rq.push_back(std::move(it));
         }
       }
@@ -2357,6 +2744,8 @@ class Engine {
         if (!cur.F || !seenR.insert(RK{cur.F, cur.r.who, cur.r.arg, cur.box}).second)
           continue;
         reachFromChop[cur.F].push_back(cur.r);
+        if (nameMatch(*cur.F))
+          continue;
         auto sit = sum.find(cur.F);
         if (sit == sum.end())
           continue;
@@ -2369,21 +2758,9 @@ class Engine {
             nxt.r = cur.r;
             nxt.r.seq = cur.r.seq;
             nxt.r.seq.push_back(T);
-            if (site.callee) {
-              nxt.boxes.assign(site.args.size(), 0);
-              for (unsigned i = 0; i < site.args.size(); ++i) {
-                int c = site.args[i].chain;
-                if (c == 0)
-                  for (int f : site.args[i].formals)
-                    if (f >= 0 && f < (int)cur.boxes.size() && cur.boxes[(size_t)f] > 0)
-                      c = cur.boxes[(size_t)f];
-                nxt.boxes[i] = c;
-              }
-              uint64_t bh = 1469598103934665603ull;
-              for (int c : nxt.boxes)
-                bh = (bh ^ (uint64_t)(unsigned)c) * 1099511628211ull;
-              nxt.box = bh;
-            }
+            if (site.callee)
+              nxt.boxes = passBoxes(site, cur.boxes);
+            nxt.box = boxHash(nxt.boxes);
             rq.push_back(std::move(nxt));
           }
       }
@@ -2878,7 +3255,7 @@ class Engine {
     std::unordered_set<std::string> seenSeq;
     for (const auto &kv : reachFromChop)
       for (const Reach &r : kv.second) {
-        if (!r.who || r.seq.empty())
+        if (!r.who || r.seq.empty() || !r.seq.back() || !nameMatch(*r.seq.back()))
           continue;
         std::string s = "pass ";
         s += std::to_string(r.arg);
