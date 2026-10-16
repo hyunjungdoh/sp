@@ -33,8 +33,11 @@ namespace chain {
 // string or string_view labels only fields of that string. The call
 // sequence is a path in the resolved call graph from that export to the
 // sink function, and it ends at the sink. Use-def selects the export and
-// the chop; it does not insert an edge. A call whose operand denotes a
-// formal targets the functions passed as that formal.
+// the chop; it does not insert an edge. The walk keeps the shortest path
+// to each sink state, each return to the export, and the shortest path from
+// the chop that reaches the sink again after a function repeats. A call
+// whose operand may denote several formals targets the functions passed as
+// any of them. A phi or select of slots is the union of those slots.
 // A function-pointer slot drops a byte-0 step only when that field's type
 // is the struct the next step indexes. A function stored at a constant
 // index of a global pointer array is a target of a call that loads that

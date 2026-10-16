@@ -148,7 +148,7 @@ struct Site {
   llvm::Function *home = nullptr;
   llvm::FunctionType *fty = nullptr;
   int calleeBox = -1;
-  int calleeFormal = -1;
+  std::vector<int> calleeFormals;
   std::vector<int> calleeKeys;
   std::vector<ArgAt> args;
 };
@@ -772,7 +772,11 @@ class Engine {
       for (llvm::GlobalVariable &G : M.globals()) {
         if (!G.hasInitializer())
           continue;
-        std::map<int64_t, std::set<int>> byBias;
+        struct Bias {
+          std::set<int> sizes;
+          std::set<int> tys;
+        };
+        std::map<int64_t, Bias> byBias;
         for (llvm::User *U : G.users()) {
           const auto *GOP = llvm::dyn_cast<llvm::GEPOperator>(U);
           if (!GOP)
@@ -787,10 +791,14 @@ class Engine {
               continue;
             const llvm::Value *dest = St->getPointerOperand()->stripPointerCasts();
             std::set<int> sizes;
+            std::set<int> tys;
             std::set<llvm::StructType *> seenTy;
             auto addSizes = [&](llvm::StructType *ST, auto &self) -> void {
               if (!ST || ST->isOpaque() || !seenTy.insert(ST).second)
                 return;
+              int id = internType(ST);
+              if (id > 0)
+                tys.insert(id);
               int sz = (int)DL.getTypeAllocSize(ST);
               if (sz > 0)
                 sizes.insert(sz);
@@ -815,7 +823,8 @@ class Engine {
                   sizes.insert((int)d);
               }
             }
-            byBias[bias].insert(sizes.begin(), sizes.end());
+            byBias[bias].sizes.insert(sizes.begin(), sizes.end());
+            byBias[bias].tys.insert(tys.begin(), tys.end());
           }
         }
         if (byBias.empty())
@@ -841,8 +850,14 @@ class Engine {
           for (const auto &bs : byBias) {
             if (at < bs.first)
               continue;
-            for (int sz : bs.second) {
-              int slot = slotStep(0, kRel, pack(sz, at - bs.first));
+            int64_t rel = at - bs.first;
+            for (int sz : bs.second.sizes) {
+              int slot = slotStep(0, kRel, pack(sz, rel));
+              if (slot > 0)
+                fnAt[slot].insert(const_cast<llvm::Function *>(Fn));
+            }
+            for (int ty : bs.second.tys) {
+              int slot = slotStep(0, kRel + 1, ((int64_t)ty << 32) | (rel & 0xffffffffLL));
               if (slot > 0)
                 fnAt[slot].insert(const_cast<llvm::Function *>(Fn));
             }
@@ -936,9 +951,7 @@ class Engine {
     std::set<std::pair<int, llvm::Function *>> dirty;
     for (llvm::Function *F : order)
       dirty.insert({ord[F], F});
-    int spins = 0;
-    while (!dirty.empty() && spins < 2000000) {
-      ++spins;
+    while (!dirty.empty()) {
       llvm::Function *F = dirty.begin()->second;
       dirty.erase(dirty.begin());
       uint64_t oldRet = sum[F].retSig;
@@ -972,62 +985,55 @@ class Engine {
     }
   }
 
-  // The value denotes a formal when it is that formal, a cast, or a reload of
-  // an alloca that holds only that formal. A field load is a different value.
-  int denotesFormal(const llvm::Value *V) const {
+  // Formals this value may denote. A phi, select, or alloca joins every
+  // formal any incoming value denotes. A field load is a different value.
+  std::vector<int> denoteFormals(const llvm::Value *V) const {
     std::unordered_set<const llvm::Value *> seen;
-    std::function<int(const llvm::Value *)> walk = [&](const llvm::Value *U) -> int {
+    std::set<int> found;
+    std::function<void(const llvm::Value *)> walk = [&](const llvm::Value *U) {
       if (!U || !seen.insert(U).second)
-        return -1;
-      if (const auto *A = llvm::dyn_cast<llvm::Argument>(U))
-        return (int)A->getArgNo();
-      if (const auto *C = llvm::dyn_cast<llvm::CastInst>(U))
-        return walk(C->getOperand(0));
+        return;
+      if (const auto *A = llvm::dyn_cast<llvm::Argument>(U)) {
+        found.insert((int)A->getArgNo());
+        return;
+      }
+      if (const auto *C = llvm::dyn_cast<llvm::CastInst>(U)) {
+        walk(C->getOperand(0));
+        return;
+      }
       if (const auto *CE = llvm::dyn_cast<llvm::ConstantExpr>(U)) {
         if (CE->isCast())
-          return walk(CE->getOperand(0));
-        return -1;
+          walk(CE->getOperand(0));
+        return;
       }
-      if (const auto *Fz = llvm::dyn_cast<llvm::FreezeInst>(U))
-        return walk(Fz->getOperand(0));
+      if (const auto *Fz = llvm::dyn_cast<llvm::FreezeInst>(U)) {
+        walk(Fz->getOperand(0));
+        return;
+      }
       if (const auto *PN = llvm::dyn_cast<llvm::PHINode>(U)) {
-        if (PN->getNumIncomingValues() == 0)
-          return -1;
-        int f = -1;
-        for (unsigned i = 0; i < PN->getNumIncomingValues(); ++i) {
-          int g = walk(PN->getIncomingValue(i));
-          if (g < 0 || (f >= 0 && g != f))
-            return -1;
-          f = g;
-        }
-        return f;
+        for (unsigned i = 0; i < PN->getNumIncomingValues(); ++i)
+          walk(PN->getIncomingValue(i));
+        return;
       }
       if (const auto *Sel = llvm::dyn_cast<llvm::SelectInst>(U)) {
-        int a = walk(Sel->getTrueValue());
-        int b = walk(Sel->getFalseValue());
-        return a >= 0 && a == b ? a : -1;
+        walk(Sel->getTrueValue());
+        walk(Sel->getFalseValue());
+        return;
       }
       if (const auto *Ld = llvm::dyn_cast<llvm::LoadInst>(U)) {
         const auto *AI = llvm::dyn_cast<llvm::AllocaInst>(Ld->getPointerOperand()->stripPointerCasts());
         if (!AI)
-          return -1;
-        int f = -1;
-        bool any = false;
+          return;
         for (const llvm::User *SU : AI->users()) {
           const auto *St = llvm::dyn_cast<llvm::StoreInst>(SU);
           if (!St || St->getPointerOperand()->stripPointerCasts() != AI)
             continue;
-          int g = walk(St->getValueOperand());
-          if (g < 0 || (f >= 0 && g != f))
-            return -1;
-          f = g;
-          any = true;
+          walk(St->getValueOperand());
         }
-        return any ? f : -1;
       }
-      return -1;
     };
-    return walk(V);
+    walk(V);
+    return std::vector<int>(found.begin(), found.end());
   }
 
   void analyze(llvm::Function &F) {
@@ -1148,13 +1154,17 @@ class Engine {
             auto nit = byName.find(Fn->getName().str());
             if (nit == byName.end())
               continue;
+            bool heldAny = false;
             if (p.box >= 0 && p.box < (int)CB->arg_size()) {
-              int container = fnSlotOf(CB->getArgOperand((unsigned)p.box), DL);
-              if (container > 0) {
+              for (int container : fnSlotsOf(CB->getArgOperand((unsigned)p.box), DL)) {
+                if (container <= 0)
+                  continue;
                 held[(uint64_t)(unsigned)container << 32 | (unsigned)p.slot].insert(nit->second);
-                continue;
+                heldAny = true;
               }
             }
+            if (heldAny)
+              continue;
             fnAt[p.slot].insert(nit->second);
           }
           for (const CallArg &c : pit->second.callArgs) {
@@ -1174,8 +1184,9 @@ class Engine {
         return;
       }
       std::unordered_set<llvm::Function *> targets;
-      int slot = fnSlotOf(CB->getCalledOperand(), DL);
-      if (slot > 0) {
+      for (int slot : fnSlotsOf(CB->getCalledOperand(), DL)) {
+        if (slot <= 0)
+          continue;
         watchers[slot].insert(&F);
         auto fit = fnAt.find(slot);
         if (fit != fnAt.end())
@@ -1564,14 +1575,14 @@ class Engine {
           if (Fn->hasName()) {
             auto nit = byName.find(Fn->getName().str());
             if (nit != byName.end()) {
-              int slot = fnSlotOf(St->getPointerOperand(), DL);
-              if (slot > 0)
-                fnAt[slot].insert(nit->second);
+              for (int slot : fnSlotsOf(St->getPointerOperand(), DL))
+                if (slot > 0)
+                  fnAt[slot].insert(nit->second);
             }
           }
         }
-        int pubSlot = fnSlotOf(St->getPointerOperand(), DL);
-        if (pubSlot > 0) {
+        std::vector<int> pubSlots = fnSlotsOf(St->getPointerOperand(), DL);
+        if (!pubSlots.empty()) {
           int box = -1;
           auto bit = byVal.find(St->getPointerOperand());
           if (bit != byVal.end())
@@ -1584,7 +1595,9 @@ class Engine {
           if (vit != byVal.end())
             for (const VKey &s : vit->second)
               if (s.formal >= 0)
-                next.pubs.push_back(Pub{s.formal, pubSlot, box});
+                for (int pubSlot : pubSlots)
+                  if (pubSlot > 0)
+                    next.pubs.push_back(Pub{s.formal, pubSlot, box});
         }
         auto ait = byVal.find(St->getPointerOperand());
         if (ait == byVal.end())
@@ -1624,9 +1637,9 @@ class Engine {
           if (!fn.empty()) {
             auto nit = byName.find(fn);
             if (nit != byName.end()) {
-              int slot = fnSlotOf(St->getPointerOperand(), DL);
-              if (slot > 0)
-                fnAt[slot].insert(nit->second);
+              for (int slot : fnSlotsOf(St->getPointerOperand(), DL))
+                if (slot > 0)
+                  fnAt[slot].insert(nit->second);
             }
           }
         }
@@ -1687,18 +1700,19 @@ class Engine {
         site.home = &F;
         if (!callee) {
           site.fty = CB->getFunctionType();
-          int denoted = denotesFormal(CB->getCalledOperand());
-          if (denoted >= 0) {
-            site.calleeFormal = denoted;
+          for (int denoted : denoteFormals(CB->getCalledOperand())) {
+            site.calleeFormals.push_back(denoted);
             next.callArgs.push_back(CallArg{denoted, CB->getFunctionType()});
           }
-          int slot = fnSlotOf(CB->getCalledOperand(), DL);
-          if (slot > 0) {
+          for (int slot : fnSlotsOf(CB->getCalledOperand(), DL)) {
+            if (slot <= 0)
+              continue;
             site.calleeKeys.push_back(slot);
             next.indirectKeys.push_back(slot);
           }
-          int vslot = vtableSlot(CB, DL);
-          if (vslot > 0) {
+          for (int vslot : vtableSlots(CB, DL)) {
+            if (vslot <= 0)
+              continue;
             site.calleeKeys.push_back(vslot);
             next.indirectKeys.push_back(vslot);
           }
@@ -2019,98 +2033,124 @@ class Engine {
     return false;
   }
 
-  int fnSlotOf(const llvm::Value *V, const llvm::DataLayout &DL) {
+  // Every slot the value may point at. A phi, select, or alloca is the union.
+  void collectFnSlots(const llvm::Value *V, const llvm::DataLayout &DL, std::set<int> &out) {
     std::set<const llvm::Value *> seen;
-    // `into` is the struct the caller indexes. A byte-0 step is dropped only
-    // when it is that struct embedded at the front of the holder.
-    std::function<int(const llvm::Value *, bool, const llvm::StructType *)> walk =
-        [&](const llvm::Value *U, bool outermost, const llvm::StructType *into) -> int {
-      if (!U || !seen.insert(U).second)
-        return 0;
-      if (const auto *CE = llvm::dyn_cast<llvm::ConstantExpr>(U)) {
-        if (CE->isCast())
-          return walk(CE->getOperand(0), outermost, into);
-        if (CE->getOpcode() != llvm::Instruction::GetElementPtr)
-          return 0;
-      }
-      if (const auto *G = llvm::dyn_cast<llvm::GEPOperator>(U)) {
-        const llvm::Type *src = G->getSourceElementType();
-        const auto *ST = llvm::dyn_cast<llvm::StructType>(src);
-        if (!ST)
-          if (const auto *AT = llvm::dyn_cast<llvm::ArrayType>(src))
-            ST = llvm::dyn_cast<llvm::StructType>(AT->getElementType());
-        int base = walk(G->getPointerOperand(), false, ST);
-        int64_t off = Any;
-        llvm::APInt ap(DL.getIndexSizeInBits(G->getPointerAddressSpace()), 0);
-        if (G->accumulateConstantOffset(DL, ap)) {
-          if (ap.getSignificantBits() <= 63 || ap.isNegative())
-            off = ap.getSExtValue();
-        }
-        if (!ST)
-          return base;
-        int ty = internType(ST);
-        if (off == 0 && !outermost && embeddedHeader(ST, into, DL))
-          return base;
-        return slotStep(base, ty, off);
-      }
-      if (const auto *Ld = llvm::dyn_cast<llvm::LoadInst>(U))
-        return walk(Ld->getPointerOperand(), false, nullptr);
-      if (const auto *AI = llvm::dyn_cast<llvm::AllocaInst>(U)) {
-        for (const llvm::User *SU : AI->users()) {
-          const auto *St = llvm::dyn_cast<llvm::StoreInst>(SU);
-          if (!St || St->getPointerOperand() != AI)
-            continue;
-          int k = walk(St->getValueOperand(), true, nullptr);
-          if (k > 0)
-            return k;
-        }
-        return 0;
-      }
-      if (const auto *CB = llvm::dyn_cast<llvm::CallBase>(U)) {
-        if (CB->isInlineAsm())
-          return 0;
-        llvm::Function *target = nullptr;
-        if (llvm::Function *CF = CB->getCalledFunction())
-          target = bodyOf(CF);
-        else if (auto *FN = llvm::dyn_cast<llvm::Function>(CB->getCalledOperand()->stripPointerCasts()))
-          target = bodyOf(FN);
-        if (!target)
-          return 0;
-        auto sit = sum.find(target);
-        if (sit == sum.end())
-          return 0;
-        for (const Ret &r : sit->second.rets) {
-          int k = pathToSlot(r.path);
-          if (k > 0)
-            return k;
-        }
-        return 0;
-      }
-      if (const auto *C = llvm::dyn_cast<llvm::CastInst>(U))
-        return walk(C->getOperand(0), outermost, into);
-      if (const auto *Fz = llvm::dyn_cast<llvm::FreezeInst>(U))
-        return walk(Fz->getOperand(0), outermost, into);
-      if (const auto *PN = llvm::dyn_cast<llvm::PHINode>(U)) {
-        for (unsigned i = 0; i < PN->getNumIncomingValues(); ++i) {
-          int k = walk(PN->getIncomingValue(i), outermost, into);
-          if (k > 0)
-            return k;
-        }
-        return 0;
-      }
-      if (const auto *Sel = llvm::dyn_cast<llvm::SelectInst>(U)) {
-        int k = walk(Sel->getTrueValue(), outermost, into);
-        return k > 0 ? k : walk(Sel->getFalseValue(), outermost, into);
-      }
-      return 0;
-    };
-    return walk(V, true, nullptr);
+    std::function<void(const llvm::Value *, bool, const llvm::StructType *, std::set<int> &)> walk =
+        [&](const llvm::Value *U, bool outermost, const llvm::StructType *into, std::set<int> &acc) {
+          if (!U || !seen.insert(U).second)
+            return;
+          auto add = [&](int k) {
+            if (k > 0)
+              acc.insert(k);
+          };
+          if (const auto *CE = llvm::dyn_cast<llvm::ConstantExpr>(U)) {
+            if (CE->isCast()) {
+              walk(CE->getOperand(0), outermost, into, acc);
+              return;
+            }
+            if (CE->getOpcode() != llvm::Instruction::GetElementPtr)
+              return;
+          }
+          if (const auto *G = llvm::dyn_cast<llvm::GEPOperator>(U)) {
+            const llvm::Type *src = G->getSourceElementType();
+            const auto *ST = llvm::dyn_cast<llvm::StructType>(src);
+            if (!ST)
+              if (const auto *AT = llvm::dyn_cast<llvm::ArrayType>(src))
+                ST = llvm::dyn_cast<llvm::StructType>(AT->getElementType());
+            std::set<int> bases;
+            walk(G->getPointerOperand(), false, ST, bases);
+            int64_t off = Any;
+            llvm::APInt ap(DL.getIndexSizeInBits(G->getPointerAddressSpace()), 0);
+            if (G->accumulateConstantOffset(DL, ap)) {
+              if (ap.getSignificantBits() <= 63 || ap.isNegative())
+                off = ap.getSExtValue();
+            }
+            if (!ST) {
+              for (int b : bases)
+                add(b);
+              return;
+            }
+            if (bases.empty())
+              bases.insert(0);
+            int ty = internType(ST);
+            for (int base : bases) {
+              if (off == 0 && !outermost && embeddedHeader(ST, into, DL))
+                add(base);
+              else
+                add(slotStep(base, ty, off));
+            }
+            return;
+          }
+          if (const auto *Ld = llvm::dyn_cast<llvm::LoadInst>(U)) {
+            walk(Ld->getPointerOperand(), false, nullptr, acc);
+            return;
+          }
+          if (const auto *AI = llvm::dyn_cast<llvm::AllocaInst>(U)) {
+            for (const llvm::User *SU : AI->users()) {
+              const auto *St = llvm::dyn_cast<llvm::StoreInst>(SU);
+              if (!St || St->getPointerOperand() != AI)
+                continue;
+              walk(St->getValueOperand(), true, nullptr, acc);
+            }
+            return;
+          }
+          if (const auto *CB = llvm::dyn_cast<llvm::CallBase>(U)) {
+            if (CB->isInlineAsm())
+              return;
+            llvm::Function *target = nullptr;
+            if (llvm::Function *CF = CB->getCalledFunction())
+              target = bodyOf(CF);
+            else if (auto *FN = llvm::dyn_cast<llvm::Function>(CB->getCalledOperand()->stripPointerCasts()))
+              target = bodyOf(FN);
+            if (!target)
+              return;
+            auto sit = sum.find(target);
+            if (sit == sum.end())
+              return;
+            for (const Ret &r : sit->second.rets)
+              add(pathToSlot(r.path));
+            return;
+          }
+          if (const auto *C = llvm::dyn_cast<llvm::CastInst>(U)) {
+            walk(C->getOperand(0), outermost, into, acc);
+            return;
+          }
+          if (const auto *Fz = llvm::dyn_cast<llvm::FreezeInst>(U)) {
+            walk(Fz->getOperand(0), outermost, into, acc);
+            return;
+          }
+          if (const auto *PN = llvm::dyn_cast<llvm::PHINode>(U)) {
+            for (unsigned i = 0; i < PN->getNumIncomingValues(); ++i)
+              walk(PN->getIncomingValue(i), outermost, into, acc);
+            return;
+          }
+          if (const auto *Sel = llvm::dyn_cast<llvm::SelectInst>(U)) {
+            walk(Sel->getTrueValue(), outermost, into, acc);
+            walk(Sel->getFalseValue(), outermost, into, acc);
+          }
+        };
+    std::set<int> acc;
+    walk(V, true, nullptr, acc);
+    out.insert(acc.begin(), acc.end());
+  }
+
+  int fnSlotOf(const llvm::Value *V, const llvm::DataLayout &DL) {
+    std::set<int> slots;
+    collectFnSlots(V, DL, slots);
+    return slots.empty() ? 0 : *slots.begin();
+  }
+
+  std::vector<int> fnSlotsOf(const llvm::Value *V, const llvm::DataLayout &DL) {
+    std::set<int> slots;
+    collectFnSlots(V, DL, slots);
+    return std::vector<int>(slots.begin(), slots.end());
   }
 
   // Virtual call: load the vptr, then a constant pointer index. The receiver
   // is the object whose vptr was loaded, and its size is the dereferenceable
   // byte count on that call argument. The same pair is what fileRelative stores.
-  int vtableSlot(const llvm::CallBase *CB, const llvm::DataLayout &DL) {
+  std::vector<int> vtableSlot(const llvm::CallBase *CB, const llvm::DataLayout &DL) {
     const llvm::Value *V = CB->getCalledOperand();
     auto peel = [](const llvm::Value *X) {
       while (X) {
@@ -2128,19 +2168,19 @@ class Engine {
     V = peel(V);
     const auto *Ld = llvm::dyn_cast<llvm::LoadInst>(V);
     if (!Ld)
-      return 0;
+      return {};
     const auto *G = llvm::dyn_cast<llvm::GEPOperator>(peel(Ld->getPointerOperand()));
     if (!G || !G->getSourceElementType()->isPointerTy())
-      return 0;
+      return {};
     llvm::APInt ap(DL.getIndexSizeInBits(G->getPointerAddressSpace()), 0);
     if (!G->accumulateConstantOffset(DL, ap) || ap.isNegative())
-      return 0;
+      return {};
     int64_t off = ap.getSExtValue();
     if (off <= 0)
-      return 0;
+      return {};
     const auto *vptr = llvm::dyn_cast<llvm::LoadInst>(peel(G->getPointerOperand()));
     if (!vptr)
-      return 0;
+      return {};
     const llvm::Value *obj = peel(vptr->getPointerOperand());
     int sz = 0;
     for (unsigned i = 0; i < CB->arg_size(); ++i) {
@@ -2151,9 +2191,37 @@ class Engine {
         sz = (int)d;
       break;
     }
-    if (sz <= 0)
-      return 0;
-    return slotStep(0, 0x40000000, ((int64_t)sz << 32) | (off & 0xffffffffLL));
+    std::vector<int> keys;
+    if (sz > 0)
+      keys.push_back(slotStep(0, 0x40000000, ((int64_t)sz << 32) | (off & 0xffffffffLL)));
+    if (const auto *home = CB->getFunction()) {
+      std::set<llvm::StructType *> seenTy;
+      auto addTy = [&](llvm::StructType *ST, auto &self) -> void {
+        if (!ST || ST->isOpaque() || !seenTy.insert(ST).second)
+          return;
+        int id = internType(ST);
+        if (id > 0)
+          keys.push_back(slotStep(0, 0x40000001, ((int64_t)id << 32) | (off & 0xffffffffLL)));
+        if (ST->getNumElements() == 0)
+          return;
+        if (DL.getStructLayout(ST)->getElementOffset(0) != 0)
+          return;
+        if (auto *fs = llvm::dyn_cast<llvm::StructType>(ST->getElementType(0)))
+          self(fs, self);
+      };
+      for (const llvm::Instruction &I : llvm::instructions(*home)) {
+        const auto *GG = llvm::dyn_cast<llvm::GEPOperator>(&I);
+        if (!GG || peel(GG->getPointerOperand()) != obj)
+          continue;
+        if (auto *ST = llvm::dyn_cast<llvm::StructType>(GG->getSourceElementType()))
+          addTy(const_cast<llvm::StructType *>(ST), addTy);
+      }
+    }
+    return keys;
+  }
+
+  std::vector<int> vtableSlots(const llvm::CallBase *CB, const llvm::DataLayout &DL) {
+    return vtableSlot(CB, DL);
   }
 
   // Field key of a function pointer loaded from a global or an argument,
@@ -2573,14 +2641,15 @@ class Engine {
           }
         }
       }
-      if (site.calleeFormal >= 0 && site.home) {
+      if (site.home) {
         auto fit = fnPassed.find(site.home);
-        if (fit != fnPassed.end()) {
-          auto git = fit->second.find(site.calleeFormal);
-          if (git != fit->second.end())
-            for (llvm::Function *T : git->second)
-              take(T);
-        }
+        if (fit != fnPassed.end())
+          for (int formal : site.calleeFormals) {
+            auto git = fit->second.find(formal);
+            if (git != fit->second.end())
+              for (llvm::Function *T : git->second)
+                take(T);
+          }
       }
       return tg;
     };
@@ -2623,14 +2692,6 @@ class Engine {
     };
     std::unordered_map<llvm::Function *, std::vector<Reach>> reachFromChop;
     {
-      struct Item {
-        llvm::Function *F = nullptr;
-        Reach r;
-        std::vector<int> boxes;
-        uint64_t box = 0;
-      };
-      std::vector<Item> rq;
-      std::unordered_set<RK, RKHash> seenR;
       auto passBoxes = [](const Site &site, const std::vector<int> &boxes) {
         std::vector<int> next(site.args.size(), 0);
         if (!site.callee)
@@ -2651,118 +2712,236 @@ class Engine {
           bh = (bh ^ (uint64_t)(unsigned)c) * 1099511628211ull;
         return bh;
       };
-      // A sequence is a path in the resolved call graph. Use-def names the
-      // export and the chop; it does not add an edge between them.
-      struct FF {
-        llvm::Function *a = nullptr;
-        llvm::Function *b = nullptr;
-        bool operator==(const FF &o) const { return a == o.a && b == o.b; }
+      // Use-def names the export. A sequence is a path in the resolved graph
+      // from that export to the sink. The walk keeps the shortest path to each
+      // sink state, each return to the export, and, from the chop, the shortest
+      // path that reaches the sink again after repeating a function.
+      struct St {
+        llvm::Function *F = nullptr;
+        uint64_t box = 0;
+        bool operator==(const St &o) const { return F == o.F && box == o.box; }
       };
-      struct FFHash {
-        size_t operator()(const FF &k) const { return ((size_t)k.a >> 4) ^ ((size_t)k.b >> 5); }
-      };
-      std::unordered_map<FF, std::vector<llvm::Function *>, FFHash> pathMemo;
-      auto callPath = [&](llvm::Function *from, llvm::Function *to) {
-        auto mit = pathMemo.find(FF{from, to});
-        if (mit != pathMemo.end())
-          return mit->second;
-        std::vector<llvm::Function *> found;
-        if (!from || !to) {
-          pathMemo[FF{from, to}] = found;
-          return found;
-        }
-        if (from == to) {
-          found = {from};
-          pathMemo[FF{from, to}] = found;
-          return found;
-        }
-        struct P {
-          llvm::Function *F = nullptr;
-          std::vector<llvm::Function *> seq;
-          std::vector<int> boxes;
-          uint64_t box = 0;
-        };
-        std::vector<P> q;
-        std::unordered_set<RK, RKHash> seen;
-        P start;
-        start.F = from;
-        start.seq = {from};
-        q.push_back(std::move(start));
-        for (size_t qi = 0; qi < q.size() && qi < 400000; ++qi) {
-          P cur = q[qi];
-          if (!cur.F || !seen.insert(RK{cur.F, from, 0, cur.box}).second)
-            continue;
-          if (cur.F == to) {
-            found = cur.seq;
-            break;
-          }
-          auto sit = sum.find(cur.F);
-          if (sit == sum.end())
-            continue;
-          for (const Site &site : sit->second.sites)
-            for (llvm::Function *T : targetsOf(site, cur.boxes)) {
-              if (!T || T == cur.F)
-                continue;
-              P nxt;
-              nxt.F = T;
-              nxt.seq = cur.seq;
-              nxt.seq.push_back(T);
-              if (site.callee)
-                nxt.boxes = passBoxes(site, cur.boxes);
-              nxt.box = boxHash(nxt.boxes);
-              q.push_back(std::move(nxt));
-            }
-        }
-        pathMemo[FF{from, to}] = found;
-        return found;
+      struct StHash {
+        size_t operator()(const St &s) const { return ((size_t)s.F >> 4) ^ (size_t)s.box; }
       };
       for (const auto &kvIn : *inMap) {
-        llvm::Function *chop = lookupFn(kvIn.first);
-        if (!chop)
-          continue;
         for (const Input &in : kvIn.second) {
           if (in.arg < 0)
             continue;
           llvm::Function *who = lookupFn(in.func);
           if (!who)
             continue;
-          std::vector<llvm::Function *> path = callPath(who, chop);
-          // No call-graph path: keep the chop's own callee cone, and do not
-          // write an edge from the export to the chop.
-          if (path.empty())
-            path = {chop};
-          Item it;
-          it.F = chop;
-          it.r.who = who;
-          it.r.arg = in.arg;
-          it.r.seq = std::move(path);
-          rq.push_back(std::move(it));
-        }
-      }
-      for (size_t qi = 0; qi < rq.size(); ++qi) {
-        Item cur = rq[qi];
-        if (!cur.F || !seenR.insert(RK{cur.F, cur.r.who, cur.r.arg, cur.box}).second)
-          continue;
-        reachFromChop[cur.F].push_back(cur.r);
-        if (nameMatch(*cur.F))
-          continue;
-        auto sit = sum.find(cur.F);
-        if (sit == sum.end())
-          continue;
-        for (const Site &site : sit->second.sites)
-          for (llvm::Function *T : targetsOf(site, cur.boxes)) {
-            if (!T || T == cur.F)
+          struct Node {
+            llvm::Function *F = nullptr;
+            std::vector<llvm::Function *> seq;
+            std::vector<int> boxes;
+            uint64_t box = 0;
+          };
+          std::vector<Node> q;
+          std::unordered_set<St, StHash> expanded;
+          std::unordered_map<St, std::vector<llvm::Function *>, StHash> treePath;
+          std::unordered_map<St, std::vector<int>, StHash> boxesAt;
+          std::unordered_map<St, std::vector<St>, StHash> succs;
+          std::unordered_map<St, St, StHash> parent;
+          std::unordered_set<St, StHash> sinkStates;
+          Node start;
+          start.F = who;
+          start.seq = {who};
+          start.box = boxHash(start.boxes);
+          q.push_back(std::move(start));
+          for (size_t qi = 0; qi < q.size(); ++qi) {
+            Node cur = q[qi];
+            St cs{cur.F, cur.box};
+            if (!cur.F || !expanded.insert(cs).second)
               continue;
-            Item nxt;
-            nxt.F = T;
-            nxt.r = cur.r;
-            nxt.r.seq = cur.r.seq;
-            nxt.r.seq.push_back(T);
-            if (site.callee)
-              nxt.boxes = passBoxes(site, cur.boxes);
-            nxt.box = boxHash(nxt.boxes);
-            rq.push_back(std::move(nxt));
+            treePath[cs] = cur.seq;
+            boxesAt[cs] = cur.boxes;
+            Reach rr;
+            rr.who = who;
+            rr.arg = in.arg;
+            rr.seq = cur.seq;
+            reachFromChop[cur.F].push_back(std::move(rr));
+            if (nameMatch(*cur.F)) {
+              sinkStates.insert(cs);
+              continue;
+            }
+            auto sit = sum.find(cur.F);
+            if (sit == sum.end())
+              continue;
+            for (const Site &site : sit->second.sites)
+              for (llvm::Function *T : targetsOf(site, cur.boxes)) {
+                if (!T)
+                  continue;
+                Node nxt;
+                nxt.F = T;
+                nxt.seq = cur.seq;
+                nxt.seq.push_back(T);
+                if (site.callee)
+                  nxt.boxes = passBoxes(site, cur.boxes);
+                nxt.box = boxHash(nxt.boxes);
+                St ns{T, nxt.box};
+                succs[cs].push_back(ns);
+                if (!parent.count(ns))
+                  parent.emplace(ns, cs);
+                q.push_back(std::move(nxt));
+              }
           }
+          std::unordered_set<St, StHash> reach = sinkStates;
+          std::vector<St> revq(sinkStates.begin(), sinkStates.end());
+          std::unordered_map<St, std::vector<St>, StHash> pred;
+          for (auto &kv : succs)
+            for (const St &t : kv.second)
+              pred[t].push_back(kv.first);
+          for (size_t i = 0; i < revq.size(); ++i)
+            for (const St &p : pred[revq[i]])
+              if (reach.insert(p).second)
+                revq.push_back(p);
+          std::unordered_map<St, std::vector<llvm::Function *>, StHash> sufMemo;
+          auto suffix = [&](const St &v) -> std::vector<llvm::Function *> {
+            auto it = sufMemo.find(v);
+            if (it != sufMemo.end())
+              return it->second;
+            struct Qn {
+              St s;
+              std::vector<llvm::Function *> path;
+            };
+            std::vector<Qn> sq;
+            sq.push_back(Qn{v, {v.F}});
+            std::unordered_set<St, StHash> seen;
+            std::vector<llvm::Function *> ans;
+            for (size_t i = 0; i < sq.size(); ++i) {
+              if (!seen.insert(sq[i].s).second)
+                continue;
+              if (sinkStates.count(sq[i].s)) {
+                ans = sq[i].path;
+                break;
+              }
+              auto jt = succs.find(sq[i].s);
+              if (jt == succs.end())
+                continue;
+              for (const St &t : jt->second) {
+                if (!reach.count(t))
+                  continue;
+                Qn n;
+                n.s = t;
+                n.path = sq[i].path;
+                n.path.push_back(t.F);
+                sq.push_back(std::move(n));
+              }
+            }
+            sufMemo.emplace(v, ans);
+            return ans;
+          };
+          std::unordered_map<St, std::pair<size_t, Reach>, StHash> bestInto;
+          for (auto &kv : succs) {
+            auto tp = treePath.find(kv.first);
+            if (tp == treePath.end())
+              continue;
+            for (const St &v : kv.second) {
+              if (!reach.count(v))
+                continue;
+              auto par = parent.find(v);
+              if (par != parent.end() && par->second == kv.first)
+                continue;
+              bool backToExport = v.F == who;
+              if (!backToExport && !sinkStates.count(v))
+                continue;
+              std::vector<llvm::Function *> suf = suffix(v);
+              if (suf.empty() || !suf.back() || !nameMatch(*suf.back()))
+                continue;
+              Reach extra;
+              extra.who = who;
+              extra.arg = in.arg;
+              extra.seq = tp->second;
+              extra.seq.insert(extra.seq.end(), suf.begin(), suf.end());
+              if (!extra.seq.back())
+                continue;
+              if (backToExport) {
+                reachFromChop[extra.seq.back()].push_back(std::move(extra));
+                continue;
+              }
+              auto bit = bestInto.find(v);
+              if (bit == bestInto.end() || extra.seq.size() < bit->second.first)
+                bestInto[v] = {extra.seq.size(), extra};
+            }
+          }
+          for (auto &kv : bestInto)
+            if (kv.second.second.seq.back())
+              reachFromChop[kv.second.second.seq.back()].push_back(std::move(kv.second.second));
+          // From the chop, expand again with the prefix states not yet seen, so a
+          // return to the export is still a path that can reach the sink.
+          llvm::Function *chop = lookupFn(kvIn.first);
+          if (chop && chop != who) {
+            const St *at = nullptr;
+            size_t n = 0;
+            for (auto &kv : treePath) {
+              if (kv.first.F != chop)
+                continue;
+              if (!at || kv.second.size() < n) {
+                at = &kv.first;
+                n = kv.second.size();
+              }
+            }
+            if (at) {
+              std::vector<Node> cq;
+              Node seed;
+              seed.F = chop;
+              seed.seq = treePath[*at];
+              seed.boxes = boxesAt[*at];
+              seed.box = at->box;
+              cq.push_back(std::move(seed));
+              std::unordered_set<St, StHash> seenC;
+              bool tookLoop = false;
+              for (size_t qi = 0; qi < cq.size(); ++qi) {
+                Node cur = cq[qi];
+                St cs{cur.F, cur.box};
+                if (!cur.F)
+                  continue;
+                if (!seenC.insert(cs).second) {
+                  if (!tookLoop && nameMatch(*cur.F)) {
+                    std::unordered_set<llvm::Function *> once;
+                    bool rep = false;
+                    for (llvm::Function *F : cur.seq)
+                      if (F && !once.insert(F).second)
+                        rep = true;
+                    if (rep) {
+                      Reach rr;
+                      rr.who = who;
+                      rr.arg = in.arg;
+                      rr.seq = cur.seq;
+                      reachFromChop[cur.F].push_back(std::move(rr));
+                      tookLoop = true;
+                    }
+                  }
+                  continue;
+                }
+                Reach rr;
+                rr.who = who;
+                rr.arg = in.arg;
+                rr.seq = cur.seq;
+                reachFromChop[cur.F].push_back(rr);
+                if (nameMatch(*cur.F))
+                  continue;
+                auto sit = sum.find(cur.F);
+                if (sit == sum.end())
+                  continue;
+                for (const Site &site : sit->second.sites)
+                  for (llvm::Function *T : targetsOf(site, cur.boxes)) {
+                    if (!T)
+                      continue;
+                    Node nxt;
+                    nxt.F = T;
+                    nxt.seq = cur.seq;
+                    nxt.seq.push_back(T);
+                    if (site.callee)
+                      nxt.boxes = passBoxes(site, cur.boxes);
+                    nxt.box = boxHash(nxt.boxes);
+                    cq.push_back(std::move(nxt));
+                  }
+              }
+            }
+          }
+        }
       }
     }
     std::unordered_map<std::uint64_t, std::unordered_set<std::uint64_t>> pointedAt;
@@ -2785,7 +2964,7 @@ class Engine {
       std::unordered_set<P, PH> got;
       std::vector<P> q;
       q.push_back({from, arg});
-      for (size_t qi = 0; qi < q.size() && qi < 400000; ++qi) {
+      for (size_t qi = 0; qi < q.size(); ++qi) {
         P cur = q[qi];
         if (!cur.fn || !got.insert(cur).second)
           continue;
@@ -3125,7 +3304,7 @@ class Engine {
     for (auto &kv : originOf)
       if (!kv.second.empty() && oinq.insert(kv.first).second)
         oq.push_back(kv.first);
-    for (size_t qi = 0; qi < oq.size() && qi < 20000000; ++qi) {
+    for (size_t qi = 0; qi < oq.size(); ++qi) {
       NKey n = oq[qi];
       oinq.erase(n);
       auto fit = fwd.find(n);
