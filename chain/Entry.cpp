@@ -313,9 +313,10 @@ class Solve {
             if (const auto *TI = llvm::dyn_cast<llvm::GlobalVariable>(CA->getOperand(1)->stripPointerCasts()))
               vtableTI[gv] = TI;
       }
-      std::function<void(const llvm::Constant *, std::vector<const llvm::GlobalVariable *> &, int)> collect;
-      collect = [&](const llvm::Constant *C0, std::vector<const llvm::GlobalVariable *> &gs, int depth) {
-        if (!C0 || depth > 6)
+      std::unordered_set<const llvm::Constant *> constSeen;
+      std::function<void(const llvm::Constant *, std::vector<const llvm::GlobalVariable *> &)> collect;
+      collect = [&](const llvm::Constant *C0, std::vector<const llvm::GlobalVariable *> &gs) {
+        if (!C0 || !constSeen.insert(C0).second)
           return;
         if (const auto *G = llvm::dyn_cast<llvm::GlobalVariable>(C0->stripPointerCasts())) {
           gs.push_back(G);
@@ -324,24 +325,25 @@ class Solve {
         if (const auto *CE = llvm::dyn_cast<llvm::ConstantExpr>(C0)) {
           if (CE->getOpcode() == llvm::Instruction::GetElementPtr || CE->getOpcode() == llvm::Instruction::BitCast ||
               CE->getOpcode() == llvm::Instruction::AddrSpaceCast)
-            collect(CE->getOperand(0), gs, depth + 1);
+            collect(CE->getOperand(0), gs);
           return;
         }
         if (const auto *CS = llvm::dyn_cast<llvm::ConstantStruct>(C0)) {
           for (unsigned i = 0; i < CS->getNumOperands(); ++i)
-            collect(CS->getOperand(i), gs, depth + 1);
+            collect(CS->getOperand(i), gs);
           return;
         }
         if (const auto *CA = llvm::dyn_cast<llvm::ConstantArray>(C0))
           for (unsigned i = 0; i < CA->getNumOperands(); ++i)
-            collect(CA->getOperand(i), gs, depth + 1);
+            collect(CA->getOperand(i), gs);
       };
       for (const auto &kv : vtableTI) {
         const llvm::GlobalVariable *TI = kv.second;
         if (!TI || !TI->hasInitializer())
           continue;
         std::vector<const llvm::GlobalVariable *> gs;
-        collect(TI->getInitializer(), gs, 0);
+        constSeen.clear();
+        collect(TI->getInitializer(), gs);
         for (size_t i = 2; i < gs.size(); ++i)
           if (gs[i] && gs[i] != TI)
             tiBases[TI].push_back(gs[i]);
@@ -4403,10 +4405,35 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
               }
               return std::nullopt;
             };
+            struct CW {
+              const llvm::Function *f = nullptr;
+              unsigned ai = 0;
+              int64_t off = 0;
+              bool operator<(const CW &o) const {
+                if (f != o.f)
+                  return f < o.f;
+                if (ai != o.ai)
+                  return ai < o.ai;
+                return off < o.off;
+              }
+            };
+            std::set<CW> cwStack;
+            std::map<CW, bool> cwMemo;
             std::function<bool(const llvm::Function *, unsigned, int64_t, int)> calleeWrites;
-            calleeWrites = [&](const llvm::Function *D, unsigned ai, int64_t off, int depth) -> bool {
-              if (!D || D->isDeclaration() || depth > 2 || ai >= D->arg_size())
+            calleeWrites = [&](const llvm::Function *D, unsigned ai, int64_t off, int) -> bool {
+              if (!D || D->isDeclaration() || ai >= D->arg_size())
                 return true;
+              CW key{D, ai, off};
+              auto known = cwMemo.find(key);
+              if (known != cwMemo.end())
+                return known->second;
+              if (!cwStack.insert(key).second)
+                return false;
+              auto answer = [&](bool v) {
+                cwStack.erase(key);
+                cwMemo.emplace(key, v);
+                return v;
+              };
               const llvm::Argument *FA = D->getArg(ai);
               auto formalOff = [&](const llvm::Value *V) -> std::optional<std::pair<int64_t, bool>> {
                 int64_t o = 0;
@@ -4444,14 +4471,14 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
                 if (const auto *SI = llvm::dyn_cast<llvm::StoreInst>(&DI)) {
                   if (auto o = formalOff(SI->getPointerOperand()))
                     if ((!o->second && o->first == 0) || (o->second && o->first == off))
-                      return true;
+                      return answer(true);
                 } else if (const auto *CB = llvm::dyn_cast<llvm::CallBase>(&DI)) {
                   const llvm::Value *dst = nullptr;
                   const llvm::Value *src = nullptr;
                   if (byteCopy(CB, dst, src)) {
                     if (auto o = formalOff(dst))
                       if ((!o->second && o->first == 0) || (o->second && o->first == off))
-                        return true;
+                        return answer(true);
                   }
                   if (CB->onlyReadsMemory() || CB->doesNotAccessMemory())
                     continue;
@@ -4463,13 +4490,13 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
                       if (o->second && o->first != off)
                         continue;
                       const llvm::Function *Cal = CB->getCalledFunction();
-                      if (calleeWrites(Cal, fj, o->second ? off - o->first : off, depth + 1))
-                        return true;
+                      if (calleeWrites(Cal, fj, o->second ? off - o->first : off, 0))
+                        return answer(true);
                     }
                   }
                 }
               }
-              return false;
+              return answer(false);
             };
             for (const llvm::Instruction &BI : llvm::instructions(*Fn)) {
               const llvm::Value *ptr = nullptr;
@@ -4507,10 +4534,19 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
             }
             return false;
           };
+          std::set<std::pair<const llvm::Argument *, int64_t>> goStack;
           std::function<Status(const llvm::Argument *, int64_t, int)> go;
-          go = [&](const llvm::Argument *A, int64_t off, int depth) -> Status {
-            if (!A || depth > 6)
+          go = [&](const llvm::Argument *A, int64_t off, int) -> Status {
+            if (!A)
               return opened();
+            auto gk = std::make_pair(A, off);
+            if (!goStack.insert(gk).second)
+              return bare();
+            struct GoPop {
+              std::set<std::pair<const llvm::Argument *, int64_t>> &s;
+              std::pair<const llvm::Argument *, int64_t> k;
+              ~GoPop() { s.erase(k); }
+            } goPop{goStack, gk};
             if (A->getParent() == entryFn) {
               if (written(A, off))
                 return opened();
@@ -4552,7 +4588,7 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
                 break;
               }
               if (const auto *B = llvm::dyn_cast_or_null<llvm::Argument>(V))
-                return go(B, extra, depth + 1);
+                return go(B, extra, 0);
               if (const auto *AI = llvm::dyn_cast_or_null<llvm::AllocaInst>(V)) {
                 int64_t o = extra;
                 Status m = memRoots(C, AI, true, &o);
@@ -8406,7 +8442,7 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
     std::function<bool(const llvm::Value *, const PredEnv &, int, std::unordered_set<const llvm::Value *> &)> pred;
     pred = [&](const llvm::Value *V, const PredEnv &env, int depth,
                std::unordered_set<const llvm::Value *> &seen) -> bool {
-      if (!V || depth > 12)
+      if (!V)
         return false;
       if (llvm::isa<llvm::UndefValue>(V) || llvm::isa<llvm::PoisonValue>(V))
         return false;
@@ -8723,7 +8759,7 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
         collect;
     collect = [&](const llvm::Value *root, const std::vector<uint64_t> &idx, std::vector<const llvm::Value *> &out,
                   int depth) {
-      if (!root || depth > 8)
+      if (!root)
         return;
       root = peel(root);
       if (!root)
@@ -8757,11 +8793,6 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
       std::vector<const llvm::Value *> local;
       bool constOnly = false;
       auto addV = [&](const llvm::Value *V) {
-        if (local.size() >= 4) {
-          if (local.empty() || local.back())
-            local.push_back(nullptr);
-          return;
-        }
         if (!V || !V->getType()->isPointerTy() || llvm::isa<llvm::Constant>(V))
           return;
         for (const llvm::Value *E : local)
@@ -8984,10 +9015,19 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
         return it->second;
       if (!retFromStack.insert({D, ix}).second)
         return false;
+      std::unordered_set<const llvm::Value *> walkSeen;
       std::function<bool(const llvm::Value *, int)> walkR;
       walkR = [&](const llvm::Value *V0, int d) -> bool {
-        if (!V0 || d > 8)
+        if (!V0)
           return false;
+        const llvm::Value *peeled = peel(V0);
+        if (!peeled || !walkSeen.insert(peeled).second)
+          return false;
+        struct WalkPop {
+          std::unordered_set<const llvm::Value *> &s;
+          const llvm::Value *v;
+          ~WalkPop() { s.erase(v); }
+        } walkPop{walkSeen, peeled};
         V0 = peel(V0);
         if (!V0)
           return false;
@@ -9046,7 +9086,7 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
     collectSources = [&](const llvm::Function *F, unsigned objIx, const std::vector<uint64_t> &idx, int pd,
                          std::vector<const llvm::Value *> &out) {
       F = definedBody(F);
-      if (!F || F->isDeclaration() || objIx >= F->arg_size() || pd > 20)
+      if (!F || F->isDeclaration() || objIx >= F->arg_size())
         return;
       PKey key{F, objIx, idx};
       if (activeWant && (!memoReady || !(memoOnFor == *activeWant))) {
@@ -9074,7 +9114,7 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
       };
       if (idx.empty())
         addObj(Obj);
-      for (int spin = 0; spin < 5; ++spin) {
+      for (;;) {
         size_t before = objV.size();
         for (const llvm::Instruction &I : llvm::instructions(*F)) {
           if (const auto *G = llvm::dyn_cast<llvm::GEPOperator>(&I)) {
@@ -9138,18 +9178,12 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
         return Q && objV.count(Q);
       };
       std::vector<const llvm::Value *> local;
-      // A source set that does not fit is unknown. A prefix of it is not the set.
-      bool cut = false;
       auto pushSrc = [&](const llvm::Value *S) {
         if (!S || !S->getType()->isPointerTy() || llvm::isa<llvm::Constant>(S) || inObj(S))
           return;
         for (const llvm::Value *E : local)
           if (E == S)
             return;
-        if (local.size() >= 32) {
-          cut = true;
-          return;
-        }
         local.push_back(S);
       };
       for (const llvm::Instruction &I : llvm::instructions(*F)) {
@@ -9240,8 +9274,6 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
         }
       }
       plantStack.erase(key);
-      if (cut)
-        local.clear();
       (activeWant ? srcMemoOn : srcMemo)[key] = local;
       for (const llvm::Value *S : local)
         out.push_back(S);
@@ -9250,7 +9282,7 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
                          int pd) -> std::set<int> {
       F = definedBody(F);
       std::set<int> none;
-      if (!F || F->isDeclaration() || objIx >= F->arg_size() || pd > 20)
+      if (!F || F->isDeclaration() || objIx >= F->arg_size())
         return none;
       PKey key{F, objIx, idx};
       if (activeWant && (!memoReady || !(memoOnFor == *activeWant))) {
@@ -9269,9 +9301,10 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
         return none;
       std::vector<const llvm::Value *> srcs;
       collectSources(F, objIx, idx, pd, srcs);
+      std::unordered_set<const llvm::Value *> formalSeen;
       std::function<int(const llvm::Value *, int)> formalIx;
       formalIx = [&](const llvm::Value *S, int d) -> int {
-        if (!S || d > 6)
+        if (!S || !formalSeen.insert(S).second)
           return -1;
         for (const llvm::Argument &A : F->args()) {
           if (!A.getType()->isPointerTy())
@@ -9387,8 +9420,6 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
       auto itD = discMemo.find(key);
       if (itD != discMemo.end())
         return itD->second;
-      if (d > 16)
-        return depthCut();
       if (!discStack.insert(key).second)
         return depthCut();
       const llvm::Argument *Obj = F->getArg(objIx);
@@ -9494,10 +9525,16 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
       bool cell = false;
     };
     std::function<Pred(const llvm::Value *, int)> predOf;
+    std::unordered_set<const llvm::Value *> predSeen;
     predOf = [&](const llvm::Value *V, int d) -> Pred {
       Pred none;
-      if (!V || d > 8)
+      if (!V || !predSeen.insert(V).second)
         return none;
+      struct PredPop {
+        std::unordered_set<const llvm::Value *> &s;
+        const llvm::Value *v;
+        ~PredPop() { s.erase(v); }
+      } predPop{predSeen, V};
       V = peel(V);
       if (!V)
         return none;
@@ -9596,7 +9633,7 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
         return std::nullopt;
       std::vector<const llvm::BasicBlock *> q{I->getParent()};
       std::unordered_set<const llvm::BasicBlock *> seen;
-      for (size_t i = 0; i < q.size() && i < 32; ++i) {
+      for (size_t i = 0; i < q.size(); ++i) {
         const llvm::BasicBlock *BB = q[i];
         if (!seen.insert(BB).second)
           continue;
@@ -9670,7 +9707,7 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
               addObj(C0->getArgOperand(ai));
         }
       }
-      for (int spin = 0; spin < 4; ++spin) {
+      for (;;) {
         size_t before = objV.size();
         for (const llvm::Instruction &I : llvm::instructions(*F)) {
           if (const auto *G = llvm::dyn_cast<llvm::GEPOperator>(&I)) {
@@ -9724,18 +9761,12 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
         return Q && objV.count(Q);
       };
       std::vector<const llvm::Value *> local;
-      // A source set that does not fit is unknown. A prefix of it is not the set.
-      bool cut = false;
       auto pushSrc = [&](const llvm::Value *S) {
         if (!S || !S->getType()->isPointerTy() || llvm::isa<llvm::Constant>(S) || inObj(S))
           return;
         for (const llvm::Value *E : local)
           if (E == S)
             return;
-        if (local.size() >= 32) {
-          cut = true;
-          return;
-        }
         local.push_back(S);
       };
       for (const llvm::Instruction &I : llvm::instructions(*F)) {
@@ -9801,8 +9832,6 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
         }
       }
       valSrcStack.erase(key);
-      if (cut)
-        local.clear();
       valSrcMemo[key] = local;
       out.insert(out.end(), local.begin(), local.end());
     };
@@ -9811,7 +9840,7 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
     std::unordered_map<const llvm::Value *, Status> byteMemo;
     std::function<Status(const llvm::Value *, int)> bytesOf;
     bytesOf = [&](const llvm::Value *V, int depth) -> Status {
-      if (!V || depth > 256)
+      if (!V)
         return opened();
       if (!V->getType()->isPointerTy())
         return opened();
@@ -10002,17 +10031,12 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
         if (!ws.empty() || c.root) {
             if (const auto *HA = llvm::dyn_cast<llvm::Argument>(c.root)) {
             std::vector<const llvm::Value *> srcs;
-            bool cutU = false;
             auto pushU = [&](const llvm::Value *S) {
               if (!S)
                 return;
               for (const llvm::Value *E : srcs)
                 if (E == S)
                   return;
-              if (srcs.size() >= 32) {
-                cutU = true;
-                return;
-              }
               srcs.push_back(S);
             };
             auto sit = sites.find(HA->getParent());
@@ -10078,8 +10102,6 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
                 }
               }
             }
-            if (cutU)
-              srcs.clear();
             if (!srcs.empty()) {
               Status acc;
               bool sawS = false;
@@ -10795,14 +10817,23 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
                   return;
                 if (!stack.insert({F, key}).second)
                   return;
+                std::unordered_set<const llvm::Value *> fromSeen;
                 std::function<bool(const llvm::Value *, int)> fromCell;
                 // True only after the walk has passed a load of q: the value is
                 // the buffer that cell points at, not the cell address.
+                std::unordered_set<const llvm::Value *> pointeeSeen;
                 std::function<bool(const llvm::Value *, int)> pointee;
                 fromCell = [&](const llvm::Value *X, int depth) -> bool {
-                  if (!X || depth > 8)
+                  if (!X)
                     return false;
                   X = peel(X);
+                  if (!fromSeen.insert(X).second)
+                    return false;
+                  struct FromPop {
+                    std::unordered_set<const llvm::Value *> &s;
+                    const llvm::Value *v;
+                    ~FromPop() { s.erase(v); }
+                  } fromPop{fromSeen, X};
                   if (b >= 0) {
                     if (const auto *A = llvm::dyn_cast<llvm::Argument>(X)) {
                       if (A->getParent() == bnds[static_cast<size_t>(b)].fn && bnds[static_cast<size_t>(b)].call &&
@@ -10828,9 +10859,16 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
                   return sameLoc(anchor(X, b), q);
                 };
                 pointee = [&](const llvm::Value *X, int depth) -> bool {
-                  if (!X || depth > 8)
+                  if (!X)
                     return false;
                   X = peel(X);
+                  if (!pointeeSeen.insert(X).second)
+                    return false;
+                  struct PointeePop {
+                    std::unordered_set<const llvm::Value *> &s;
+                    const llvm::Value *v;
+                    ~PointeePop() { s.erase(v); }
+                  } pointeePop{pointeeSeen, X};
                   if (b >= 0) {
                     if (const auto *A = llvm::dyn_cast<llvm::Argument>(X)) {
                       if (A->getParent() == bnds[static_cast<size_t>(b)].fn && bnds[static_cast<size_t>(b)].call &&
@@ -11398,11 +11436,20 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
     std::set<CopyKey> copyStack;
     std::unordered_set<const llvm::AllocaInst *> reachAlloca;
     std::unordered_set<const llvm::Value *> reachHold;
+    std::unordered_set<const llvm::Value *> reachPath;
     std::function<bool(const llvm::Function *, unsigned, unsigned, int)> copiesArg;
     std::function<bool(const llvm::Value *, const llvm::Function *, unsigned, int)> reachesF;
     reachesF = [&](const llvm::Value *V, const llvm::Function *F, unsigned ix, int d) -> bool {
-      if (!V || !F || d > 16 || ix >= F->arg_size())
+      if (!V || !F || ix >= F->arg_size())
         return false;
+      V = peel(V);
+      if (!V || !reachPath.insert(V).second)
+        return false;
+      struct ReachPop {
+        std::unordered_set<const llvm::Value *> &s;
+        const llvm::Value *v;
+        ~ReachPop() { s.erase(v); }
+      } reachPop{reachPath, V};
       V = peel(V);
       if (!V)
         return false;
@@ -11417,7 +11464,7 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
           return reachesF(st, F, ix, d + 1);
         // A local filled by a call that copies another value is that value.
         // The value is the formal when that other argument reaches it.
-        if (!AI->getFunction() || d > 16)
+        if (!AI->getFunction())
           return false;
         if (!reachAlloca.insert(AI).second)
           return false;
@@ -11528,7 +11575,7 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
     };
     copiesArg = [&](const llvm::Function *F0, unsigned dst, unsigned src, int d) -> bool {
       const llvm::Function *F = definedBody(F0);
-      if (!F || F->isDeclaration() || d > 12 || dst >= F->arg_size() || src >= F->arg_size() || dst == src)
+      if (!F || F->isDeclaration() || dst >= F->arg_size() || src >= F->arg_size() || dst == src)
         return false;
       CopyKey key{F, dst, src};
       auto it = copyMemo.find(key);
@@ -11627,7 +11674,7 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
     copyField = [&](const llvm::Function *F0, unsigned dst, unsigned src, int d) -> FieldPair {
       FieldPair none;
       const llvm::Function *F = definedBody(F0);
-      if (!F || F->isDeclaration() || d > 12 || dst >= F->arg_size() || src >= F->arg_size() || dst == src)
+      if (!F || F->isDeclaration() || dst >= F->arg_size() || src >= F->arg_size() || dst == src)
         return none;
       CopyKey key{F, dst, src};
       auto it = fieldMemo.find(key);
@@ -12100,7 +12147,7 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
     };
     std::function<Status(const llvm::Value *, int, bool)> originBytes;
     originBytes = [&](const llvm::Value *V, int d, bool allowSelf) -> Status {
-      if (!V || d > 24 || !V->getType()->isPointerTy())
+      if (!V || !V->getType()->isPointerTy())
         return opened();
       if (allowSelf) {
         auto it = obMemo.find(V);
@@ -12158,7 +12205,7 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
     std::unordered_set<const llvm::Value *> regActive;
     std::function<Status(const llvm::Value *, int)> registered;
     registered = [&](const llvm::Value *V, int depth) -> Status {
-      if (!V || depth > 64 || !V->getType()->isPointerTy())
+      if (!V || !V->getType()->isPointerTy())
         return opened();
       auto itR = regMemo.find(V);
       if (itR != regMemo.end())
@@ -12341,7 +12388,7 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
                 std::unordered_set<const llvm::Value *> seen;
                 std::function<bool(const llvm::Value *, int)> fromArg;
                 fromArg = [&](const llvm::Value *v, int d) -> bool {
-                  if (!v || d > 12)
+                  if (!v)
                     return false;
                   v = peel(v);
                   if (!v || !seen.insert(v).second)
@@ -12504,7 +12551,7 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
       };
       auto keyOf = [&](const llvm::Value *V) -> std::optional<FKey> {
         std::unordered_set<const llvm::Value *> seen;
-        for (int n = 0; V && n < 4 && seen.insert(V).second; ++n) {
+        while (V && seen.insert(V).second) {
           V = V->stripPointerCasts();
           const auto *CB = llvm::dyn_cast<llvm::CallBase>(V);
           if (!CB)
@@ -12622,7 +12669,7 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
         };
         auto localId = [&](const llvm::Value *V, const llvm::Function *Owner) -> std::optional<Id> {
           std::unordered_set<const llvm::Value *> seen;
-          for (int n = 0; V && n < 4 && seen.insert(V).second; ++n) {
+          while (V && seen.insert(V).second) {
             V = V->stripPointerCasts();
             const auto *CB = llvm::dyn_cast<llvm::CallBase>(V);
             if (!CB)
@@ -12773,7 +12820,7 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
         std::unordered_map<const llvm::Value *, int> provMemo;
         std::function<int(const llvm::Value *, int)> prov;
         prov = [&](const llvm::Value *V, int d) -> int {
-          if (!V || d > 24)
+          if (!V)
             return 1;
           auto it = provMemo.find(V);
           if (it != provMemo.end())
@@ -12904,7 +12951,7 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
       // Empty idx means the actual is that argument.
       auto passed = [&](const llvm::Value *V, const llvm::Function *Owner) -> std::optional<FKey> {
         std::unordered_set<const llvm::Value *> seen;
-        for (int n = 0; V && n < 4 && seen.insert(V).second; ++n) {
+        while (V && seen.insert(V).second) {
           V = V->stripPointerCasts();
           const auto *CB = llvm::dyn_cast<llvm::CallBase>(V);
           if (!CB)
@@ -12977,10 +13024,21 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
       // This invocation's copy of the field. A callsite in the cone that passes
       // its own argument carries the same field onto that argument. Callers
       // outside the cone pass a different object.
+      std::unordered_set<const llvm::Argument *> widenStack;
       std::function<void(FKey, std::set<FKey> &, int)> widen;
       widen = [&](FKey k, std::set<FKey> &out, int depth) {
-        if (depth > 64 || !k.root || !out.insert(k).second)
+        if (!k.root || !out.insert(k).second)
           return;
+        if (!widenStack.insert(k.root).second) {
+          fieldBad.insert(k);
+          out.erase(k);
+          return;
+        }
+        struct WidenPop {
+          std::unordered_set<const llvm::Argument *> &s;
+          const llvm::Argument *v;
+          ~WidenPop() { s.erase(v); }
+        } widenPop{widenStack, k.root};
         auto sit = allSites.find(k.root->getParent());
         if (sit == allSites.end())
           return;
@@ -13023,7 +13081,7 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
       std::unordered_set<const llvm::Value *> apiActive;
       std::function<Status(const llvm::Value *, int)> apiBytes;
       apiBytes = [&](const llvm::Value *V, int d) -> Status {
-        if (!V || d > 48)
+        if (!V)
           return opened();
         V = V->stripPointerCasts();
         if (auto itM = apiMemo.find(V); itM != apiMemo.end())

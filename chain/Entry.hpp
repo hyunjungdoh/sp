@@ -151,7 +151,8 @@ namespace chain {
 // the roots are the values stored into it before the call.
 // A nameable global is an input only when no parameter of this export is a
 // root of the same actual. Anything that does not reduce stays open, on
-// that export.
+// that export. A repeated value adds nothing. The walk is finished when
+// every reached value has been answered.
 struct Input {
   std::string func;
   int arg = -1;
