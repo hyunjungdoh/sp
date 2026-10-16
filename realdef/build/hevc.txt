@@ -1,7 +1,0 @@
-  use load sse-motion.cc:968 _Z34ff_hevc_put_hevc_epel_pixels_8_ssePslPKhliiiiS_
-    def store _Z18apply_sao_internalItEvP11de265_imageiiPK20slice_segment_headeriiiPKT_iPS5_i sao.cc:174
-    def store _Z18apply_sao_internalItEvP11de265_imageiiPK20slice_segment_headeriiiPKT_iPS5_i sao.cc:238
-    def store _Z18apply_sao_internalItEvP11de265_imageiiPK20slice_segment_headeriiiPKT_iPS5_i sao.cc:268
-    def store _Z18apply_sao_internalIhEvP11de265_imageiiPK20slice_segment_headeriiiPKT_iPS5_i sao.cc:174
-    def store _Z18apply_sao_internalIhEvP11de265_imageiiPK20slice_segment_headeriiiPKT_iPS5_i sao.cc:238
-    def store _Z18apply_sao_internalIhEvP11de265_imageiiPK20slice_segment_headeriiiPKT_iPS5_i sao.cc:268

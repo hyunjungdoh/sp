@@ -33,11 +33,27 @@ namespace chain {
 // string or string_view labels only fields of that string. The call
 // sequence is a path in the resolved call graph from that export to the
 // sink function, and it ends at the sink. Use-def selects the export and
-// the chop; it does not insert an edge. The walk keeps the shortest path
-// to each sink state, each return to the export, and the shortest path from
-// the chop that reaches the sink again after a function repeats. A call
+// the chop; it does not insert an edge. Among the paths that reach one
+// sink state, the walk keeps the shortest. Call sites of one function are
+// tried in instruction order, and the may-targets of one site are tried in
+// demangled-name order, so that shortest path is the first one in that
+// order. The same rule picks each return to the export and the path from
+// the chop that reaches the sink again after a function repeats. The path
+// from the export back to a field writer is the shortest path in the caller
+// graph under that same order. A value that denotes several slot chains
+// contributes every chain to a call's target set. The one chain copied onto
+// a callee as the object's identity is the lexicographically smallest,
+// read as the sequence of (type name, byte offset). An unnamed struct is
+// that sequence's name by its layout, not by the id assigned when it was
+// first seen. Bodies that share an IR name are one function, and the path
+// kept for a field of that function is the shortest path to any of them.
+// Users of one value are
+// walked in instruction order. An argument is the pair (function, index).
+// A hash of its address is not its identity. A call
 // whose operand may denote several formals targets the functions passed as
-// any of them. A phi or select of slots is the union of those slots.
+// any of them. The slots of a value in a context are the union of its
+// operands' slots. A cycle adds nothing, and a finished pair is reused by
+// every caller. A phi or select is that union.
 // A function-pointer slot drops a byte-0 step only when that field's type
 // is the struct the next step indexes. A function stored at a constant
 // index of a global pointer array is a target of a call that loads that

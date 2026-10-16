@@ -195,19 +195,6 @@ entry/fast:
 .PHONY : entry/fast
 
 #=============================================================================
-# Target rules for targets named test_cfl
-
-# Build rule for target.
-test_cfl: cmake_check_build_system
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 test_cfl
-.PHONY : test_cfl
-
-# fast build rule for target.
-test_cfl/fast:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_cfl.dir/build.make CMakeFiles/test_cfl.dir/build
-.PHONY : test_cfl/fast
-
-#=============================================================================
 # Target rules for targets named test_pts
 
 # Build rule for target.
@@ -219,33 +206,6 @@ test_pts: cmake_check_build_system
 test_pts/fast:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_pts.dir/build.make CMakeFiles/test_pts.dir/build
 .PHONY : test_pts/fast
-
-Automaton.o: Automaton.cpp.o
-.PHONY : Automaton.o
-
-# target to build an object file
-Automaton.cpp.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/entry.dir/build.make CMakeFiles/entry.dir/Automaton.cpp.o
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_cfl.dir/build.make CMakeFiles/test_cfl.dir/Automaton.cpp.o
-.PHONY : Automaton.cpp.o
-
-Automaton.i: Automaton.cpp.i
-.PHONY : Automaton.i
-
-# target to preprocess a source file
-Automaton.cpp.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/entry.dir/build.make CMakeFiles/entry.dir/Automaton.cpp.i
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_cfl.dir/build.make CMakeFiles/test_cfl.dir/Automaton.cpp.i
-.PHONY : Automaton.cpp.i
-
-Automaton.s: Automaton.cpp.s
-.PHONY : Automaton.s
-
-# target to generate assembly for a file
-Automaton.cpp.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/entry.dir/build.make CMakeFiles/entry.dir/Automaton.cpp.s
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_cfl.dir/build.make CMakeFiles/test_cfl.dir/Automaton.cpp.s
-.PHONY : Automaton.cpp.s
 
 Chop.o: Chop.cpp.o
 .PHONY : Chop.o
@@ -322,33 +282,6 @@ Field.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/entry.dir/build.make CMakeFiles/entry.dir/Field.cpp.s
 .PHONY : Field.cpp.s
 
-Graph.o: Graph.cpp.o
-.PHONY : Graph.o
-
-# target to build an object file
-Graph.cpp.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/entry.dir/build.make CMakeFiles/entry.dir/Graph.cpp.o
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_cfl.dir/build.make CMakeFiles/test_cfl.dir/Graph.cpp.o
-.PHONY : Graph.cpp.o
-
-Graph.i: Graph.cpp.i
-.PHONY : Graph.i
-
-# target to preprocess a source file
-Graph.cpp.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/entry.dir/build.make CMakeFiles/entry.dir/Graph.cpp.i
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_cfl.dir/build.make CMakeFiles/test_cfl.dir/Graph.cpp.i
-.PHONY : Graph.cpp.i
-
-Graph.s: Graph.cpp.s
-.PHONY : Graph.s
-
-# target to generate assembly for a file
-Graph.cpp.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/entry.dir/build.make CMakeFiles/entry.dir/Graph.cpp.s
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_cfl.dir/build.make CMakeFiles/test_cfl.dir/Graph.cpp.s
-.PHONY : Graph.cpp.s
-
 Points.o: Points.cpp.o
 .PHONY : Points.o
 
@@ -424,30 +357,6 @@ main.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/chop.dir/build.make CMakeFiles/chop.dir/main.cpp.s
 .PHONY : main.cpp.s
 
-test_cfl.o: test_cfl.cpp.o
-.PHONY : test_cfl.o
-
-# target to build an object file
-test_cfl.cpp.o:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_cfl.dir/build.make CMakeFiles/test_cfl.dir/test_cfl.cpp.o
-.PHONY : test_cfl.cpp.o
-
-test_cfl.i: test_cfl.cpp.i
-.PHONY : test_cfl.i
-
-# target to preprocess a source file
-test_cfl.cpp.i:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_cfl.dir/build.make CMakeFiles/test_cfl.dir/test_cfl.cpp.i
-.PHONY : test_cfl.cpp.i
-
-test_cfl.s: test_cfl.cpp.s
-.PHONY : test_cfl.s
-
-# target to generate assembly for a file
-test_cfl.cpp.s:
-	$(MAKE) $(MAKESILENT) -f CMakeFiles/test_cfl.dir/build.make CMakeFiles/test_cfl.dir/test_cfl.cpp.s
-.PHONY : test_cfl.cpp.s
-
 test_pts.o: test_pts.cpp.o
 .PHONY : test_pts.o
 
@@ -486,11 +395,7 @@ help:
 	@echo "... omp_gen"
 	@echo "... chop"
 	@echo "... entry"
-	@echo "... test_cfl"
 	@echo "... test_pts"
-	@echo "... Automaton.o"
-	@echo "... Automaton.i"
-	@echo "... Automaton.s"
 	@echo "... Chop.o"
 	@echo "... Chop.i"
 	@echo "... Chop.s"
@@ -500,9 +405,6 @@ help:
 	@echo "... Field.o"
 	@echo "... Field.i"
 	@echo "... Field.s"
-	@echo "... Graph.o"
-	@echo "... Graph.i"
-	@echo "... Graph.s"
 	@echo "... Points.o"
 	@echo "... Points.i"
 	@echo "... Points.s"
@@ -512,9 +414,6 @@ help:
 	@echo "... main.o"
 	@echo "... main.i"
 	@echo "... main.s"
-	@echo "... test_cfl.o"
-	@echo "... test_cfl.i"
-	@echo "... test_cfl.s"
 	@echo "... test_pts.o"
 	@echo "... test_pts.i"
 	@echo "... test_pts.s"

@@ -220,9 +220,8 @@ std::string show(const llvm::Function *F) {
 // a pointer stepped by one and fed back through a phi. A constant index is
 // a fixed slot. A load from a constant struct field is not that walk. A
 // procedure parameter is replaced by the actual at the call; one that
-// remains contributes the functions in its points-to set. If the summary
-// equations do not settle, the path's callees are every procedure stored
-// into a list. A parameter that no object reaches, used as a struct, denotes the
+// remains contributes the functions in its points-to set. The summary
+// equations are solved until the pieces no longer change. A parameter that no object reaches, used as a struct, denotes the
 // external object of that struct; a field GEP is resolved from it before a
 // GEP derived from it is given its own external object. An indirect call
 // targets the functions in the callee's points-to set.
@@ -1379,9 +1378,9 @@ void fillCallers(
   // A constant index is a slot. A load from a constant struct field is a
   // method, not a walk. A procedure parameter is replaced by the actual at
   // the call; one that remains contributes the functions in its points-to
-  // set. Paths whose pointees meet are the same path. If the summary
-  // equations do not settle, the path's callees are every procedure stored
-  // into a list: the top of this lattice, not a cutoff.
+  // set. Paths whose pointees meet are the same path. The summary equations
+  // are solved until the pieces no longer change. A walk whose list is not
+  // one argument calls every procedure stored into a list.
   {
     struct Key {
       unsigned arg = 0;
@@ -2273,25 +2272,20 @@ void fillCallers(
         stackF.erase(F);
         order.push_back(F);
       };
-      for (const llvm::Function *F : live)
+      std::vector<const llvm::Function *> roots(live.begin(), live.end());
+      std::sort(roots.begin(), roots.end(), [](const llvm::Function *a, const llvm::Function *b) {
+        return a->getName() < b->getName();
+      });
+      for (const llvm::Function *F : roots)
         dfs(F);
       bool stable = false;
-      for (int round = 0; round < (int)order.size() + 2 && !stable; ++round) {
+      while (!stable) {
         stable = true;
         for (const llvm::Function *F : order) {
           auto old = summary[F];
           solveFn(F);
           if (!(summary[F] == old))
             stable = false;
-        }
-      }
-      if (!stable) {
-        for (const llvm::Function *F : order) {
-          for (Piece &p : summary[F])
-            for (auto &kv : p.st) {
-              kv.second.top = true;
-              kv.second.kill = false;
-            }
         }
       }
 

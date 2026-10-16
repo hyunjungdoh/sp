@@ -1,8 +1,0 @@
-/home/guswjd/sp/realdef/build/CMakeFiles/intrinsics_gen.dir
-/home/guswjd/sp/realdef/build/CMakeFiles/omp_gen.dir
-/home/guswjd/sp/realdef/build/CMakeFiles/acc_gen.dir
-/home/guswjd/sp/realdef/build/CMakeFiles/RISCVTargetParserTableGen.dir
-/home/guswjd/sp/realdef/build/CMakeFiles/realdef.dir
-/home/guswjd/sp/realdef/build/CMakeFiles/realdef-bin.dir
-/home/guswjd/sp/realdef/build/CMakeFiles/edit_cache.dir
-/home/guswjd/sp/realdef/build/CMakeFiles/rebuild_cache.dir

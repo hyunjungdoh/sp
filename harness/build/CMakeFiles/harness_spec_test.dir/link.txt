@@ -1,1 +1,0 @@
-/usr/bin/c++ CMakeFiles/harness_spec_test.dir/spec_test.cpp.o -o harness_spec_test  libharness.a

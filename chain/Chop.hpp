@@ -53,8 +53,8 @@ struct ChopResult {
 // procedures stored on a path that reaches the walk with no such store. A
 // procedure is a constant function or a parameter. The parameter is replaced
 // by the actual at the call. A parameter that remains contributes the
-// functions in its points-to set. If the summary equations do not settle,
-// that path's callees are every procedure stored into a list.
+// functions in its points-to set. The summary equations are solved until
+// the pieces no longer change.
 // Two paths whose pointees meet are one path.
 // A parameter that no object reaches, used as a struct, denotes one
 // external object of that struct. Outside the module a direct call is that
