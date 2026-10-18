@@ -195,6 +195,43 @@ struct Cell {
   std::vector<std::string> roots;
 };
 
+// Bytes of a file opened from an export argument. len is the least constant
+// size of the reads of that file. The driver names the file A.
+struct FileBytes {
+  std::string func;
+  int arg = -1;
+  int64_t len = 0;
+};
+
+// An indirect call on the kept sequence loads this access path.
+// The driver stores `name` there, so the call is that function.
+struct FnBind {
+  std::string func;
+  int arg = -1;
+  std::string path;
+  std::string name;
+  // The cell holds the export argument's object.
+  bool self = false;
+};
+
+// A predicate of the kept call sequence, lifted to an export argument.
+// pred is an LLVM icmp code. EQ with more than one value is a disjunction.
+// otherArg >= 0 names the other access path; vals is then empty.
+// A single EQ value is stored. Every other predicate is assumed.
+struct GuardFix {
+  std::string func;
+  int arg = -1;
+  std::string path;
+  int otherArg = -1;
+  std::string otherPath;
+  int64_t len = 0;
+  unsigned pred = 32;
+  // Decimal integers of width `len` bytes. The width is the load's.
+  std::vector<std::string> vals;
+  // The predicate reads (cell & mask). mask is empty when it reads the cell.
+  std::string mask;
+};
+
 struct EntryGroup {
   std::string chop;
   std::vector<std::string> entries;
@@ -209,6 +246,11 @@ struct EntryGroup {
   // Call sequences from an export through the chop. A sequence does not label a field.
   std::vector<std::string> seqs;
   std::vector<Witness> witnesses;
+  std::vector<FileBytes> files;
+  std::vector<GuardFix> guards;
+  std::vector<FnBind> fns;
+  // The seq line whose predicates are the guards. Later lines were not used.
+  std::string kept;
 };
 
 std::vector<EntryGroup> findEntries(llvm::Module &downstream, llvm::Module &upstream,

@@ -13,7 +13,10 @@ class Module;
 namespace chain {
 
 // Least fixpoint of access paths. A path is a sequence of (struct, constant
-// byte offset). A struct keeps one id for its name; a loader suffix .N is
+// byte offset). Each step also carries a boundary join of height 2: the gep
+// indexed a loaded pointer (a new object), the previous address (a field of
+// the same object), or both. The boundary is not part of the step's identity
+// and not part of the worklist key. A struct keeps one id for its name; a loader suffix .N is
 // the same id when the unsuffixed name exists and the field count matches.
 // The same struct on a path collapses that step to Any and
 // does not grow past it. A call result is the callee return path concatenated
@@ -30,7 +33,11 @@ namespace chain {
 // call sees it only on that path. An unnamed global whose layout equals a
 // named struct is that named struct's field. An export argument whose
 // declared type, after peeling pointer, reference, and typedef, is a
-// string or string_view labels only fields of that string. The call
+// string or string_view keeps every field that reaches the sink. The file
+// line of an export argument is the maximum constant-size read of a file
+// descriptor opened from that argument whose buffer is in the sink slice.
+// A read with no constant size adds nothing. A constant read whose buffer
+// is outside the slice adds nothing. The call
 // sequence is a path in the resolved call graph from that export to the
 // sink function, and it ends at the sink. Use-def selects the export and
 // the chop; it does not insert an edge. Among the paths that reach one
@@ -39,8 +46,10 @@ namespace chain {
 // demangled-name order, so that shortest path is the first one in that
 // order. The same rule picks each return to the export and the path from
 // the chop that reaches the sink again after a function repeats. The path
-// from the export back to a field writer is the shortest path in the caller
-// graph under that same order. A value that denotes several slot chains
+// from the export back to a field writer keeps every simple chain of caller
+// actuals. A chain is dropped only when another chain's actuals extend it,
+// and a repeated (function, formal) ends that chain. The call sequence kept
+// beside it is still the shortest path in that same order. A value that denotes several slot chains
 // contributes every chain to a call's target set. The one chain copied onto
 // a callee as the object's identity is the lexicographically smallest,
 // read as the sequence of (type name, byte offset). An unnamed struct is
@@ -77,6 +86,11 @@ struct FieldReport {
   std::vector<Cell> cells;
   // One call sequence from an export argument through the chop. No field.
   std::vector<std::string> seqs;
+  // One file per export argument that open/read derives from that argument.
+  std::vector<FileBytes> files;
+  std::vector<GuardFix> guards;
+  std::vector<FnBind> fns;
+  std::string kept;
 };
 
 FieldReport fieldCells(llvm::Module &downstream, llvm::Module &upstream, const std::string &sinkFile,

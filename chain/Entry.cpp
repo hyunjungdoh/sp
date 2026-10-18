@@ -10460,36 +10460,45 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
             const llvm::Function *D = definedBody(D0);
             if (!D || D->isDeclaration() || interior)
               continue;
-            std::function<bool(const llvm::Value *, bool, int)> touch;
-            touch = [&](const llvm::Value *cur, bool sawL, int n) -> bool {
-              if (!cur || n > 8)
+            std::unordered_set<const llvm::Value *> pathL, pathN;
+            std::function<bool(const llvm::Value *, bool)> touch;
+            touch = [&](const llvm::Value *cur, bool sawL) -> bool {
+              if (!cur)
                 return false;
               cur = peel(cur);
               if (!cur)
                 return false;
+              std::unordered_set<const llvm::Value *> &path = sawL ? pathL : pathN;
+              if (!path.insert(cur).second)
+                return false;
+              struct Pop {
+                std::unordered_set<const llvm::Value *> &s;
+                const llvm::Value *v;
+                ~Pop() { s.erase(v); }
+              } pop{path, cur};
               if (const auto *GA = llvm::dyn_cast<llvm::Argument>(cur))
                 return sawL && GA->getParent() == D && GA->getArgNo() == onlyF->getArgNo();
               if (const auto *GG = llvm::dyn_cast<llvm::GEPOperator>(cur))
-                return touch(GG->getPointerOperand(), sawL, n + 1);
+                return touch(GG->getPointerOperand(), sawL);
               if (const auto *LL = llvm::dyn_cast<llvm::LoadInst>(cur))
-                return touch(LL->getPointerOperand(), true, n + 1);
+                return touch(LL->getPointerOperand(), true);
               if (const auto *RC = llvm::dyn_cast<llvm::CallBase>(cur)) {
                 if (const llvm::Function *Cal = RC->getCalledFunction()) {
                   int u = retArg(Cal);
                   if (u >= 0 && u < static_cast<int>(RC->arg_size()))
-                    return touch(RC->getArgOperand(static_cast<unsigned>(u)), sawL, n + 1);
+                    return touch(RC->getArgOperand(static_cast<unsigned>(u)), sawL);
                 }
               }
               if (const auto *AI = llvm::dyn_cast<llvm::AllocaInst>(cur))
                 if (const llvm::Value *st = spillValue(AI))
-                  return touch(st, sawL, n + 1);
+                  return touch(st, sawL);
               return false;
             };
             for (const llvm::BasicBlock &BB : *D) {
               const auto *R = llvm::dyn_cast<llvm::ReturnInst>(BB.getTerminator());
               if (!R || !R->getReturnValue())
                 continue;
-              if (touch(R->getReturnValue(), false, 0))
+              if (touch(R->getReturnValue(), false))
                 interior = true;
             }
           }
@@ -10527,11 +10536,19 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
                 return no;
               RetA acc;
               bool any = false, badR = false;
-              std::function<bool(const llvm::Value *, int &, int64_t &, bool &, int)> addr;
-              addr = [&](const llvm::Value *V, int &arg, int64_t &off, bool &known, int n) -> bool {
-                if (!V || n > 64)
+              std::unordered_set<const llvm::Value *> addrPath;
+              std::function<bool(const llvm::Value *, int &, int64_t &, bool &)> addr;
+              addr = [&](const llvm::Value *V, int &arg, int64_t &off, bool &known) -> bool {
+                if (!V)
                   return false;
                 V = peel(V);
+                if (!V || !addrPath.insert(V).second)
+                  return false;
+                struct AddrPop {
+                  std::unordered_set<const llvm::Value *> &s;
+                  const llvm::Value *v;
+                  ~AddrPop() { s.erase(v); }
+                } addrPop{addrPath, V};
                 if (const auto *A = llvm::dyn_cast<llvm::Argument>(V)) {
                   if (A->getParent() != F)
                     return false;
@@ -10546,13 +10563,13 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
                     else
                       off += ap.getSExtValue();
                   }
-                  return addr(G->getPointerOperand(), arg, off, known, n + 1);
+                  return addr(G->getPointerOperand(), arg, off, known);
                 }
                 if (const auto *L = llvm::dyn_cast<llvm::LoadInst>(V)) {
                   if (const auto *AI = llvm::dyn_cast<llvm::AllocaInst>(peel(L->getPointerOperand())))
                     if (AI->getAllocatedType()->isPointerTy())
                       if (const llvm::Value *st = spillValue(AI))
-                        return addr(st, arg, off, known, n + 1);
+                        return addr(st, arg, off, known);
                   return false;
                 }
                 if (const auto *C = llvm::dyn_cast<llvm::CallBase>(V)) {
@@ -10567,7 +10584,7 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
                     else
                       off += in.off;
                   }
-                  return addr(C->getArgOperand(static_cast<unsigned>(in.arg)), arg, off, known, n + 1);
+                  return addr(C->getArgOperand(static_cast<unsigned>(in.arg)), arg, off, known);
                 }
                 return false;
               };
@@ -10578,7 +10595,7 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
                 int arg = -1;
                 int64_t off = 0;
                 bool known = true;
-                if (!addr(R->getReturnValue(), arg, off, known, 0)) {
+                if (!addr(R->getReturnValue(), arg, off, known)) {
                   badR = true;
                   break;
                 }
@@ -10990,7 +11007,7 @@ void fillInputs(Solve &solve, llvm::Module &M, llvm::Module &upstream,
               std::unordered_set<const llvm::Value *> seenR;
               std::function<void(const llvm::Value *, int)> walk;
               walk = [&](const llvm::Value *V, int n) {
-                if (!V || n > 16 || !seenR.insert(V).second)
+                if (!V || !seenR.insert(V).second)
                   return;
                 V = peel(V);
                 if (const auto *P = llvm::dyn_cast<llvm::PHINode>(V)) {
@@ -14576,6 +14593,10 @@ std::vector<EntryGroup> findEntries(llvm::Module &downstream, llvm::Module &upst
     if (!widePlaced) {
       g.cells = std::move(wide.cells);
       g.seqs = std::move(wide.seqs);
+      g.files = std::move(wide.files);
+      g.guards = std::move(wide.guards);
+      g.fns = std::move(wide.fns);
+      g.kept = std::move(wide.kept);
       widePlaced = true;
     }
     g.witnesses = std::move(witnesses[g.chop]);
@@ -14625,6 +14646,48 @@ std::string formatEntries(const ChopResult &chop, const std::vector<EntryGroup> 
     }
     for (const std::string &s : g.seqs)
       o << "seq " << s << "\n";
+    for (const FileBytes &f : g.files)
+      o << "file " << f.arg << " " << f.len << " " << f.func << "\n";
+    auto predName = [](unsigned pred) -> const char * {
+      switch (pred) {
+      case 32: return "eq";
+      case 33: return "ne";
+      case 34: return "ugt";
+      case 35: return "uge";
+      case 36: return "ult";
+      case 37: return "ule";
+      case 38: return "sgt";
+      case 39: return "sge";
+      case 40: return "slt";
+      case 41: return "sle";
+      default: return "eq";
+      }
+    };
+    if (!g.kept.empty())
+      o << "kept " << g.kept << "\n";
+    for (const FnBind &f : g.fns) {
+      if (f.self)
+        o << "ptr " << f.arg << " " << f.path << "\n";
+      else
+        o << "fn " << f.arg << " " << f.path << " " << f.name << "\n";
+    }
+    for (const GuardFix &gfix : g.guards) {
+      if (gfix.otherArg >= 0) {
+        o << "rel " << gfix.arg << " " << gfix.otherArg << " " << predName(gfix.pred) << " " << gfix.len << " "
+          << gfix.path << " :: " << gfix.otherPath << " :: " << gfix.func << "\n";
+        continue;
+      }
+      const char *op = !gfix.mask.empty() ? "mask" : (gfix.pred == 32 && gfix.vals.size() > 1 ? "in" : predName(gfix.pred));
+      o << "guard " << gfix.arg << " " << op << " " << gfix.len << " ";
+      if (!gfix.mask.empty())
+        o << gfix.mask << " " << predName(gfix.pred) << " ";
+      for (size_t i = 0; i < gfix.vals.size(); ++i) {
+        if (i != 0)
+          o << ",";
+        o << gfix.vals[i];
+      }
+      o << " " << gfix.path << " :: " << gfix.func << "\n";
+    }
     for (const Witness &w : g.witnesses)
     {
       o << "witness " << w.chopArg << " " << w.entry << " ";
