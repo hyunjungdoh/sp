@@ -10766,8 +10766,11 @@ class Engine {
               files.push_back(FileBytes{showFn(h.who), h.arg, n});
         }
       }
-      // The opened path is a buffer filled by copying an export argument.
-      // That argument is the file even when the open itself sees the copy.
+      // The open path is this file only when its bytes are an export argument.
+      // A byte copy (a load of i8 stored through another pointer, or memcpy)
+      // moves those bytes into a field or a local buffer. Passing that object
+      // moves the same bytes to the callee's field. An open whose path does
+      // not carry those bytes is not this argument.
       if (!openCount.empty()) {
         int64_t n = 0;
         bool variable = false;
@@ -10789,38 +10792,370 @@ class Engine {
         }
         if (variable)
           n = 0;
-        // The sequence copies bytes of an export argument, and this cone opens
-        // a file. That argument is the file. The copy is a byte load from one
-        // formal stored through another, or memcpy.
-        for (llvm::Function *F : keptFns) {
-          auto sit = sum.find(F);
-          if (sit == sum.end())
-            continue;
-          for (size_t si = 0; si < sit->second.sites.size() && si < sit->second.binds.size(); ++si) {
-            llvm::Function *cal = sit->second.sites[si].callee ? bodyOf(sit->second.sites[si].callee) : nullptr;
-            if (!cal)
+        const llvm::DataLayout &DL = down.getDataLayout();
+        struct Loc {
+          llvm::Function *fn = nullptr;
+          const llvm::Value *base = nullptr;
+          int64_t off = 0;
+          bool operator<(const Loc &o) const {
+            if (fn != o.fn)
+              return fn < o.fn;
+            if (base != o.base)
+              return base < o.base;
+            return off < o.off;
+          }
+        };
+        using Origin = std::pair<llvm::Function *, int>;
+        std::map<Loc, std::set<Origin>> origin;
+        std::map<Loc, std::vector<Loc>> copyTo;
+        struct Pass {
+          llvm::Function *sfn;
+          const llvm::Value *sbase;
+          int64_t soff;
+          llvm::Function *dfn;
+          const llvm::Argument *darg;
+        };
+        std::vector<Pass> passes;
+        auto ensureCopy = [&](llvm::Function *cal) {
+          if (!cal || cal->isDeclaration() || sum.count(cal))
+            return;
+          unsigned nIns = 0;
+          for (const llvm::BasicBlock &BB : *cal)
+            nIns += BB.size();
+          if (nIns > 0 && nIns < 400)
+            analyze(*cal);
+        };
+        std::unordered_map<const llvm::AllocaInst *, const llvm::Value *> slotOf;
+        std::unordered_set<const llvm::AllocaInst *> slotSeen;
+        auto slotValue = [&](const llvm::AllocaInst *AI) -> const llvm::Value * {
+          if (!slotSeen.insert(AI).second) {
+            auto it = slotOf.find(AI);
+            return it == slotOf.end() ? nullptr : it->second;
+          }
+          const llvm::Value *one = nullptr;
+          bool many = false;
+          std::vector<const llvm::Value *> q{AI};
+          std::unordered_set<const llvm::Value *> seen;
+          for (size_t i = 0; i < q.size(); ++i) {
+            const llvm::Value *P = q[i];
+            if (!seen.insert(P).second)
               continue;
-            auto cit = sum.find(cal);
-            if (cit == sum.end() && !cal->isDeclaration()) {
-              unsigned nIns = 0;
-              for (const llvm::BasicBlock &BB : *cal)
-                nIns += BB.size();
-              if (nIns > 0 && nIns < 400) {
-                analyze(*cal);
-                cit = sum.find(cal);
+            for (const llvm::User *U : P->users()) {
+              if (const auto *S = llvm::dyn_cast<llvm::StoreInst>(U)) {
+                if (S->getPointerOperand() != P)
+                  continue;
+                if (one && one != S->getValueOperand())
+                  many = true;
+                one = S->getValueOperand();
+              } else if (const auto *C = llvm::dyn_cast<llvm::CastInst>(U)) {
+                q.push_back(C);
+              } else if (const auto *G = llvm::dyn_cast<llvm::GEPOperator>(U)) {
+                llvm::APInt ap(DL.getIndexSizeInBits(G->getPointerAddressSpace()), 0);
+                if (G->accumulateConstantOffset(DL, ap) && ap.isZero())
+                  q.push_back(G);
               }
             }
-            if (cit == sum.end())
-              continue;
-            const std::vector<ArgBind> &row = sit->second.binds[si];
-            for (const auto &cp : cit->second.byteFrom) {
-              if (cp.first < 0 || cp.second < 0 || cp.first >= (int)row.size() || cp.second >= (int)row.size())
-                continue;
-              int src = row[(size_t)cp.second].formal;
-              if (src < 0 || !isInput(F, src))
-                continue;
-              files.push_back(FileBytes{showFn(F), src, n});
+          }
+          if (!many && one)
+            slotOf[AI] = one;
+          return many ? nullptr : one;
+        };
+        auto resolve = [&](llvm::Function *fn, const llvm::Value *v, Loc &out) -> bool {
+          std::unordered_set<const llvm::Value *> seen;
+          int64_t extra = 0;
+          for (int guard = 0; v && guard < 64; ++guard) {
+            if (!seen.insert(v).second)
+              return false;
+            if (const auto *A = llvm::dyn_cast<llvm::Argument>(v)) {
+              if (A->getParent() != fn)
+                return false;
+              out = Loc{fn, A, extra};
+              return true;
             }
+            if (const auto *AI = llvm::dyn_cast<llvm::AllocaInst>(v)) {
+              out = Loc{fn, AI, extra};
+              return true;
+            }
+            if (const auto *CB = llvm::dyn_cast<llvm::CallBase>(v)) {
+              out = Loc{fn, CB, extra};
+              return true;
+            }
+            if (const auto *C = llvm::dyn_cast<llvm::CastInst>(v)) {
+              v = C->getOperand(0);
+              continue;
+            }
+            if (const auto *CE = llvm::dyn_cast<llvm::ConstantExpr>(v)) {
+              if (CE->isCast()) {
+                v = CE->getOperand(0);
+                continue;
+              }
+              return false;
+            }
+            if (const auto *G = llvm::dyn_cast<llvm::GEPOperator>(v)) {
+              llvm::APInt ap(DL.getIndexSizeInBits(G->getPointerAddressSpace()), 0);
+              if (!G->accumulateConstantOffset(DL, ap))
+                return false;
+              if (ap.getSignificantBits() > 63 && !ap.isNegative())
+                return false;
+              extra += ap.getSExtValue();
+              v = G->getPointerOperand();
+              continue;
+            }
+            if (const auto *L = llvm::dyn_cast<llvm::LoadInst>(v)) {
+              const llvm::Value *p = L->getPointerOperand();
+              const llvm::AllocaInst *AI = nullptr;
+              for (int g = 0; p && g < 8; ++g) {
+                if (const auto *A = llvm::dyn_cast<llvm::AllocaInst>(p)) {
+                  AI = A;
+                  break;
+                }
+                if (const auto *C = llvm::dyn_cast<llvm::CastInst>(p)) {
+                  p = C->getOperand(0);
+                  continue;
+                }
+                if (const auto *GE = llvm::dyn_cast<llvm::GEPOperator>(p)) {
+                  llvm::APInt ap(DL.getIndexSizeInBits(GE->getPointerAddressSpace()), 0);
+                  if (!GE->accumulateConstantOffset(DL, ap) || !ap.isZero())
+                    break;
+                  p = GE->getPointerOperand();
+                  continue;
+                }
+                break;
+              }
+              if (!AI)
+                return false;
+              const llvm::Value *st = slotValue(AI);
+              if (!st)
+                return false;
+              v = st;
+              continue;
+            }
+            if (const auto *P = llvm::dyn_cast<llvm::PHINode>(v)) {
+              const llvm::Value *same = nullptr;
+              bool ok = true;
+              for (unsigned pi = 0; pi < P->getNumIncomingValues(); ++pi) {
+                const llvm::Value *inc = P->getIncomingValue(pi);
+                if (inc == P)
+                  continue;
+                if (!same)
+                  same = inc;
+                else if (same != inc)
+                  ok = false;
+              }
+              if (!ok || !same)
+                return false;
+              v = same;
+              continue;
+            }
+            return false;
+          }
+          return false;
+        };
+        for (llvm::Function *F : cone) {
+          for (llvm::Argument &A : F->args())
+            if (isInput(F, (int)A.getArgNo()))
+              origin[Loc{F, &A, 0}].insert({F, (int)A.getArgNo()});
+          for (llvm::Instruction &I : llvm::instructions(*F)) {
+            const auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+            if (!CB)
+              continue;
+            llvm::Function *cal = CB->getCalledFunction() ? bodyOf(CB->getCalledFunction()) : nullptr;
+            if (cal)
+              ensureCopy(cal);
+            auto cit = cal ? sum.find(cal) : sum.end();
+            if (cal && cit != sum.end()) {
+              for (const auto &cp : cit->second.byteFrom) {
+                if (cp.first < 0 || cp.second < 0 || cp.first >= (int)CB->arg_size() ||
+                    cp.second >= (int)CB->arg_size())
+                  continue;
+                Loc dst, src;
+                if (!resolve(F, CB->getArgOperand((unsigned)cp.first), dst) ||
+                    !resolve(F, CB->getArgOperand((unsigned)cp.second), src))
+                  continue;
+                copyTo[src].push_back(dst);
+              }
+            }
+            if (!cal)
+              continue;
+            for (unsigned a = 0; a < CB->arg_size() && a < cal->arg_size(); ++a) {
+              if (!CB->getArgOperand(a)->getType()->isPointerTy())
+                continue;
+              Loc src;
+              if (!resolve(F, CB->getArgOperand(a), src))
+                continue;
+              const auto *arg = cal->getArg(a);
+              passes.push_back(Pass{src.fn, src.base, src.off, cal, arg});
+            }
+          }
+        }
+        // A function that returns a new object can copy a field of an argument
+        // onto the same field of that object. The call then carries those bytes.
+        struct Fact {
+          int formal;
+          int64_t srcOff;
+          int64_t dstOff;
+          int64_t len;
+        };
+        std::unordered_map<llvm::Function *, std::vector<Fact>> retFact;
+        auto factsOf = [&](llvm::Function *G) -> std::vector<Fact> {
+          auto it = retFact.find(G);
+          if (it != retFact.end())
+            return it->second;
+          std::vector<Fact> facts;
+          unsigned nIns = 0;
+          for (const llvm::BasicBlock &BB : *G)
+            nIns += BB.size();
+          if (nIns > 0 && nIns < 20000) {
+            std::vector<std::pair<const llvm::Value *, int64_t>> bases;
+            for (const llvm::BasicBlock &BB : *G) {
+              const auto *R = llvm::dyn_cast<llvm::ReturnInst>(BB.getTerminator());
+              if (!R || !R->getReturnValue() || !R->getReturnValue()->getType()->isPointerTy())
+                continue;
+              Loc L;
+              if (resolve(G, R->getReturnValue(), L))
+                bases.push_back({L.base, L.off});
+            }
+            auto take = [&](const Loc &dst, const Loc &src, int64_t len) {
+              if (len <= 0)
+                return;
+              const auto *A = llvm::dyn_cast<llvm::Argument>(src.base);
+              if (!A || A->getParent() != G)
+                return;
+              for (const auto &b : bases) {
+                if (b.first != dst.base || dst.off < b.second)
+                  continue;
+                facts.push_back(Fact{(int)A->getArgNo(), src.off, dst.off - b.second, len});
+                break;
+              }
+            };
+            for (llvm::Instruction &I : llvm::instructions(*G)) {
+              const auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+              if (!CB)
+                continue;
+              if (const auto *MC = llvm::dyn_cast<llvm::MemCpyInst>(CB)) {
+                int64_t len = -1;
+                if (const auto *C = llvm::dyn_cast<llvm::ConstantInt>(MC->getLength()))
+                  len = C->getSExtValue();
+                Loc dst, src;
+                if (len > 0 && resolve(G, MC->getDest(), dst) && resolve(G, MC->getSource(), src))
+                  take(dst, src, len);
+                continue;
+              }
+              llvm::Function *inner = CB->getCalledFunction() ? bodyOf(CB->getCalledFunction()) : nullptr;
+              if (!inner)
+                continue;
+              ensureCopy(inner);
+              auto cit = sum.find(inner);
+              if (cit == sum.end())
+                continue;
+              int64_t len = 1;
+              if (CB->arg_size() > 2)
+                if (const auto *C = llvm::dyn_cast<llvm::ConstantInt>(CB->getArgOperand(2)))
+                  if (C->getSExtValue() > 0)
+                    len = C->getSExtValue();
+              for (const auto &cp : cit->second.byteFrom) {
+                if (cp.first < 0 || cp.second < 0 || cp.first >= (int)CB->arg_size() ||
+                    cp.second >= (int)CB->arg_size())
+                  continue;
+                Loc dst, src;
+                if (!resolve(G, CB->getArgOperand((unsigned)cp.first), dst) ||
+                    !resolve(G, CB->getArgOperand((unsigned)cp.second), src))
+                  continue;
+                take(dst, src, len);
+              }
+            }
+          }
+          auto stored = retFact.emplace(G, std::move(facts));
+          return stored.first->second;
+        };
+        struct RetMove {
+          llvm::Function *sfn;
+          const llvm::Value *sbase;
+          int64_t begin;
+          int64_t end;
+          const llvm::CallBase *call;
+          int64_t dst;
+        };
+        std::vector<RetMove> moves;
+        for (llvm::Function *F : cone) {
+          for (llvm::Instruction &I : llvm::instructions(*F)) {
+            const auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+            if (!CB)
+              continue;
+            llvm::Function *cal = CB->getCalledFunction() ? bodyOf(CB->getCalledFunction()) : nullptr;
+            if (!cal)
+              continue;
+            for (const Fact &f : factsOf(cal)) {
+              if (f.formal < 0 || f.formal >= (int)CB->arg_size())
+                continue;
+              Loc src;
+              if (!resolve(F, CB->getArgOperand((unsigned)f.formal), src))
+                continue;
+              moves.push_back(
+                  RetMove{src.fn, src.base, src.off + f.srcOff, src.off + f.srcOff + f.len, CB, f.dstOff});
+            }
+          }
+        }
+        std::vector<Loc> work;
+        for (const auto &kv : origin)
+          work.push_back(kv.first);
+        std::set<std::tuple<llvm::Function *, const llvm::Value *, int64_t, llvm::Function *, int>> have;
+        for (const auto &kv : origin)
+          for (const Origin &o : kv.second)
+            have.insert({kv.first.fn, kv.first.base, kv.first.off, o.first, o.second});
+        auto addOrigin = [&](const Loc &at, const Origin &o) {
+          if (!at.fn || !at.base || !o.first)
+            return;
+          if (!have.insert({at.fn, at.base, at.off, o.first, o.second}).second)
+            return;
+          origin[at].insert(o);
+          work.push_back(at);
+        };
+        for (size_t wi = 0; wi < work.size(); ++wi) {
+          Loc at = work[wi];
+          std::set<Origin> gotHere = origin[at];
+          auto eit = copyTo.find(at);
+          if (eit != copyTo.end())
+            for (const Loc &dst : eit->second)
+              for (const Origin &o : gotHere)
+                addOrigin(dst, o);
+          for (const Pass &p : passes) {
+            if (p.sfn != at.fn || p.sbase != at.base || at.off < p.soff)
+              continue;
+            for (const Origin &o : gotHere)
+              addOrigin(Loc{p.dfn, p.darg, at.off - p.soff}, o);
+          }
+          for (const RetMove &m : moves) {
+            if (m.sfn != at.fn || m.sbase != at.base || at.off < m.begin || at.off >= m.end)
+              continue;
+            for (const Origin &o : gotHere)
+              addOrigin(Loc{at.fn, m.call, m.dst + (at.off - m.begin)}, o);
+          }
+        }
+        auto openName = [](llvm::StringRef nm) {
+          return nm == "open" || nm == "open64" || nm == "fopen" || nm == "fopen64" || nm == "openat" ||
+                 nm == "openat64";
+        };
+        for (llvm::Function *F : cone) {
+          for (llvm::Instruction &I : llvm::instructions(*F)) {
+            const auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+            if (!CB || !CB->getCalledFunction() || !CB->getCalledFunction()->hasName())
+              continue;
+            llvm::StringRef nm = CB->getCalledFunction()->getName();
+            if (!openName(nm))
+              continue;
+            int pathArg = (nm == "openat" || nm == "openat64") ? 1 : 0;
+            if (pathArg >= (int)CB->arg_size())
+              continue;
+            Loc path;
+            if (!resolve(F, CB->getArgOperand((unsigned)pathArg), path))
+              continue;
+            auto oit = origin.find(path);
+            if (oit == origin.end())
+              continue;
+            for (const Origin &o : oit->second)
+              if (isInput(o.first, o.second))
+                files.push_back(FileBytes{showFn(o.first), o.second, n});
           }
         }
       }
@@ -10836,6 +11171,352 @@ class Engine {
                                 return a.func == b.func && a.arg == b.arg && a.len == b.len;
                               }),
                   files.end());
+      // A pointer the sequence passes on is a cell when every step back to the
+      // export argument is a constant-offset field. An indirect call contributes
+      // a field only when the function it loads returns one. The call's return
+      // value is not itself a field.
+      if (exportFn) {
+        const llvm::DataLayout &DL = down.getDataLayout();
+        struct St {
+          std::string ty;
+          int64_t off = 0;
+          bool operator==(const St &o) const { return ty == o.ty && off == o.off; }
+        };
+        struct Via {
+          const llvm::CallBase *cb = nullptr;
+          llvm::Function *at = nullptr;
+        };
+        std::unordered_map<llvm::Function *, std::vector<const llvm::CallBase *>> calledBy;
+        for (llvm::Function *F : cone)
+          for (llvm::Instruction &I : llvm::instructions(*F))
+            if (const auto *CB = llvm::dyn_cast<llvm::CallBase>(&I))
+              if (llvm::Function *D = CB->getCalledFunction() ? bodyOf(CB->getCalledFunction()) : nullptr)
+                calledBy[D].push_back(CB);
+        auto typeOf = [](llvm::Type *T) -> std::string {
+          const auto *S = llvm::dyn_cast<llvm::StructType>(T);
+          if (!S || !S->hasName())
+            return {};
+          return S->getName().str();
+        };
+        llvm::Module &upstreamMod = up;
+        std::function<bool(llvm::Function *, const llvm::Value *, std::vector<Via>, std::vector<St> &, int &, int,
+                           std::set<std::pair<llvm::Function *, const llvm::Value *>> &)>
+            go;
+        go = [&](llvm::Function *F, const llvm::Value *v, std::vector<Via> up, std::vector<St> &steps, int &arg,
+                 int depth, std::set<std::pair<llvm::Function *, const llvm::Value *>> &seen) -> bool {
+          if (!F || !v || depth > 40)
+            return false;
+          if (!seen.insert({F, v}).second)
+            return false;
+          for (int peel = 0; peel < 12; ++peel) {
+            if (const auto *C = llvm::dyn_cast<llvm::CastInst>(v)) {
+              v = C->getOperand(0);
+              continue;
+            }
+            if (const auto *CE = llvm::dyn_cast<llvm::ConstantExpr>(v)) {
+              if (!CE->isCast())
+                break;
+              v = CE->getOperand(0);
+              continue;
+            }
+            if (const auto *P = llvm::dyn_cast<llvm::PHINode>(v)) {
+              const llvm::Value *same = nullptr;
+              bool ok = true;
+              for (unsigned i = 0; i < P->getNumIncomingValues(); ++i) {
+                const llvm::Value *inc = P->getIncomingValue(i);
+                if (inc == P)
+                  continue;
+                if (!same)
+                  same = inc;
+                else if (same != inc)
+                  ok = false;
+              }
+              if (!ok || !same)
+                break;
+              v = same;
+              continue;
+            }
+            break;
+          }
+          if (const auto *A = llvm::dyn_cast<llvm::Argument>(v)) {
+            if (!up.empty()) {
+              Via top = up.back();
+              up.pop_back();
+              unsigned i = A->getArgNo();
+              if (!top.cb || !top.at || i >= top.cb->arg_size())
+                return false;
+              return go(top.at, top.cb->getArgOperand(i), up, steps, arg, depth + 1, seen);
+            }
+            if (F == exportFn) {
+              arg = (int)A->getArgNo();
+              return true;
+            }
+            std::vector<St> agreed;
+            int agreedArg = -1;
+            int n = 0;
+            for (const llvm::CallBase *CB : calledBy[F]) {
+              llvm::Function *caller = const_cast<llvm::Function *>(CB->getFunction());
+              unsigned i = A->getArgNo();
+              if (!caller || i >= CB->arg_size())
+                continue;
+              std::vector<St> sub;
+              int a2 = -1;
+              auto branch = seen;
+              if (!go(caller, CB->getArgOperand(i), {}, sub, a2, depth + 1, branch))
+                continue;
+              if (n == 0) {
+                agreed = sub;
+                agreedArg = a2;
+              } else if (a2 != agreedArg || sub != agreed) {
+                return false;
+              }
+              ++n;
+            }
+            if (n == 0)
+              return false;
+            steps = std::move(agreed);
+            arg = agreedArg;
+            return true;
+          }
+          if (const auto *L = llvm::dyn_cast<llvm::LoadInst>(v)) {
+            const llvm::Value *p = L->getPointerOperand();
+            const llvm::AllocaInst *AI = nullptr;
+            const llvm::Value *q = p;
+            for (int g = 0; q && g < 6; ++g) {
+              if (const auto *AL = llvm::dyn_cast<llvm::AllocaInst>(q)) {
+                AI = AL;
+                break;
+              }
+              if (const auto *C = llvm::dyn_cast<llvm::CastInst>(q)) {
+                q = C->getOperand(0);
+                continue;
+              }
+              if (const auto *G = llvm::dyn_cast<llvm::GEPOperator>(q)) {
+                llvm::APInt z(DL.getIndexSizeInBits(G->getPointerAddressSpace()), 0);
+                if (!G->accumulateConstantOffset(DL, z) || !z.isZero())
+                  break;
+                q = G->getPointerOperand();
+                continue;
+              }
+              break;
+            }
+            if (AI) {
+              std::vector<const llvm::Value *> stored;
+              for (const llvm::User *U : AI->users())
+                if (const auto *S = llvm::dyn_cast<llvm::StoreInst>(U))
+                  if (S->getPointerOperand() == AI)
+                    stored.push_back(S->getValueOperand());
+              std::vector<St> agreed;
+              int agreedArg = -1;
+              int n = 0;
+              bool any = false;
+              for (const llvm::Value *sv : stored) {
+                std::vector<St> sub;
+                int a2 = -1;
+                auto branch = seen;
+                if (!go(F, sv, up, sub, a2, depth + 1, branch))
+                  continue;
+                any = true;
+                if (n == 0) {
+                  agreed = sub;
+                  agreedArg = a2;
+                } else if (a2 != agreedArg || sub != agreed)
+                  return false;
+                ++n;
+              }
+              if (!any || n == 0)
+                return false;
+              steps = std::move(agreed);
+              arg = agreedArg;
+              return true;
+            }
+            const auto *G = llvm::dyn_cast<llvm::GEPOperator>(p);
+            if (!G)
+              return false;
+            llvm::APInt ap(DL.getIndexSizeInBits(G->getPointerAddressSpace()), 0);
+            if (!G->accumulateConstantOffset(DL, ap))
+              return false;
+            if (ap.getSignificantBits() > 63 && !ap.isNegative())
+              return false;
+            std::string ty = typeOf(G->getSourceElementType());
+            if (ty.empty())
+              return false;
+            if (!go(F, G->getPointerOperand(), up, steps, arg, depth + 1, seen))
+              return false;
+            steps.push_back(St{ty, ap.getSExtValue()});
+            return true;
+          }
+          if (const auto *CB = llvm::dyn_cast<llvm::CallBase>(v)) {
+            if (CB->isInlineAsm())
+              return false;
+            auto enter = [&](llvm::Function *cal) -> bool {
+              if (!cal || cal->isDeclaration())
+                return false;
+              unsigned nIns = 0;
+              for (const llvm::BasicBlock &BB : *cal)
+                nIns += BB.size();
+              if (nIns == 0 || nIns > 8000)
+                return false;
+              std::vector<const llvm::Value *> rets;
+              for (const llvm::BasicBlock &BB : *cal)
+                if (const auto *R = llvm::dyn_cast<llvm::ReturnInst>(BB.getTerminator()))
+                  if (R->getReturnValue() && R->getReturnValue()->getType()->isPointerTy())
+                    rets.push_back(R->getReturnValue());
+              if (rets.empty())
+                return false;
+              std::vector<Via> next = up;
+              next.push_back(Via{CB, F});
+              std::vector<St> agreed;
+              int agreedArg = -1;
+              int n = 0;
+              for (const llvm::Value *rv : rets) {
+                std::vector<St> sub;
+                int a2 = -1;
+                auto branch = seen;
+                if (!go(cal, rv, next, sub, a2, depth + 1, branch))
+                  continue;
+                if (n == 0) {
+                  agreed = sub;
+                  agreedArg = a2;
+                } else if (a2 != agreedArg || sub != agreed)
+                  return false;
+                ++n;
+              }
+              if (n == 0)
+                return false;
+              steps = std::move(agreed);
+              arg = agreedArg;
+              return true;
+            };
+            if (llvm::Function *direct = CB->getCalledFunction())
+              return enter(bodyOf(direct));
+            std::set<int> keys;
+            collectFnSlots(CB->getCalledOperand(), DL, keys);
+            std::vector<llvm::Function *> tg;
+            for (int k : keys) {
+              auto it = fnAt.find(k);
+              if (it == fnAt.end())
+                continue;
+              for (llvm::Function *T : it->second)
+                if (llvm::Function *B = bodyOf(T))
+                  if (!B->isDeclaration())
+                    tg.push_back(B);
+            }
+            std::sort(tg.begin(), tg.end());
+            tg.erase(std::unique(tg.begin(), tg.end()), tg.end());
+            if (tg.empty()) {
+              static std::unordered_map<llvm::FunctionType *, std::vector<llvm::Function *>> taken;
+              auto it = taken.find(CB->getFunctionType());
+              if (it == taken.end()) {
+                std::vector<llvm::Function *> all;
+                auto pull = [&](llvm::Module &M) {
+                  for (llvm::Function &G : M) {
+                    if (G.isDeclaration() || !G.hasAddressTaken())
+                      continue;
+                    if (G.getFunctionType() != CB->getFunctionType())
+                      continue;
+                    if (llvm::Function *B = bodyOf(&G))
+                      if (!B->isDeclaration())
+                        all.push_back(B);
+                  }
+                };
+                pull(down);
+                pull(upstreamMod);
+                std::sort(all.begin(), all.end());
+                all.erase(std::unique(all.begin(), all.end()), all.end());
+                it = taken.emplace(CB->getFunctionType(), std::move(all)).first;
+              }
+              tg = it->second;
+            }
+            if (tg.empty() || tg.size() > 64)
+              return false;
+            std::vector<St> agreed;
+            int agreedArg = -1;
+            int n = 0;
+            for (llvm::Function *T : tg) {
+              std::vector<St> sub;
+              int a2 = -1;
+              auto branch = seen;
+              if (!enter(T))
+                continue;
+              if (n == 0) {
+                agreed = steps;
+                agreedArg = arg;
+              } else if (arg != agreedArg || steps != agreed)
+                return false;
+              ++n;
+              (void)sub;
+              (void)a2;
+              (void)branch;
+            }
+            if (n == 0)
+              return false;
+            steps = std::move(agreed);
+            arg = agreedArg;
+            return true;
+          }
+          return false;
+        };
+        std::set<std::pair<int, std::string>> have;
+        std::string tail;
+        {
+          size_t a = kept.find(" :: ");
+          size_t b = a == std::string::npos ? std::string::npos : kept.find(" :: ", a + 4);
+          if (b != std::string::npos)
+            tail = kept.substr(a + 4);
+        }
+        for (llvm::Function *F : keptFns) {
+          for (llvm::Instruction &I : llvm::instructions(*F)) {
+            const auto *CB = llvm::dyn_cast<llvm::CallBase>(&I);
+            if (!CB || CB->isInlineAsm())
+              continue;
+            for (unsigned a = 0; a < CB->arg_size(); ++a) {
+              const llvm::Value *op = CB->getArgOperand(a);
+              if (llvm::isa<llvm::Argument>(op) || llvm::isa<llvm::Constant>(op))
+                continue;
+              int64_t len = 0;
+              if (op->getType()->isPointerTy())
+                len = (int64_t)DL.getPointerSize(0);
+              else if (op->getType()->isIntegerTy()) {
+                const llvm::Value *n = op;
+                for (int peel = 0; peel < 4; ++peel) {
+                  const auto *C = llvm::dyn_cast<llvm::CastInst>(n);
+                  if (!C || !C->getOperand(0)->getType()->isIntegerTy())
+                    break;
+                  n = C->getOperand(0);
+                }
+                if (const auto *L = llvm::dyn_cast<llvm::LoadInst>(n))
+                  if (L->getType()->isIntegerTy() && L->getType()->getIntegerBitWidth() % 8 == 0)
+                    len = (int64_t)L->getType()->getIntegerBitWidth() / 8;
+                op = n;
+              }
+              if (len <= 0)
+                continue;
+              std::vector<St> steps;
+              int arg = -1;
+              std::set<std::pair<llvm::Function *, const llvm::Value *>> seen;
+              if (!go(F, op, {}, steps, arg, 0, seen) || arg < 0 || steps.size() < 2)
+                continue;
+              if (!isInput(exportFn, arg))
+                continue;
+              std::string path = "arg" + std::to_string(arg);
+              for (const St &s : steps)
+                path += "." + s.ty + "^" + std::to_string(s.off);
+              if (!have.insert({arg, path}).second)
+                continue;
+              Cell c;
+              c.chopArg = -1;
+              c.off = 0;
+              c.len = len;
+              c.func = showFn(exportFn);
+              c.path = path;
+              if (!tail.empty())
+                c.roots.push_back("pass " + std::to_string(arg) + " " + path + " :: " + tail);
+              out.push_back(std::move(c));
+            }
+          }
+        }
+      }
     }
     return FieldReport{std::move(out), std::move(seqs), std::move(files), std::move(guards), std::move(fns),
                        std::move(kept)};

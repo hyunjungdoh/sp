@@ -69,6 +69,17 @@ std::optional<std::vector<Step>> parsePath(const std::string &path) {
 
 } // namespace
 
+// The kept line is `pass N :: export :: sequence`. The harness is that export.
+std::string keptExport(const std::string &kept) {
+  size_t a = kept.find(" :: ");
+  if (a == std::string::npos)
+    return {};
+  size_t b = kept.find(" :: ", a + 4);
+  if (b == std::string::npos)
+    return {};
+  return kept.substr(a + 4, b - (a + 4));
+}
+
 std::vector<Driver> driversOf(const Report &report) {
   std::map<std::string, std::map<int, std::vector<Field>>> byFunc;
   std::map<std::string, std::vector<Rel>> pending;
@@ -156,6 +167,15 @@ std::vector<Driver> driversOf(const Report &report) {
     byFunc[f.func];
     if (f.arg >= 0)
       byFunc[f.func][f.arg];
+  }
+  std::string keptFn = keptExport(report.kept);
+  if (!keptFn.empty()) {
+    for (auto it = byFunc.begin(); it != byFunc.end();) {
+      if (it->first != keptFn)
+        it = byFunc.erase(it);
+      else
+        ++it;
+    }
   }
   for (auto &fv : byFunc) {
     Driver d;

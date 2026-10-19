@@ -80,8 +80,7 @@ struct Driver {
   int64_t fileBytes = 0;
 };
 
-// One driver per export that an input line names, in the order of the
-// export's demangled name.
+// One driver for the export named by the kept sequence.
 std::vector<Driver> driversOf(const Report &report);
 
 } // namespace gen
