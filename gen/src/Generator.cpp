@@ -132,7 +132,7 @@ std::vector<Generated> generate(const std::string &reportPath, const std::string
         }
       }
     }
-    if (p.fileBytes > 0)
+    if (p.file)
       manifest << "klee-file 1 " << p.fileBytes << "\n";
     if (!e.file.empty() && !upstreamPath.empty()) {
       llvm::LLVMContext lctx;

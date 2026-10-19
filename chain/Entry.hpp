@@ -195,8 +195,9 @@ struct Cell {
   std::vector<std::string> roots;
 };
 
-// Bytes of a file opened from an export argument. len is the least constant
-// size of the reads of that file. The driver names the file A.
+// Bytes of a file opened from an export argument. len is the largest constant
+// count among the reads of that file whose buffer reaches the sink. Zero
+// means those reads do not pass a constant count. The driver names the file A.
 struct FileBytes {
   std::string func;
   int arg = -1;

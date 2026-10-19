@@ -86,8 +86,10 @@ struct PlacedArg {
 struct Placed {
   std::string func;
   std::vector<PlacedArg> args;
-  // Constant size of the file opened from this export's path argument.
-  // Zero means this driver does not open that file.
+  // file is set when this export opens a file. fileBytes is the largest
+  // constant read. Zero with file set means the read count is not a constant.
+  bool file = false;
+  int fileArg = -1;
   int64_t fileBytes = 0;
 };
 

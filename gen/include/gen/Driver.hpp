@@ -72,6 +72,11 @@ struct Driver {
   std::string func;
   std::vector<Argument> args;
   std::vector<Rel> rels;
+  // True when an export argument is the path of a file the kept sequence reads.
+  // fileBytes is the largest constant count among those reads. Zero means the
+  // count is not a constant; the runtime fills each concrete read.
+  bool file = false;
+  int fileArg = -1;
   int64_t fileBytes = 0;
 };
 

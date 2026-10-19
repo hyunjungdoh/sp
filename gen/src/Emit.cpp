@@ -379,12 +379,19 @@ Emitted emitDriver(const Placed &placed, llvm::Module &library, const std::strin
     }
     if (ty->isPointerTy()) {
       if (slot->shapes.empty()) {
-        uint64_t bytes = m.getDataLayout().getPointerSize(0);
+        bool path = placed.file && placed.fileArg == static_cast<int>(i);
+        uint64_t bytes = path ? 2 : m.getDataLayout().getPointerSize(0);
         if (bytes == 0)
           bytes = 8;
         auto *slotp = b.CreateAlloca(i8, llvm::ConstantInt::get(i64, bytes), "arg" + std::to_string(i));
         slotp->setAlignment(llvm::Align(8));
-        b.CreateMemSet(slotp, llvm::ConstantInt::get(i8, 0), bytes, llvm::Align(8));
+        if (path) {
+          b.CreateStore(llvm::ConstantInt::get(i8, 'A'), slotp);
+          auto *z = b.CreateGEP(i8, slotp, llvm::ConstantInt::get(i64, 1));
+          b.CreateStore(llvm::ConstantInt::get(i8, 0), z);
+        } else {
+          b.CreateMemSet(slotp, llvm::ConstantInt::get(i8, 0), bytes, llvm::Align(8));
+        }
         args.push_back(slotp);
       } else if (slot->shapes.size() == 1) {
         args.push_back(buildShape(slot->shapes[0], static_cast<int>(i), 0));

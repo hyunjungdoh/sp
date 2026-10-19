@@ -310,6 +310,8 @@ std::vector<Placed> placeAll(const std::vector<Driver> &drivers, llvm::Module &l
   for (const Driver &d : drivers) {
     Placed p;
     p.func = d.func;
+    p.file = d.file;
+    p.fileArg = d.fileArg;
     p.fileBytes = d.fileBytes;
     for (const Argument &a : d.args) {
       PlacedArg arg;

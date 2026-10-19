@@ -151,9 +151,11 @@ std::vector<Driver> driversOf(const Report &report) {
   }
   std::vector<Driver> drivers;
   for (const FileBytes &f : report.files) {
-    if (f.len <= 0 || f.func.empty())
+    if (f.func.empty() || f.len < 0)
       continue;
     byFunc[f.func];
+    if (f.arg >= 0)
+      byFunc[f.func][f.arg];
   }
   for (auto &fv : byFunc) {
     Driver d;
@@ -164,9 +166,17 @@ std::vector<Driver> driversOf(const Report &report) {
       a.fields = std::move(av.second);
       d.args.push_back(std::move(a));
     }
-    for (const FileBytes &f : report.files)
-      if (f.func == d.func && f.len > d.fileBytes)
+    d.file = false;
+    d.fileArg = -1;
+    for (const FileBytes &f : report.files) {
+      if (f.func != d.func || f.len < 0)
+        continue;
+      d.file = true;
+      if (f.arg >= 0)
+        d.fileArg = f.arg;
+      if (f.len > d.fileBytes)
         d.fileBytes = f.len;
+    }
     auto pit = pending.find(d.func);
     if (pit != pending.end())
       d.rels = std::move(pit->second);
