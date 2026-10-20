@@ -425,6 +425,11 @@ class Engine {
   std::vector<int> chainParent{0};
   std::vector<int> chainTy{0};
   std::vector<int64_t> chainOff{0};
+  // A struct that is only the first field of a larger struct. LLVM reuses that
+  // header for every controller with the same prefix, so the header alone is
+  // not one cell.
+  std::unordered_set<int> headerTy;
+  bool headerReady = false;
   std::vector<std::vector<int>> deps;
   std::unordered_map<std::vector<int>, int, VecHash> depMemo;
   std::unordered_map<std::uint64_t, int> uniteMemo;
@@ -5412,6 +5417,91 @@ class Engine {
     }
     for (Wr &w : carried)
       next.writes.push_back(std::move(w));
+    // A function stored into a local controller is the value of the field
+    // where that controller is published. The header type alone is shared by
+    // other controllers, so the published field is part of the cell.
+    {
+      auto peel = [](const llvm::Value *V) {
+        while (V) {
+          if (const auto *C = llvm::dyn_cast<llvm::CastInst>(V))
+            V = C->getOperand(0);
+          else if (const auto *CE = llvm::dyn_cast<llvm::ConstantExpr>(V)) {
+            if (!CE->isCast())
+              break;
+            V = CE->getOperand(0);
+          } else
+            break;
+        }
+        return V;
+      };
+      auto objectAlloca = [&](const llvm::Value *V) -> const llvm::AllocaInst * {
+        std::unordered_set<const llvm::Value *> seen;
+        while (V && seen.insert(V).second) {
+          V = peel(V);
+          if (const auto *A = llvm::dyn_cast<llvm::AllocaInst>(V))
+            return A;
+          if (const auto *L = llvm::dyn_cast<llvm::LoadInst>(V)) {
+            V = L->getPointerOperand();
+            continue;
+          }
+          if (const auto *G = llvm::dyn_cast<llvm::GEPOperator>(V)) {
+            V = G->getPointerOperand();
+            continue;
+          }
+          break;
+        }
+        return nullptr;
+      };
+      std::unordered_map<const llvm::AllocaInst *, std::vector<std::pair<int, llvm::Function *>>> atObj;
+      std::unordered_map<const llvm::AllocaInst *, std::vector<int>> publishAt;
+      for (llvm::Instruction &I : llvm::instructions(F)) {
+        auto *St = llvm::dyn_cast<llvm::StoreInst>(&I);
+        if (!St)
+          continue;
+        if (const auto *Fn = llvm::dyn_cast<llvm::Function>(St->getValueOperand()->stripPointerCasts())) {
+          if (!Fn->hasName() || Fn->isIntrinsic())
+            continue;
+          const llvm::AllocaInst *A = objectAlloca(St->getPointerOperand());
+          if (!A)
+            continue;
+          auto nit = byName.find(Fn->getName().str());
+          if (nit == byName.end())
+            continue;
+          for (int slot : fnSlotsOf(St->getPointerOperand(), DL))
+            if (slot > 0)
+              atObj[A].push_back({slot, nit->second});
+          continue;
+        }
+        if (!St->getValueOperand()->getType()->isPointerTy())
+          continue;
+        const llvm::AllocaInst *A = objectAlloca(St->getValueOperand());
+        if (!A)
+          continue;
+        for (int slot : fnSlotsOf(St->getPointerOperand(), DL))
+          if (slot > 0)
+            publishAt[A].push_back(slot);
+      }
+      auto appendSlot = [&](int base, int ext) {
+        std::vector<std::pair<int, int64_t>> rev;
+        for (int c = ext; c > 0 && (size_t)c < chainParent.size(); c = chainParent[(size_t)c])
+          rev.push_back({chainTy[(size_t)c], chainOff[(size_t)c]});
+        int cur = base;
+        for (int i = (int)rev.size() - 1; i >= 0; --i)
+          cur = slotStep(cur, rev[(size_t)i].first, rev[(size_t)i].second);
+        return cur;
+      };
+      for (const auto &kv : atObj) {
+        auto pit = publishAt.find(kv.first);
+        if (pit == publishAt.end())
+          continue;
+        for (int dest : pit->second)
+          for (const auto &sf : kv.second) {
+            int slot = appendSlot(dest, sf.first);
+            if (slot > 0)
+              fnAt[slot].insert(sf.second);
+          }
+      }
+    }
     next.retSig = retSigOf(next);
     next.fnSig = fnSigOf(next);
     {
@@ -5882,9 +5972,50 @@ class Engine {
     return std::vector<int>(slots.begin(), slots.end());
   }
 
+  // Structs that exist only as the first field of a larger object. The cell is
+  // the longer path. The header type is shared by every such object.
+  void indexHeaders() {
+    if (headerReady)
+      return;
+    headerReady = true;
+    std::unordered_map<int, int> headerCount;
+    auto scan = [&](llvm::Module &M) {
+      const llvm::DataLayout &DL = M.getDataLayout();
+      for (llvm::StructType *ST : M.getIdentifiedStructTypes()) {
+        if (!ST || ST->isOpaque() || ST->getNumElements() == 0)
+          continue;
+        const llvm::StructLayout *SL = DL.getStructLayout(ST);
+        if (SL->getElementOffset(0) != 0)
+          continue;
+        auto *E = llvm::dyn_cast<llvm::StructType>(ST->getElementType(0));
+        if (!E || E->isOpaque() || E->getNumElements() == 0)
+          continue;
+        if (DL.getTypeAllocSize(ST) <= DL.getTypeAllocSize(E))
+          continue;
+        bool pointers = true;
+        for (llvm::Type *F : E->elements())
+          if (!F->isPointerTy())
+            pointers = false;
+        if (!pointers || DL.getTypeAllocSize(E) > 32)
+          continue;
+        int id = internType(E);
+        if (id > 0)
+          headerCount[id] += 1;
+      }
+    };
+    scan(down);
+    scan(up);
+    for (const auto &kv : headerCount)
+      if (kv.second >= 2)
+        headerTy.insert(kv.first);
+  }
+
   // A call loads one cell of one object. The function may have been stored in
   // that cell, or in the same field of the table that object was copied from.
   // The field sequence from the outside of the loaded object is the same key.
+  // A suffix that starts at an embedded header names every object that uses
+  // that header. The load's longer path is the object, so that suffix is not
+  // a second cell.
   std::vector<int> slotSuffixes(int key) {
     std::vector<std::pair<int, int64_t>> steps;
     for (int c = key; c > 0 && (size_t)c < chainParent.size(); c = chainParent[(size_t)c])
@@ -5911,7 +6042,26 @@ class Engine {
     }
     if (suffixes.empty())
       add(key);
-    return suffixes;
+    if (suffixes.size() <= 1)
+      return suffixes;
+    indexHeaders();
+    std::vector<int> kept;
+    kept.reserve(suffixes.size());
+    for (size_t i = 0; i < suffixes.size(); ++i) {
+      int id = suffixes[i];
+      if (i > 0) {
+        int top = id;
+        while (top > 0 && (size_t)top < chainParent.size() && chainParent[(size_t)top] > 0)
+          top = chainParent[(size_t)top];
+        int ty = top > 0 && (size_t)top < chainTy.size() ? chainTy[(size_t)top] : 0;
+        if (ty > 0 && headerTy.count(ty))
+          continue;
+      }
+      kept.push_back(id);
+    }
+    if (kept.empty())
+      kept.push_back(suffixes.front());
+    return kept;
   }
 
   template <typename Fn>
@@ -8299,6 +8449,7 @@ class Engine {
           finish();
           return;
         }
+        bool placed = false;
         for (size_t i = 1; i < r.seq.size(); ++i) {
           llvm::Function *here = r.seq[i];
           llvm::Function *hb = bodyOf(here);
@@ -8462,7 +8613,66 @@ class Engine {
                 out.push_back(p);
             }
           }
+          placed = true;
           break;
+        }
+        // A string helper is not on the sequence. Follow it only through
+        // string functions back to a formal of this sequence. A local object
+        // has no formal, so it is not attached to an export field.
+        if (!placed && stringTypeName(fn->getName())) {
+          auto onSeq = [&](llvm::Function *F) {
+            if (!F)
+              return false;
+            llvm::Function *B = bodyOf(F);
+            for (llvm::Function *s : r.seq)
+              if (s == F || s == B || bodyOf(s) == F || (B && bodyOf(s) == B))
+                return true;
+            return false;
+          };
+          struct Acc {
+            llvm::Function *caller = nullptr;
+            int formal = -1;
+            int path = 0;
+            bool operator<(const Acc &o) const {
+              if (caller != o.caller)
+                return caller < o.caller;
+              if (formal != o.formal)
+                return formal < o.formal;
+              return path < o.path;
+            }
+          };
+          std::set<Acc> acc;
+          auto pull = [&](llvm::Function *callee) {
+            if (!callee)
+              return;
+            auto dit = directAt.find(callee);
+            if (dit == directAt.end())
+              return;
+            for (const SiteRef &sr : dit->second) {
+              if (!sr.site || !sr.caller || formal >= (int)sr.site->args.size())
+                continue;
+              if (!onSeq(sr.caller) && !stringTypeName(sr.caller->getName()))
+                continue;
+              const ArgAt &a = sr.site->args[(size_t)formal];
+              for (const LiftFrom &L : a.lift) {
+                if (L.kind != 0 || L.formal < 0)
+                  continue;
+                acc.insert(Acc{sr.caller, L.formal, L.path});
+              }
+            }
+          };
+          pull(fn);
+          llvm::Function *b = bodyOf(fn);
+          if (b && b != fn)
+            pull(b);
+          for (const Acc &a : acc) {
+            int composed = concat(a.formal, a.path, path, true);
+            std::vector<Lay> up;
+            walkLay(a.caller, a.formal, composed, up, stack);
+            for (const Lay &p : up)
+              if (stringTypeName(p.layout))
+                out.push_back(p);
+          }
         }
         finish();
       };
@@ -8481,8 +8691,9 @@ class Engine {
           h.layout = L.layout;
           hits.push_back(std::move(h));
         }
-        if (hits.empty())
-          return hitsOf(fn, formal, path);
+        // A read whose actual is not on this sequence is a different object.
+        // Searching every caller attaches a value created inside the call to
+        // whichever export field has the same LLVM struct type.
         return hits;
       };
       for (size_t i = 0; i + 1 < r.seq.size() && !bad; ++i) {
@@ -9185,8 +9396,11 @@ class Engine {
             }
           }
         }
+        // The cell an indirect call on this sequence loads holds the next
+        // function. A function stored in some other slot of the same object
+        // is not that call.
         for (const auto &ck : chosen)
-          if (!fnWant.count(ck.first) && !fnBad.count(ck.first))
+          if (ck.second.called && !fnWant.count(ck.first) && !fnBad.count(ck.first))
             fnWant.emplace(ck.first, ck.second.name);
         for (llvm::Function *I : installers) {
           auto sit = sum.find(I);
@@ -9242,6 +9456,28 @@ class Engine {
             continue;
           for (llvm::Function *C : cit->second)
             addFn(C);
+        }
+        // string_view::data is called by the copy at the export, not by the
+        // export itself. Follow that string chain a few calls.
+        std::vector<llvm::Function *> strLayer;
+        if (r.who)
+          strLayer.push_back(bodyOf(r.who));
+        for (int depth = 0; depth < 4; ++depth) {
+          std::vector<llvm::Function *> next;
+          for (llvm::Function *F : strLayer) {
+            auto cit = callees.find(F);
+            if (cit == callees.end())
+              continue;
+            for (llvm::Function *C : cit->second) {
+              if (!C || !stringTypeName(C->getName()))
+                continue;
+              size_t before = extra.size();
+              addFn(C);
+              if (extra.size() != before)
+                next.push_back(bodyOf(C));
+            }
+          }
+          strLayer.swap(next);
         }
         for (llvm::Function *F : extra) {
           auto sit = sum.find(F);
@@ -9925,6 +10161,18 @@ class Engine {
           }
           if (fnClash || fnWrites == 0 || fnWrites != allWrites)
             name.clear();
+          if (!name.empty()) {
+            bool successor = false;
+            for (size_t si = 1; si < r.seq.size(); ++si) {
+              llvm::Function *S = r.seq[si];
+              if (!S)
+                continue;
+              if (showFn(S) == name || (S->hasName() && S->getName() == name))
+                successor = true;
+            }
+            if (!successor)
+              name.clear();
+          }
           const llvm::APInt *cnst = nullptr;
           bool cClash = false;
           std::unordered_set<llvm::Function *> constWriters;
@@ -10006,17 +10254,15 @@ class Engine {
               if (typed)
                 continue;
             }
+            if (rd->len <= 0)
+              continue;
+            // The load read this field. Its width is the pointer, not a
+            // one-byte slot of an unnamed pointee.
             std::string suffix;
-            int64_t len = 1;
-            if (!rd->pointee.empty()) {
+            if (!rd->pointee.empty())
               suffix = "." + rd->pointee + "^0";
-              len = rd->ptrField ? 1 : std::max<int64_t>(rd->objLen, 1);
-            } else if (rd->ptrField) {
-              suffix = ".struct.slot^0.struct.slot^0";
-            } else {
-              suffix = ".struct.slot^0";
-            }
             std::string full = layout + suffix;
+            int64_t len = rd->len;
             if (!seenObj.insert(std::to_string(h.arg) + " " + full).second)
               continue;
             PtrNeed need;
@@ -10041,6 +10287,7 @@ class Engine {
           struct Info {
             std::string ty;
             int64_t n = 1;
+            int64_t ptrBytes = 0;
             int ptrs = 0;
             bool ptrField = false;
           } info;
@@ -10103,8 +10350,10 @@ class Engine {
               if (!S->isOpaque()) {
                 info.n = (int64_t)DL.getTypeAllocSize(S);
                 for (unsigned ei = 0; ei < S->getNumElements(); ++ei)
-                  if (S->getElementType(ei)->isPointerTy())
+                  if (S->getElementType(ei)->isPointerTy()) {
                     info.ptrField = true;
+                    info.ptrBytes = (int64_t)DL.getPointerSize(0);
+                  }
               }
               break;
             }
@@ -10162,20 +10411,13 @@ class Engine {
               if (!pointer)
                 continue;
               auto info = leafOf(calleeFn, ai);
+              if (info.ty.empty())
+                continue;
               std::string suffix;
               for (int s = 0; s < info.ptrs; ++s)
                 suffix += ".struct.slot^0";
-              int64_t len = 1;
-              if (!info.ty.empty()) {
-                suffix += "." + info.ty + "^0";
-                len = info.ptrField ? 1 : std::max<int64_t>(info.n, 1);
-              } else {
-                suffix += ".struct.slot^0";
-                if (info.ptrs > 0)
-                  len = 1;
-                else
-                  len = std::max<int64_t>(info.n, 1);
-              }
+              suffix += "." + info.ty + "^0";
+              int64_t len = info.ptrField && info.ptrBytes > 0 ? info.ptrBytes : std::max<int64_t>(info.n, 1);
               for (const LiftFrom &lf : site->args[ai].lift) {
                 if (lf.kind != 0 || lf.formal < 0 || lf.path <= 0)
                   continue;
@@ -11301,20 +11543,111 @@ class Engine {
               break;
             }
             if (AI) {
-              std::vector<const llvm::Value *> stored;
+              struct Written {
+                llvm::Function *at = nullptr;
+                const llvm::CallBase *cb = nullptr;
+                const llvm::Value *val = nullptr;
+              };
+              std::vector<Written> written;
               for (const llvm::User *U : AI->users())
                 if (const auto *S = llvm::dyn_cast<llvm::StoreInst>(U))
                   if (S->getPointerOperand() == AI)
-                    stored.push_back(S->getValueOperand());
+                    written.push_back(Written{F, nullptr, S->getValueOperand()});
+              // A callee that stores through this alloca writes the value.
+              // The store is in the callee, so the local alloca has no StoreInst.
+              if (written.empty()) {
+                auto rootOf = [&](const llvm::Value *V) -> const llvm::AllocaInst * {
+                  const llvm::Value *q = V;
+                  for (int g = 0; q && g < 6; ++g) {
+                    if (const auto *AL = llvm::dyn_cast<llvm::AllocaInst>(q))
+                      return AL;
+                    if (const auto *C = llvm::dyn_cast<llvm::CastInst>(q)) {
+                      q = C->getOperand(0);
+                      continue;
+                    }
+                    if (const auto *G = llvm::dyn_cast<llvm::GEPOperator>(q)) {
+                      llvm::APInt z(DL.getIndexSizeInBits(G->getPointerAddressSpace()), 0);
+                      if (!G->accumulateConstantOffset(DL, z) || !z.isZero())
+                        break;
+                      q = G->getPointerOperand();
+                      continue;
+                    }
+                    break;
+                  }
+                  return nullptr;
+                };
+                auto fromArg = [&](const llvm::Value *P, const llvm::Argument *A, auto &self,
+                                   std::set<const llvm::Value *> &seenP) -> bool {
+                  if (!P || !seenP.insert(P).second)
+                    return false;
+                  if (P == A)
+                    return true;
+                  if (const auto *C = llvm::dyn_cast<llvm::CastInst>(P))
+                    return self(C->getOperand(0), A, self, seenP);
+                  if (const auto *G = llvm::dyn_cast<llvm::GEPOperator>(P)) {
+                    llvm::APInt z(DL.getIndexSizeInBits(G->getPointerAddressSpace()), 0);
+                    if (G->accumulateConstantOffset(DL, z) && z.isZero())
+                      return self(G->getPointerOperand(), A, self, seenP);
+                    return false;
+                  }
+                  const auto *Ld = llvm::dyn_cast<llvm::LoadInst>(P);
+                  if (!Ld)
+                    return false;
+                  const llvm::AllocaInst *slot = rootOf(Ld->getPointerOperand());
+                  if (!slot)
+                    return false;
+                  for (const llvm::User *U : slot->users()) {
+                    const auto *S = llvm::dyn_cast<llvm::StoreInst>(U);
+                    if (!S || S->getPointerOperand() != slot)
+                      continue;
+                    if (self(S->getValueOperand(), A, self, seenP))
+                      return true;
+                  }
+                  return false;
+                };
+                for (const llvm::User *U : AI->users()) {
+                  const auto *CB = llvm::dyn_cast<llvm::CallBase>(U);
+                  if (!CB || CB->isInlineAsm())
+                    continue;
+                  llvm::Function *decl = CB->getCalledFunction();
+                  llvm::Function *cal = decl ? bodyOf(decl) : nullptr;
+                  if (!cal || cal->isDeclaration())
+                    continue;
+                  unsigned nIns = 0;
+                  for (const llvm::BasicBlock &BB : *cal)
+                    nIns += BB.size();
+                  if (nIns == 0 || nIns > 8000)
+                    continue;
+                  int idx = -1;
+                  for (unsigned i = 0; i < CB->arg_size(); ++i)
+                    if (rootOf(CB->getArgOperand(i)) == AI)
+                      idx = (int)i;
+                  if (idx < 0 || (unsigned)idx >= cal->arg_size())
+                    continue;
+                  const llvm::Argument *form = cal->getArg((unsigned)idx);
+                  for (llvm::Instruction &J : llvm::instructions(*cal)) {
+                    const auto *S = llvm::dyn_cast<llvm::StoreInst>(&J);
+                    if (!S || !S->getValueOperand()->getType()->isIntegerTy())
+                      continue;
+                    std::set<const llvm::Value *> seenP;
+                    if (!fromArg(S->getPointerOperand(), form, fromArg, seenP))
+                      continue;
+                    written.push_back(Written{cal, CB, S->getValueOperand()});
+                  }
+                }
+              }
               std::vector<St> agreed;
               int agreedArg = -1;
               int n = 0;
               bool any = false;
-              for (const llvm::Value *sv : stored) {
+              for (const Written &w : written) {
                 std::vector<St> sub;
                 int a2 = -1;
                 auto branch = seen;
-                if (!go(F, sv, up, sub, a2, depth + 1, branch))
+                std::vector<Via> next = up;
+                if (w.cb)
+                  next.push_back(Via{w.cb, F});
+                if (!go(w.at, w.val, next, sub, a2, depth + 1, branch))
                   continue;
                 any = true;
                 if (n == 0) {
