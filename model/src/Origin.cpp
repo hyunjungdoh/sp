@@ -423,6 +423,11 @@ void Model::inputs(const std::vector<Function *> &seq, raw_ostream &out) {
   };
 
   std::function<Ov(Value *, const Function *, const std::vector<Ov> &, const CellMem &)> eval;
+  // A phi or select is the only value that can take an operand defined later,
+  // so every cycle in the value graph passes through one. Evaluating such a
+  // value while it is already being evaluated means a loop carries it back to
+  // itself; that value has no single reaching base and reads as unresolved.
+  std::unordered_set<const Value *> evalActive;
   std::function<Result(Function *, const std::vector<Ov> &, Instruction *, const CellMem &)> analyze;
   std::function<void(const Ov &, const CellMem &)> explainOv;
   std::function<void(Value *, const Function *, const std::vector<Ov> &, const CellMem &)> explainValue;
@@ -436,6 +441,18 @@ void Model::inputs(const std::vector<Function *> &seq, raw_ostream &out) {
     Ov open;
     if (!V)
       return open;
+    bool track = isa<PHINode>(V) || isa<SelectInst>(V);
+    if (track && !evalActive.insert(V).second)
+      return open;
+    struct Pop {
+      std::unordered_set<const Value *> *s;
+      const Value *v;
+      bool on;
+      ~Pop() {
+        if (on)
+          s->erase(v);
+      }
+    } pop{&evalActive, V, track};
     if (auto *C = dyn_cast<CastInst>(V))
       return eval(C->getOperand(0), F, args, mem);
     if (auto *CE = dyn_cast<ConstantExpr>(V)) {
@@ -715,6 +732,13 @@ void Model::inputs(const std::vector<Function *> &seq, raw_ostream &out) {
   std::unordered_map<const Function *, std::vector<Op>> scriptOf;
   std::vector<Place> pendingReads;
   std::unordered_set<const Function *> applyStack;
+  // A callee's effect depends only on the function and the abstract values of
+  // its arguments. The call graph joins and splits, so the same function with
+  // the same arguments is reached along many paths of one traversal; threading
+  // its effect once per distinct pair makes the traversal finite instead of
+  // growing with the number of paths. The set spans one top-level thread and
+  // is cleared when that thread returns, so a later caller state still applies.
+  std::unordered_set<std::string> applyMemo;
 
   std::unordered_map<const Function *, Base> retArgOf;
   std::unordered_set<const Function *> retStack;
@@ -1091,18 +1115,44 @@ void Model::inputs(const std::vector<Function *> &seq, raw_ostream &out) {
     }
     return o;
   };
+  auto ctxKey = [](const Function *F, const std::vector<Ov> &fs) {
+    std::string s;
+    raw_string_ostream os(s);
+    os << (const void *)F;
+    for (const Ov &o : fs) {
+      os << '|' << (int)o.k << ',' << (int)o.p.base << ',' << o.p.arg << ','
+         << (const void *)o.p.obj << ',' << (const void *)o.p.slot << ','
+         << (const void *)o.p.gv << ',' << (const void *)o.call;
+      for (const Step &st : o.p.suf)
+        os << ';' << st.type << ':' << st.off << ':' << (int)st.deref;
+    }
+    os.flush();
+    return s;
+  };
   applyEff = [&](Function *F, const std::vector<Ov> &formals, CellMem &cur) {
-    if (!F || F->isDeclaration() || !applyStack.insert(F).second)
+    if (!F || F->isDeclaration())
+      return;
+    bool root = applyStack.empty();
+    auto done = [&] {
+      applyStack.erase(F);
+      if (root)
+        applyMemo.clear();
+    };
+    if (!applyStack.insert(F).second)
       return;
     bool track = false;
     for (const Ov &o : formals)
       if (o.k == Ov::Addr && (o.p.base == Place::Entry || o.p.base == Place::Obj))
         track = true;
     if (!track) {
-      applyStack.erase(F);
+      done();
       return;
     }
-    std::vector<Op> ops = script(F);
+    if (!applyMemo.insert(ctxKey(F, formals)).second) {
+      done();
+      return;
+    }
+    const std::vector<Op> &ops = script(F);
     for (const Op &op : ops) {
       if (op.read) {
         Ov p = placeOf(op.rd, formals, cur);
@@ -1161,7 +1211,7 @@ void Model::inputs(const std::vector<Function *> &seq, raw_ostream &out) {
           applyEff(B, inner, cur);
       }
     }
-    applyStack.erase(F);
+    done();
   };
 
   std::function<void(Function *, const Result &)> explainResult;
