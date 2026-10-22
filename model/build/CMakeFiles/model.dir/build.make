@@ -86,14 +86,94 @@ CMakeFiles/model.dir/src/Model.cpp.s: cmake_force
 	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling CXX source to assembly CMakeFiles/model.dir/src/Model.cpp.s"
 	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/guswjd/sp/model/src/Model.cpp -o CMakeFiles/model.dir/src/Model.cpp.s
 
+CMakeFiles/model.dir/src/Index.cpp.o: CMakeFiles/model.dir/flags.make
+CMakeFiles/model.dir/src/Index.cpp.o: /home/guswjd/sp/model/src/Index.cpp
+CMakeFiles/model.dir/src/Index.cpp.o: CMakeFiles/model.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/guswjd/sp/model/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Building CXX object CMakeFiles/model.dir/src/Index.cpp.o"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/model.dir/src/Index.cpp.o -MF CMakeFiles/model.dir/src/Index.cpp.o.d -o CMakeFiles/model.dir/src/Index.cpp.o -c /home/guswjd/sp/model/src/Index.cpp
+
+CMakeFiles/model.dir/src/Index.cpp.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing CXX source to CMakeFiles/model.dir/src/Index.cpp.i"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/guswjd/sp/model/src/Index.cpp > CMakeFiles/model.dir/src/Index.cpp.i
+
+CMakeFiles/model.dir/src/Index.cpp.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling CXX source to assembly CMakeFiles/model.dir/src/Index.cpp.s"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/guswjd/sp/model/src/Index.cpp -o CMakeFiles/model.dir/src/Index.cpp.s
+
+CMakeFiles/model.dir/src/Locate.cpp.o: CMakeFiles/model.dir/flags.make
+CMakeFiles/model.dir/src/Locate.cpp.o: /home/guswjd/sp/model/src/Locate.cpp
+CMakeFiles/model.dir/src/Locate.cpp.o: CMakeFiles/model.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/guswjd/sp/model/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_3) "Building CXX object CMakeFiles/model.dir/src/Locate.cpp.o"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/model.dir/src/Locate.cpp.o -MF CMakeFiles/model.dir/src/Locate.cpp.o.d -o CMakeFiles/model.dir/src/Locate.cpp.o -c /home/guswjd/sp/model/src/Locate.cpp
+
+CMakeFiles/model.dir/src/Locate.cpp.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing CXX source to CMakeFiles/model.dir/src/Locate.cpp.i"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/guswjd/sp/model/src/Locate.cpp > CMakeFiles/model.dir/src/Locate.cpp.i
+
+CMakeFiles/model.dir/src/Locate.cpp.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling CXX source to assembly CMakeFiles/model.dir/src/Locate.cpp.s"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/guswjd/sp/model/src/Locate.cpp -o CMakeFiles/model.dir/src/Locate.cpp.s
+
+CMakeFiles/model.dir/src/Solve.cpp.o: CMakeFiles/model.dir/flags.make
+CMakeFiles/model.dir/src/Solve.cpp.o: /home/guswjd/sp/model/src/Solve.cpp
+CMakeFiles/model.dir/src/Solve.cpp.o: CMakeFiles/model.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/guswjd/sp/model/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_4) "Building CXX object CMakeFiles/model.dir/src/Solve.cpp.o"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/model.dir/src/Solve.cpp.o -MF CMakeFiles/model.dir/src/Solve.cpp.o.d -o CMakeFiles/model.dir/src/Solve.cpp.o -c /home/guswjd/sp/model/src/Solve.cpp
+
+CMakeFiles/model.dir/src/Solve.cpp.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing CXX source to CMakeFiles/model.dir/src/Solve.cpp.i"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/guswjd/sp/model/src/Solve.cpp > CMakeFiles/model.dir/src/Solve.cpp.i
+
+CMakeFiles/model.dir/src/Solve.cpp.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling CXX source to assembly CMakeFiles/model.dir/src/Solve.cpp.s"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/guswjd/sp/model/src/Solve.cpp -o CMakeFiles/model.dir/src/Solve.cpp.s
+
+CMakeFiles/model.dir/src/Emit.cpp.o: CMakeFiles/model.dir/flags.make
+CMakeFiles/model.dir/src/Emit.cpp.o: /home/guswjd/sp/model/src/Emit.cpp
+CMakeFiles/model.dir/src/Emit.cpp.o: CMakeFiles/model.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/guswjd/sp/model/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_5) "Building CXX object CMakeFiles/model.dir/src/Emit.cpp.o"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/model.dir/src/Emit.cpp.o -MF CMakeFiles/model.dir/src/Emit.cpp.o.d -o CMakeFiles/model.dir/src/Emit.cpp.o -c /home/guswjd/sp/model/src/Emit.cpp
+
+CMakeFiles/model.dir/src/Emit.cpp.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing CXX source to CMakeFiles/model.dir/src/Emit.cpp.i"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/guswjd/sp/model/src/Emit.cpp > CMakeFiles/model.dir/src/Emit.cpp.i
+
+CMakeFiles/model.dir/src/Emit.cpp.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling CXX source to assembly CMakeFiles/model.dir/src/Emit.cpp.s"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/guswjd/sp/model/src/Emit.cpp -o CMakeFiles/model.dir/src/Emit.cpp.s
+
+CMakeFiles/model.dir/src/Origin.cpp.o: CMakeFiles/model.dir/flags.make
+CMakeFiles/model.dir/src/Origin.cpp.o: /home/guswjd/sp/model/src/Origin.cpp
+CMakeFiles/model.dir/src/Origin.cpp.o: CMakeFiles/model.dir/compiler_depend.ts
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --progress-dir=/home/guswjd/sp/model/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_6) "Building CXX object CMakeFiles/model.dir/src/Origin.cpp.o"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -MD -MT CMakeFiles/model.dir/src/Origin.cpp.o -MF CMakeFiles/model.dir/src/Origin.cpp.o.d -o CMakeFiles/model.dir/src/Origin.cpp.o -c /home/guswjd/sp/model/src/Origin.cpp
+
+CMakeFiles/model.dir/src/Origin.cpp.i: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Preprocessing CXX source to CMakeFiles/model.dir/src/Origin.cpp.i"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -E /home/guswjd/sp/model/src/Origin.cpp > CMakeFiles/model.dir/src/Origin.cpp.i
+
+CMakeFiles/model.dir/src/Origin.cpp.s: cmake_force
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green "Compiling CXX source to assembly CMakeFiles/model.dir/src/Origin.cpp.s"
+	/usr/bin/c++ $(CXX_DEFINES) $(CXX_INCLUDES) $(CXX_FLAGS) -S /home/guswjd/sp/model/src/Origin.cpp -o CMakeFiles/model.dir/src/Origin.cpp.s
+
 # Object files for target model
 model_OBJECTS = \
-"CMakeFiles/model.dir/src/Model.cpp.o"
+"CMakeFiles/model.dir/src/Model.cpp.o" \
+"CMakeFiles/model.dir/src/Index.cpp.o" \
+"CMakeFiles/model.dir/src/Locate.cpp.o" \
+"CMakeFiles/model.dir/src/Solve.cpp.o" \
+"CMakeFiles/model.dir/src/Emit.cpp.o" \
+"CMakeFiles/model.dir/src/Origin.cpp.o"
 
 # External object files for target model
 model_EXTERNAL_OBJECTS =
 
 model: CMakeFiles/model.dir/src/Model.cpp.o
+model: CMakeFiles/model.dir/src/Index.cpp.o
+model: CMakeFiles/model.dir/src/Locate.cpp.o
+model: CMakeFiles/model.dir/src/Solve.cpp.o
+model: CMakeFiles/model.dir/src/Emit.cpp.o
+model: CMakeFiles/model.dir/src/Origin.cpp.o
 model: CMakeFiles/model.dir/build.make
 model: /home/guswjd/project/tools/llvm-18/lib/libLLVMSupport.a
 model: /home/guswjd/project/tools/llvm-18/lib/libLLVMCore.a
@@ -128,7 +208,7 @@ model: /usr/lib/x86_64-linux-gnu/libz.so
 model: /usr/lib/x86_64-linux-gnu/libzstd.so
 model: /usr/lib/x86_64-linux-gnu/libtinfo.so
 model: CMakeFiles/model.dir/link.txt
-	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/home/guswjd/sp/model/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_2) "Linking CXX executable model"
+	@$(CMAKE_COMMAND) -E cmake_echo_color "--switch=$(COLOR)" --green --bold --progress-dir=/home/guswjd/sp/model/build/CMakeFiles --progress-num=$(CMAKE_PROGRESS_7) "Linking CXX executable model"
 	$(CMAKE_COMMAND) -E cmake_link_script CMakeFiles/model.dir/link.txt --verbose=$(VERBOSE)
 
 # Rule to build all files generated by this target.
