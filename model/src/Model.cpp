@@ -1,5 +1,7 @@
 #include "Model.h"
 
+#include "llvm/IR/IntrinsicInst.h"
+
 static bool loadSink(const fs::path &yaml, std::string &file, unsigned &line) {
   std::ifstream in(yaml);
   std::string s;
@@ -161,6 +163,59 @@ int main(int argc, char **argv) {
     IB.CreateStore(IB.CreateCall(Malloc, {n}), D->getArg((unsigned)slot));
     IB.CreateRet(Constant::getNullValue(D->getReturnType()));
   }
+  // KLEE's IntrinsicCleaner lowers memcpy/memmove/memset with LLVM's
+  // IntrinsicLowering, which emits the libc call without carrying over the
+  // intrinsic's debug location. The verifier then rejects that call inside any
+  // function that holds a subprogram. Perform the same lowering here while
+  // preserving each intrinsic's location, so KLEE's pass finds nothing to
+  // lower and the module keeps its source lines for sink reporting. A location
+  // the intrinsic never had becomes a line-zero site in the enclosing
+  // subprogram, which marks "no source line" rather than a wrong one.
+  {
+    PointerType *p0 = PointerType::get(ctx, 0);
+    Type *i64 = Type::getInt64Ty(ctx);
+    Type *i32 = Type::getInt32Ty(ctx);
+    FunctionCallee cMemcpy = harness.getOrInsertFunction(
+        "memcpy", FunctionType::get(p0, {p0, p0, i64}, false));
+    FunctionCallee cMemmove = harness.getOrInsertFunction(
+        "memmove", FunctionType::get(p0, {p0, p0, i64}, false));
+    FunctionCallee cMemset = harness.getOrInsertFunction(
+        "memset", FunctionType::get(p0, {p0, i32, i64}, false));
+    for (Function &F : harness) {
+      if (F.isDeclaration())
+        continue;
+      DISubprogram *SP = F.getSubprogram();
+      std::vector<MemIntrinsic *> mems;
+      for (Instruction &I : instructions(F))
+        if (auto *MI = dyn_cast<MemIntrinsic>(&I))
+          mems.push_back(MI);
+      for (MemIntrinsic *MI : mems) {
+        IRBuilder<> B(MI);
+        DebugLoc dl = MI->getDebugLoc();
+        if (!dl && SP)
+          dl = DILocation::get(ctx, 0, 0, SP);
+        B.SetCurrentDebugLocation(dl);
+        Value *dst = MI->getRawDest();
+        Value *len = MI->getLength();
+        if (len->getType() != i64)
+          len = B.CreateZExtOrTrunc(len, i64);
+        if (auto *MS = dyn_cast<MemSetInst>(MI)) {
+          B.CreateCall(cMemset, {dst, B.CreateZExt(MS->getValue(), i32), len});
+        } else {
+          Value *src = cast<MemTransferInst>(MI)->getRawSource();
+          B.CreateCall(isa<MemMoveInst>(MI) ? cMemmove : cMemcpy, {dst, src, len});
+        }
+        MI->eraseFromParent();
+      }
+    }
+  }
+  // Block only structural breakage. Debug-metadata defects that linking left
+  // in the library bitcode (a subprogram shared by two merged definitions) are
+  // reported through the separate flag and tolerated, matching how KLEE loads
+  // the module.
+  bool brokenDI = false;
+  if (verifyModule(harness, &errs(), &brokenDI))
+    return 1;
   std::error_code bec;
   raw_fd_ostream bc((outDir / "run.bc").string(), bec);
   if (bec) {

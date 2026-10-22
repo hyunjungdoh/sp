@@ -1,5 +1,9 @@
 #include "Model.h"
 
+#include "llvm/BinaryFormat/Dwarf.h"
+#include "llvm/IR/DebugInfo.h"
+#include "llvm/IR/DebugInfoMetadata.h"
+
 Function *Model::exportFn() const { return entry; }
 
 StructType *Model::structNamed(StringRef n) const {
@@ -70,6 +74,9 @@ void Model::emit(Module &H) const {
       std::map<int64_t, Ord> ordAt;
       // end-pointer offset -> offset of the pointer that begins the byte region
       std::map<int64_t, int64_t> boundAt;
+      // The struct type whose first field sits at this object's base, used to
+      // find the function-pointer members that must hold a valid target.
+      std::string type;
       uint64_t size = 8;
     };
     std::map<int, Piece> args;
@@ -101,6 +108,8 @@ void Model::emit(Module &H) const {
         }
         int64_t off = s.suf[i].off < 0 ? 0 : s.suf[i].off;
         acc += off;
+        if (p->type.empty() && !s.suf[i].type.empty())
+          p->type = s.suf[i].type;
         walked.push_back(s.suf[i]);
         auto rb = readBytes.find({s.arg, walked});
         bool haveLen = rb != readBytes.end() && rb->second != 0;
@@ -493,6 +502,74 @@ void Model::emit(Module &H) const {
       std::map<int64_t, Built> child;
     };
     int nameN = 0;
+    // Debug info records each struct member's real type, which survives LLVM's
+    // opaque pointers. A member whose type is a pointer to a subroutine is a
+    // function pointer: control-plane scaffolding set by initialization, not a
+    // value read from attacker input. The harness fills those with a benign
+    // type-correct stub so an uninitialized handler does not abort execution
+    // before the sink, and never leaves one symbolic or null.
+    std::map<std::string, std::set<int64_t>> fnPtrOff;
+    {
+      std::function<DIType *(DIType *)> strip = [&](DIType *T) -> DIType * {
+        while (auto *D = dyn_cast_or_null<DIDerivedType>(T)) {
+          unsigned tag = D->getTag();
+          if (tag == dwarf::DW_TAG_typedef || tag == dwarf::DW_TAG_const_type ||
+              tag == dwarf::DW_TAG_volatile_type || tag == dwarf::DW_TAG_atomic_type ||
+              tag == dwarf::DW_TAG_restrict_type)
+            T = D->getBaseType();
+          else
+            break;
+        }
+        return T;
+      };
+      auto isFnPtr = [&](DIType *T) -> bool {
+        T = strip(T);
+        auto *D = dyn_cast_or_null<DIDerivedType>(T);
+        if (!D || D->getTag() != dwarf::DW_TAG_pointer_type)
+          return false;
+        return isa_and_nonnull<DISubroutineType>(strip(D->getBaseType()));
+      };
+      DebugInfoFinder finder;
+      finder.processModule(down);
+      finder.processModule(up);
+      for (DIType *T : finder.types()) {
+        auto *CT = dyn_cast<DICompositeType>(T);
+        if (!CT || CT->getName().empty())
+          continue;
+        unsigned tag = CT->getTag();
+        if (tag != dwarf::DW_TAG_structure_type && tag != dwarf::DW_TAG_class_type &&
+            tag != dwarf::DW_TAG_union_type)
+          continue;
+        for (DINode *E : CT->getElements()) {
+          auto *M = dyn_cast_or_null<DIDerivedType>(E);
+          if (!M || M->getTag() != dwarf::DW_TAG_member)
+            continue;
+          if (isFnPtr(M->getBaseType()))
+            fnPtrOff[CT->getName().str()].insert((int64_t)(M->getOffsetInBits() / 8));
+        }
+      }
+    }
+    auto bareName = [](StringRef n) -> std::string {
+      n.consume_front("struct.");
+      n.consume_front("class.");
+      n.consume_front("union.");
+      size_t dot = n.rfind('.');
+      if (dot != StringRef::npos && !n.substr(dot + 1).empty() &&
+          n.substr(dot + 1).find_first_not_of("0123456789") == StringRef::npos)
+        n = n.substr(0, dot);
+      return n.str();
+    };
+    // One benign stub serves every unresolved function pointer. It takes any
+    // signature and returns zero, so a handler call neither crashes nor steers
+    // a branch on uninitialized control state.
+    Function *stub = H.getFunction("__scaffold_stub");
+    if (!stub) {
+      auto *stubTy = FunctionType::get(i64, {}, true);
+      stub = Function::Create(stubTy, GlobalValue::InternalLinkage, "__scaffold_stub", &H);
+      auto *sb = BasicBlock::Create(ctx, "e", stub);
+      IRBuilder<> SB(sb);
+      SB.CreateRet(ConstantInt::get(i64, 0));
+    }
     std::function<Built(const Piece &)> mat = [&](const Piece &p) -> Built {
       uint64_t nbytes = p.size ? p.size : 8;
       auto *arr = ArrayType::get(i8, nbytes);
@@ -500,9 +577,24 @@ void Model::emit(Module &H) const {
       B.CreateMemSet(base, ConstantInt::get(i8, 0), nbytes, MaybeAlign(1));
       Built built;
       built.base = base;
+      std::set<int64_t> fptr;
+      if (!p.type.empty()) {
+        auto it = fnPtrOff.find(bareName(p.type));
+        if (it != fnPtrOff.end())
+          fptr = it->second;
+      }
+      for (int64_t off : fptr) {
+        if (off < 0 || (uint64_t)off + dl.getPointerSize(0) > nbytes)
+          continue;
+        if (p.word.count(off) || p.child.count(off))
+          continue;
+        Value *slot = B.CreateGEP(i8, base, {ConstantInt::get(i64, (uint64_t)off)});
+        B.CreateStore(stub, slot);
+      }
       for (const auto &sm : p.symAt) {
         if (p.child.count(sm.first) || p.word.count(sm.first) || p.text.count(sm.first) ||
-            p.pathPtrAt.count(sm.first) || p.fileAt.count(sm.first) || p.globAt.count(sm.first))
+            p.pathPtrAt.count(sm.first) || p.fileAt.count(sm.first) || p.globAt.count(sm.first) ||
+            fptr.count(sm.first))
           continue;
         if ((uint64_t)sm.first >= nbytes)
           continue;
