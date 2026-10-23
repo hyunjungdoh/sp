@@ -537,11 +537,9 @@
             }
             std::vector<Step> next = towardUse;
             if (G->hasAllConstantIndices()) {
-              APInt off(dl.getIndexSizeInBits(G->getPointerAddressSpace()), 0);
-              if (G->accumulateConstantOffset(dl, off))
-                if (auto *ST = dyn_cast<StructType>(G->getSourceElementType()))
-                  if (ST->hasName())
-                    next.insert(next.begin(), Step{ST->getName().str(), off.getSExtValue(), false});
+              Step st;
+              if (constStep(dl, G, st) && movesAddress(st))
+                next.insert(next.begin(), st);
             } else if (isa<StructType>(G->getSourceElementType())) {
               return;
             }

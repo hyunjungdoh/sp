@@ -98,6 +98,26 @@ struct Step {
 
 using Suffix = std::vector<Step>;
 
+// A constant GEP moves the address by a byte offset, and that offset is the
+// step whatever type the GEP indexes. A named struct source records the
+// field's type alongside it; any other source records none. An untyped GEP
+// of offset zero does not move the address, so it adds no step.
+inline bool constStep(const DataLayout &dl, GEPOperator *G, Step &st) {
+  if (!G->hasAllConstantIndices())
+    return false;
+  APInt off(dl.getIndexSizeInBits(G->getPointerAddressSpace()), 0);
+  if (!G->accumulateConstantOffset(dl, off))
+    return false;
+  st = Step{};
+  st.off = off.getSExtValue();
+  if (auto *ST = dyn_cast<StructType>(G->getSourceElementType()))
+    if (ST->hasName())
+      st.type = ST->getName().str();
+  return true;
+}
+
+inline bool movesAddress(const Step &st) { return !st.type.empty() || st.off != 0; }
+
 inline std::optional<int64_t> asI64(const std::string &s) {
   if (s.empty())
     return std::nullopt;
@@ -396,6 +416,13 @@ class Model {
     GlobalVariable *g = nullptr;
     uint64_t base = 0;
     int64_t field = 0;
+    // The function that stores the table, and the largest object it lays
+    // out through its receiver.
+    Function *by = nullptr;
+    uint64_t extent = 0;
+    // Some construction ends with this table in the field: a caller of the
+    // storing function stores no table into that field afterwards.
+    bool last = true;
   };
   mutable std::map<std::string, std::vector<VTab>> vtOf;
   mutable std::vector<VTab> vtAll;

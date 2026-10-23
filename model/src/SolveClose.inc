@@ -383,12 +383,11 @@
               V = G->getPointerOperand();
               continue;
             }
-            APInt off(dl.getIndexSizeInBits(G->getPointerAddressSpace()), 0);
-            if (!G->accumulateConstantOffset(dl, off))
+            Step st;
+            if (!constStep(dl, G, st))
               return std::nullopt;
-            if (auto *ST = dyn_cast<StructType>(G->getSourceElementType()))
-              if (ST->hasName())
-                pre.insert(pre.begin(), Step{ST->getName().str(), off.getSExtValue(), false});
+            if (movesAddress(st))
+              pre.insert(pre.begin(), st);
             V = G->getPointerOperand();
             continue;
           }
@@ -831,12 +830,11 @@
               V = G->getPointerOperand();
               continue;
             }
-            APInt off(dl.getIndexSizeInBits(G->getPointerAddressSpace()), 0);
-            if (!G->accumulateConstantOffset(dl, off))
+            Step st;
+            if (!constStep(dl, G, st))
               return Suffix{};
-            if (auto *ST = dyn_cast<StructType>(G->getSourceElementType()))
-              if (ST->hasName())
-                s.insert(s.begin(), Step{ST->getName().str(), off.getSExtValue(), false});
+            if (movesAddress(st))
+              s.insert(s.begin(), st);
             V = G->getPointerOperand();
           }
           return s;
@@ -961,12 +959,11 @@
             V = G->getPointerOperand();
             continue;
           }
-          APInt off(dl.getIndexSizeInBits(G->getPointerAddressSpace()), 0);
-          if (!G->accumulateConstantOffset(dl, off))
+          Step st;
+          if (!constStep(dl, G, st))
             return Suffix{};
-          if (auto *ST = dyn_cast<StructType>(G->getSourceElementType()))
-            if (ST->hasName())
-              s.insert(s.begin(), Step{ST->getName().str(), off.getSExtValue(), false});
+          if (movesAddress(st))
+            s.insert(s.begin(), st);
           V = G->getPointerOperand();
         }
         return s;

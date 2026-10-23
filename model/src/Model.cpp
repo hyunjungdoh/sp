@@ -94,6 +94,22 @@ int main(int argc, char **argv) {
     D->replaceAllUsesWith(body);
     D->eraseFromParent();
   }
+  std::vector<GlobalVariable *> gdecls;
+  for (GlobalVariable &G : harness.globals())
+    if (G.isDeclaration())
+      gdecls.push_back(&G);
+  for (GlobalVariable *D : gdecls) {
+    std::string prefix = (D->getName() + ".").str();
+    for (GlobalVariable &G : harness.globals()) {
+      if (G.isDeclaration() || G.getValueType() != D->getValueType())
+        continue;
+      if (G.getName().starts_with(prefix)) {
+        D->replaceAllUsesWith(&G);
+        D->eraseFromParent();
+        break;
+      }
+    }
+  }
   // A call with no body whose pointer argument is the address of a pointer
   // the caller then loads stores an object of its last integer argument.
   std::map<Function *, int> allocSlot;

@@ -97,14 +97,11 @@ bool Model::objectLoc(Model::Mem &m, Value *V, Loc &out) const {
       if (auto *C = dyn_cast<CastInst>(V))
         return go(C->getOperand(0));
       if (auto *G = dyn_cast<GEPOperator>(V)) {
-        if (!G->hasAllConstantIndices() || !go(G->getPointerOperand()))
+        Step st;
+        if (!constStep(dl, G, st) || !go(G->getPointerOperand()))
           return false;
-        APInt off(dl.getIndexSizeInBits(G->getPointerAddressSpace()), 0);
-        if (!G->accumulateConstantOffset(dl, off))
-          return false;
-        if (auto *ST = dyn_cast<StructType>(G->getSourceElementType()))
-          if (ST->hasName())
-            out.suf.push_back(Step{ST->getName().str(), off.getSExtValue()});
+        if (movesAddress(st))
+          out.suf.push_back(st);
         return true;
       }
       if (auto *L = dyn_cast<LoadInst>(V)) {
@@ -275,15 +272,14 @@ bool Model::cellLoc(Model::Mem &m, Value *V, Loc &out) const {
           cross = false;
           return true;
         }
-        APInt off(dl.getIndexSizeInBits(G->getPointerAddressSpace()), 0);
-        if (!G->accumulateConstantOffset(dl, off))
+        Step st;
+        if (!constStep(dl, G, st))
           return false;
-        bool into = cross || out.pointee;
-        if (auto *ST = dyn_cast<StructType>(G->getSourceElementType()))
-          if (ST->hasName()) {
-            out.suf.push_back(Step{ST->getName().str(), off.getSExtValue(), into});
-            out.pointee = false;
-          }
+        st.deref = cross || out.pointee;
+        if (movesAddress(st)) {
+          out.suf.push_back(st);
+          out.pointee = false;
+        }
         cross = false;
         return true;
       }
@@ -340,15 +336,14 @@ bool Model::locOf(Model::Mem &m, Value *V, Loc &out) const {
           return false;
         if (!go(G->getPointerOperand()))
           return false;
-        APInt off(dl.getIndexSizeInBits(G->getPointerAddressSpace()), 0);
-        if (!G->accumulateConstantOffset(dl, off))
+        Step st;
+        if (!constStep(dl, G, st))
           return false;
-        bool into = cross || out.pointee;
-        if (auto *ST = dyn_cast<StructType>(G->getSourceElementType()))
-          if (ST->hasName()) {
-            out.suf.push_back(Step{ST->getName().str(), off.getSExtValue(), into});
-            out.pointee = false;
-          }
+        st.deref = cross || out.pointee;
+        if (movesAddress(st)) {
+          out.suf.push_back(st);
+          out.pointee = false;
+        }
         cross = false;
         return true;
       }
@@ -432,18 +427,15 @@ Model::ArgRef Model::addrIn(Function *F, Value *V) const {
         if (CE->isCast())
           return go(CE->getOperand(0));
       if (auto *G = dyn_cast<GEPOperator>(V)) {
-        if (!G->hasAllConstantIndices())
+        Step st;
+        if (!constStep(dl, G, st))
           return bad;
         ArgRef base = go(G->getPointerOperand());
         if (!base.ok)
           return bad;
-        APInt off(dl.getIndexSizeInBits(G->getPointerAddressSpace()), 0);
-        if (!G->accumulateConstantOffset(dl, off))
-          return bad;
-        base.bytes += off.getSExtValue();
-        if (auto *ST = dyn_cast<StructType>(G->getSourceElementType()))
-          if (ST->hasName())
-            base.suf.push_back(Step{ST->getName().str(), off.getSExtValue(), false});
+        base.bytes += st.off;
+        if (movesAddress(st))
+          base.suf.push_back(st);
         return base;
       }
       if (auto *L = dyn_cast<LoadInst>(V)) {

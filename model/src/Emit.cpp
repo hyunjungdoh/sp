@@ -1,8 +1,6 @@
 #include "Model.h"
 
-#include "llvm/BinaryFormat/Dwarf.h"
-#include "llvm/IR/DebugInfo.h"
-#include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/IR/IntrinsicInst.h"
 
 Function *Model::exportFn() const { return entry; }
 
@@ -74,9 +72,13 @@ void Model::emit(Module &H) const {
       std::map<int64_t, Ord> ordAt;
       // end-pointer offset -> offset of the pointer that begins the byte region
       std::map<int64_t, int64_t> boundAt;
-      // The struct type whose first field sits at this object's base, used to
-      // find the function-pointer members that must hold a valid target.
-      std::string type;
+      // Indirect-call targets that flow into this field. The stored value is
+      // one of these functions, chosen by a symbolic index.
+      std::map<int64_t, std::vector<Function *>> choiceAt;
+      // A pointer to a constant table: the global and the byte offset inside
+      // it. The stored value is one of these addresses, chosen by a symbolic
+      // index.
+      std::map<int64_t, std::vector<std::pair<GlobalVariable *, uint64_t>>> tableAt;
       uint64_t size = 8;
     };
     std::map<int, Piece> args;
@@ -108,8 +110,6 @@ void Model::emit(Module &H) const {
         }
         int64_t off = s.suf[i].off < 0 ? 0 : s.suf[i].off;
         acc += off;
-        if (p->type.empty() && !s.suf[i].type.empty())
-          p->type = s.suf[i].type;
         walked.push_back(s.suf[i]);
         auto rb = readBytes.find({s.arg, walked});
         bool haveLen = rb != readBytes.end() && rb->second != 0;
@@ -313,18 +313,19 @@ void Model::emit(Module &H) const {
         if (!usedAsCount(i, i + 1))
           continue;
         Piece &p = args[(int)i];
-        bool bare = p.child.empty() && p.symAt.empty() && p.text.empty() && p.word.empty() && p.pathPtrAt.empty() &&
-                    p.fileAt.empty() && p.globAt.empty();
-        if (!bare)
-          continue;
         std::unordered_set<const Function *> seenF;
         uint64_t n = pointedExtent(entry, P, seenF, 0);
         if (P->hasAttribute(Attribute::Dereferenceable))
           n = std::max(n, P->getAttribute(Attribute::Dereferenceable).getDereferenceableBytes());
+        n = std::max(n, p.size);
         if (n == 0)
           continue;
-        p.size = std::max(p.size, n);
-        p.symAt[0] = n;
+        p.size = n;
+        if (p.child.empty() && p.word.empty() && p.text.empty() && p.globAt.empty() && p.fileAt.empty())
+          p.symAt[0] = std::max(p.symAt.count(0) ? p.symAt[0] : 0, n);
+        // The count is the length of this object. A larger integer is not a
+        // defined read of the object.
+        tiedCount[(int)i + 1] = p.size;
       }
     }
     Function *exp = declare(entry);
@@ -499,117 +500,846 @@ void Model::emit(Module &H) const {
     }
     struct Built {
       Value *base = nullptr;
+      uint64_t size = 0;
       std::map<int64_t, Built> child;
     };
     int nameN = 0;
-    // Debug info records each struct member's real type, which survives LLVM's
-    // opaque pointers. A member whose type is a pointer to a subroutine is a
-    // function pointer: control-plane scaffolding set by initialization, not a
-    // value read from attacker input. The harness fills those with a benign
-    // type-correct stub so an uninitialized handler does not abort execution
-    // before the sink, and never leaves one symbolic or null.
-    std::map<std::string, std::set<int64_t>> fnPtrOff;
-    {
-      std::function<DIType *(DIType *)> strip = [&](DIType *T) -> DIType * {
-        while (auto *D = dyn_cast_or_null<DIDerivedType>(T)) {
-          unsigned tag = D->getTag();
-          if (tag == dwarf::DW_TAG_typedef || tag == dwarf::DW_TAG_const_type ||
-              tag == dwarf::DW_TAG_volatile_type || tag == dwarf::DW_TAG_atomic_type ||
-              tag == dwarf::DW_TAG_restrict_type)
-            T = D->getBaseType();
-          else
-            break;
+    // A witness for an indirect call is an assignment of named functions to the
+    // export cell the call loads. targetsOf supplies that set when it names
+    // definitions. An empty result abstains: the cell then takes the functions
+    // the solved frontier already named, and if it named none the cell holds no
+    // function. No type is filled with every function of that type. The model
+    // claims nothing about a callee that is not an export cell. Containment is
+    // checked when the call executes: a callee value that can be anything other
+    // than a defined function ends that execution as uncertain.
+    // Each function is summarized once. A binding is the export cell a formal
+    // stands for, extended by the suffix walked inside the function. A step
+    // that already occurs in that suffix is a cycle, so the binding is not
+    // inserted. A pointer cell the code dereferences and that has no object
+    // becomes an object whose size is the constant offset and width of the
+    // accesses. The same bytes read as an integer, two call types, or an empty
+    // intersection are uncertain.
+    struct Acc {
+      bool bad = false;
+      FunctionType *ty = nullptr;
+      bool have = false;
+      bool open = false;
+      std::set<Function *> fns;
+      std::vector<CallBase *> sites;
+    };
+    auto locKey = [](const Loc &L) {
+      std::string k = std::to_string(L.arg);
+      for (const Step &s : L.suf) {
+        k.push_back('|');
+        k += s.type;
+        k.push_back('@');
+        k += std::to_string(s.off);
+        k.push_back(s.deref ? '*' : '.');
+      }
+      return k;
+    };
+    std::map<std::string, Acc> accs;
+    std::map<std::string, Loc> locOfKey;
+    std::map<int, Acc> argAcc;
+    std::set<std::string> dataKeys;
+    std::set<int> argData;
+    struct Form {
+      bool ok = false;
+      int formal = -1;
+      Suffix suf;
+      bool pointee = false;
+    };
+    auto formalOf = [&](Function *F, Value *V) -> Form {
+      std::unordered_set<const Value *> seen;
+      std::function<Form(Value *)> go = [&](Value *V) -> Form {
+        Form bad;
+        if (!V || !seen.insert(V).second)
+          return bad;
+        if (auto *C = dyn_cast<CastInst>(V))
+          return go(C->getOperand(0));
+        if (auto *CE = dyn_cast<ConstantExpr>(V))
+          if (CE->isCast())
+            return go(CE->getOperand(0));
+        if (auto *G = dyn_cast<GEPOperator>(V)) {
+          Step st;
+          if (!constStep(dl, G, st))
+            return bad;
+          Form b = go(G->getPointerOperand());
+          if (!b.ok)
+            return bad;
+          st.deref = b.pointee;
+          if (movesAddress(st)) {
+            b.suf.push_back(st);
+            b.pointee = false;
+          }
+          return b;
         }
+        if (auto *L = dyn_cast<LoadInst>(V)) {
+          if (auto *A = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts())) {
+            Value *st = storedOnce(A);
+            return st ? go(st) : bad;
+          }
+          if (!L->getType()->isPointerTy())
+            return bad;
+          Form b = go(L->getPointerOperand());
+          if (!b.ok)
+            return bad;
+          b.pointee = true;
+          return b;
+        }
+        if (auto *P = dyn_cast<PHINode>(V)) {
+          Value *one = nullptr;
+          for (Value *in : P->incoming_values()) {
+            if (isa<UndefValue>(in) || isa<ConstantPointerNull>(in))
+              continue;
+            if (one && one != in)
+              return bad;
+            one = in;
+          }
+          return one ? go(one) : bad;
+        }
+        if (auto *A = dyn_cast<Argument>(V)) {
+          if (A->getParent() != F)
+            return bad;
+          Form f;
+          f.ok = true;
+          f.formal = (int)A->getArgNo();
+          return f;
+        }
+        return bad;
+      };
+      return go(V);
+    };
+    auto sufKey = [](const Suffix &s) {
+      std::string k;
+      for (const Step &st : s) {
+        k.push_back('|');
+        k += st.type;
+        k.push_back('@');
+        k += std::to_string(st.off);
+        k.push_back(st.deref ? '*' : '.');
+      }
+      return k;
+    };
+    auto repeats = [](const Suffix &s) {
+      for (size_t i = 0; i < s.size(); ++i)
+        for (size_t j = 0; j < i; ++j)
+          if (s[i] == s[j])
+            return true;
+      return false;
+    };
+    struct Bind {
+      int arg = -1;
+      Suffix suf;
+    };
+    auto compose = [&](const Bind &base, const Suffix &extra, bool extraPointee, Bind &out) -> bool {
+      out.arg = base.arg;
+      out.suf = base.suf;
+      out.suf.insert(out.suf.end(), extra.begin(), extra.end());
+      if (extraPointee)
+        out.suf.push_back(Step{"", 0, true});
+      return !repeats(out.suf);
+    };
+    struct Use {
+      int formal = -1;
+      Suffix suf;
+      CallBase *cb = nullptr;
+      FunctionType *ty = nullptr;
+      std::vector<Function *> tg;
+      bool open = false;
+      bool argLevel = false;
+      bool mixed = false;
+    };
+    struct Edge {
+      Function *to = nullptr;
+      int toArg = -1;
+      int formal = -1;
+      Suffix suf;
+      bool pointee = false;
+    };
+    struct Need {
+      int formal = -1;
+      Suffix suf;
+      uint64_t width = 0;
+    };
+    struct Sum {
+      std::vector<Use> uses;
+      std::vector<Edge> edges;
+      std::vector<Need> needs;
+    };
+    auto bodyOf = [&](Function *T) -> Function * {
+      if (!T)
+        return nullptr;
+      if (!T->isDeclaration())
         return T;
+      return define(T->getName());
+    };
+    std::unordered_map<Function *, Sum> sum;
+    std::unordered_set<Function *> summarized;
+    std::deque<Function *> fq;
+    struct Item {
+      Function *F = nullptr;
+      int formal = -1;
+      Bind b;
+    };
+    std::deque<Item> bq;
+    std::unordered_map<Function *, std::vector<std::vector<Bind>>> binds;
+    std::unordered_map<Function *, std::vector<std::unordered_set<std::string>>> seenBind;
+    auto bindKey = [&](const Bind &b) {
+      std::string k = std::to_string(b.arg);
+      k += sufKey(b.suf);
+      return k;
+    };
+    auto remember = [&](Function *F, int formal, const Bind &b) -> bool {
+      if (!F || formal < 0 || (unsigned)formal >= F->arg_size() || b.arg < 0)
+        return false;
+      auto &slot = seenBind[F];
+      if (slot.size() < F->arg_size())
+        slot.resize(F->arg_size());
+      if (!slot[(unsigned)formal].insert(bindKey(b)).second)
+        return false;
+      auto &held = binds[F];
+      if (held.size() < F->arg_size())
+        held.resize(F->arg_size());
+      held[(unsigned)formal].push_back(b);
+      bq.push_back(Item{F, formal, b});
+      return true;
+    };
+    auto build = [&](Function *F) {
+      Sum s;
+      auto noteDeref = [&](Value *ptr, uint64_t width) {
+        if (!ptr || width == 0)
+          return;
+        Form f = formalOf(F, ptr);
+        if (!f.ok)
+          return;
+        bool deref = f.pointee;
+        for (const Step &st : f.suf)
+          if (st.deref)
+            deref = true;
+        if (!deref)
+          return;
+        Need n;
+        n.formal = f.formal;
+        n.suf = f.suf;
+        if (f.pointee)
+          n.suf.push_back(Step{"", 0, true});
+        if (repeats(n.suf))
+          return;
+        n.width = width;
+        s.needs.push_back(std::move(n));
       };
-      auto isFnPtr = [&](DIType *T) -> bool {
-        T = strip(T);
-        auto *D = dyn_cast_or_null<DIDerivedType>(T);
-        if (!D || D->getTag() != dwarf::DW_TAG_pointer_type)
-          return false;
-        return isa_and_nonnull<DISubroutineType>(strip(D->getBaseType()));
-      };
-      DebugInfoFinder finder;
-      finder.processModule(down);
-      finder.processModule(up);
-      for (DIType *T : finder.types()) {
-        auto *CT = dyn_cast<DICompositeType>(T);
-        if (!CT || CT->getName().empty())
+      for (Instruction &I : instructions(*F)) {
+        if (auto *L = dyn_cast<LoadInst>(&I)) {
+          if (L->getType()->isSized())
+            noteDeref(L->getPointerOperand(), dl.getTypeStoreSize(L->getType()).getFixedValue());
+          if (!L->getType()->isPointerTy()) {
+            Form f = formalOf(F, L->getPointerOperand());
+            if (f.ok && !f.pointee)
+              dataKeys.insert(std::to_string(reinterpret_cast<uintptr_t>(F)) + "#" + std::to_string(f.formal) + sufKey(f.suf));
+          }
+        } else if (auto *ST = dyn_cast<StoreInst>(&I)) {
+          if (ST->getValueOperand()->getType()->isSized())
+            noteDeref(ST->getPointerOperand(), dl.getTypeStoreSize(ST->getValueOperand()->getType()).getFixedValue());
+        }
+        auto *CB = dyn_cast<CallBase>(&I);
+        if (!CB)
           continue;
-        unsigned tag = CT->getTag();
-        if (tag != dwarf::DW_TAG_structure_type && tag != dwarf::DW_TAG_class_type &&
-            tag != dwarf::DW_TAG_union_type)
+        Function *direct = CB->getCalledFunction();
+        if (direct && ignorable(direct))
           continue;
-        for (DINode *E : CT->getElements()) {
-          auto *M = dyn_cast_or_null<DIDerivedType>(E);
-          if (!M || M->getTag() != dwarf::DW_TAG_member)
+        if (direct && (direct->getName().starts_with("llvm.memcpy") || direct->getName().starts_with("llvm.memmove") ||
+                       direct->getName().starts_with("llvm.memset"))) {
+          if (CB->arg_size() >= 3)
+            if (auto *N = dyn_cast<ConstantInt>(CB->getArgOperand(2))) {
+              uint64_t len = N->getZExtValue();
+              noteDeref(CB->getArgOperand(0), len);
+              if (!direct->getName().starts_with("llvm.memset") && CB->arg_size() >= 2)
+                noteDeref(CB->getArgOperand(1), len);
+            }
+          continue;
+        }
+        auto addEdge = [&](Function *D) {
+          Function *B = bodyOf(D);
+          if (!B)
+            return;
+          for (unsigned i = 0; i < CB->arg_size() && i < B->arg_size(); ++i) {
+            Form f = formalOf(F, CB->getArgOperand(i));
+            if (!f.ok)
+              continue;
+            Edge e;
+            e.to = B;
+            e.toArg = (int)i;
+            e.formal = f.formal;
+            e.suf = f.suf;
+            e.pointee = f.pointee;
+            s.edges.push_back(std::move(e));
+          }
+          if (!summarized.count(B))
+            fq.push_back(B);
+        };
+        if (!direct) {
+          Value *V = CB->getCalledOperand();
+          std::unordered_set<const Value *> seenV;
+          while (V && seenV.insert(V).second) {
+            if (auto *C = dyn_cast<CastInst>(V)) {
+              V = C->getOperand(0);
+              continue;
+            }
+            if (auto *CE = dyn_cast<ConstantExpr>(V))
+              if (CE->isCast()) {
+                V = CE->getOperand(0);
+                continue;
+              }
+            break;
+          }
+          Use u;
+          u.cb = CB;
+          u.ty = CB->getFunctionType();
+          for (Function *T : targetsOf(CB)) {
+            Function *B = bodyOf(T);
+            if (!B)
+              continue;
+            if (u.ty && B->getFunctionType() != u.ty)
+              continue;
+            u.tg.push_back(B);
+          }
+          std::sort(u.tg.begin(), u.tg.end());
+          u.tg.erase(std::unique(u.tg.begin(), u.tg.end()), u.tg.end());
+          u.open = u.tg.empty();
+          Form slot;
+          bool addressed = false;
+          if (auto *L = dyn_cast<LoadInst>(V)) {
+            slot = formalOf(F, L->getPointerOperand());
+            addressed = true;
+          } else
+            slot = formalOf(F, V);
+          if (!slot.ok) {
+            for (Function *T : u.tg)
+              addEdge(T);
             continue;
-          if (isFnPtr(M->getBaseType()))
-            fnPtrOff[CT->getName().str()].insert((int64_t)(M->getOffsetInBits() / 8));
+          }
+          u.formal = slot.formal;
+          u.suf = slot.suf;
+          if (slot.pointee)
+            u.suf.push_back(Step{"", 0, true});
+          u.argLevel = !addressed && u.suf.empty();
+          s.uses.push_back(std::move(u));
+          for (Function *T : s.uses.back().tg)
+            addEdge(T);
+          continue;
+        }
+        addEdge(direct);
+      }
+      for (Use &u : s.uses) {
+        Suffix addr = u.suf;
+        if (!addr.empty() && addr.back().type.empty() && addr.back().off == 0 && addr.back().deref)
+          addr.pop_back();
+        if (dataKeys.count(std::to_string(reinterpret_cast<uintptr_t>(F)) + "#" + std::to_string(u.formal) + sufKey(addr)))
+          u.mixed = true;
+      }
+      sum[F] = std::move(s);
+      summarized.insert(F);
+    };
+    auto drainFuncs = [&]() {
+      while (!fq.empty()) {
+        Function *F = fq.front();
+        fq.pop_front();
+        if (!F || F->isDeclaration() || summarized.count(F))
+          continue;
+        build(F);
+      }
+    };
+    auto drainBinds = [&]() {
+      while (!bq.empty()) {
+        Item it = std::move(bq.front());
+        bq.pop_front();
+        auto sit = sum.find(it.F);
+        if (sit == sum.end())
+          continue;
+        for (const Edge &e : sit->second.edges) {
+          if (e.formal != it.formal || !e.to)
+            continue;
+          Bind nb;
+          if (!compose(it.b, e.suf, e.pointee, nb))
+            continue;
+          remember(e.to, e.toArg, nb);
+        }
+      }
+    };
+    if (entry && !entry->isDeclaration())
+      fq.push_back(entry);
+    drainFuncs();
+    if (entry && !entry->isDeclaration()) {
+      for (unsigned i = 0; i < entry->arg_size(); ++i) {
+        Bind b;
+        b.arg = (int)i;
+        remember(entry, (int)i, b);
+      }
+    }
+    drainBinds();
+    auto wordFns = [&](const Bind &cell, FunctionType *ty) {
+      std::vector<Function *> v;
+      auto pl = placeIn(cell.arg, cell.suf);
+      if (!pl.first || !pl.first->word.count(pl.second))
+        return v;
+      for (const std::string &name : pl.first->word.at(pl.second)) {
+        Function *B = bodyOf(fnNamed(name));
+        if (!B || (ty && B->getFunctionType() != ty))
+          continue;
+        v.push_back(B);
+      }
+      return v;
+    };
+    bool grew = true;
+    while (grew) {
+      grew = false;
+      for (auto &sk : sum) {
+        Function *caller = sk.first;
+        for (const Use &u : sk.second.uses) {
+          if (!u.open || u.formal < 0)
+            continue;
+          auto bit = binds.find(caller);
+          if (bit == binds.end() || (unsigned)u.formal >= bit->second.size())
+            continue;
+          for (const Bind &b : bit->second[(unsigned)u.formal]) {
+            Bind cell;
+            if (!compose(b, u.suf, false, cell))
+              continue;
+            for (Function *D : wordFns(cell, u.ty)) {
+              if (!summarized.count(D)) {
+                fq.push_back(D);
+                grew = true;
+              }
+              if (!u.cb)
+                continue;
+              for (unsigned i = 0; i < u.cb->arg_size() && i < D->arg_size(); ++i) {
+                Form f = formalOf(caller, u.cb->getArgOperand(i));
+                if (!f.ok)
+                  continue;
+                auto cit = binds.find(caller);
+                if (cit == binds.end() || (unsigned)f.formal >= cit->second.size())
+                  continue;
+                for (const Bind &ab : cit->second[(unsigned)f.formal]) {
+                  Bind nb;
+                  if (compose(ab, f.suf, f.pointee, nb) && remember(D, (int)i, nb))
+                    grew = true;
+                }
+              }
+            }
+          }
+        }
+      }
+      drainFuncs();
+      drainBinds();
+    }
+    auto note = [&](Acc &a, const Use &u) {
+      if (u.cb)
+        a.sites.push_back(u.cb);
+      if (u.mixed)
+        a.bad = true;
+      if (a.bad)
+        return;
+      if (!u.ty || (a.ty && a.ty != u.ty)) {
+        a.bad = true;
+        return;
+      }
+      a.ty = u.ty;
+      if (u.open) {
+        a.open = true;
+        return;
+      }
+      std::set<Function *> s(u.tg.begin(), u.tg.end());
+      if (s.empty()) {
+        a.open = true;
+        return;
+      }
+      if (!a.have) {
+        a.have = true;
+        a.fns = std::move(s);
+        return;
+      }
+      std::set<Function *> both;
+      std::set_intersection(a.fns.begin(), a.fns.end(), s.begin(), s.end(), std::inserter(both, both.end()));
+      if (both.empty())
+        a.bad = true;
+      else
+        a.fns.swap(both);
+    };
+    for (auto &sk : sum) {
+      Function *F = sk.first;
+      for (const Use &u : sk.second.uses) {
+        auto bit = binds.find(F);
+        if (bit == binds.end() || u.formal < 0 || (unsigned)u.formal >= bit->second.size() ||
+            bit->second[(unsigned)u.formal].empty())
+          continue;
+        for (const Bind &b : bit->second[(unsigned)u.formal]) {
+          Bind cell;
+          if (!compose(b, u.suf, false, cell))
+            continue;
+          if (u.argLevel && cell.suf.empty()) {
+            note(argAcc[cell.arg], u);
+            continue;
+          }
+          Loc loc;
+          loc.arg = cell.arg;
+          loc.suf = cell.suf;
+          std::string k = locKey(loc);
+          locOfKey[k] = loc;
+          note(accs[k], u);
         }
       }
     }
-    auto bareName = [](StringRef n) -> std::string {
-      n.consume_front("struct.");
-      n.consume_front("class.");
-      n.consume_front("union.");
-      size_t dot = n.rfind('.');
-      if (dot != StringRef::npos && !n.substr(dot + 1).empty() &&
-          n.substr(dot + 1).find_first_not_of("0123456789") == StringRef::npos)
-        n = n.substr(0, dot);
-      return n.str();
+    auto ensureObj = [&](int arg, const Suffix &suf, uint64_t width) {
+      if (arg < 0 || width == 0)
+        return;
+      if (!args.count(arg))
+        args[arg] = Piece{};
+      Piece *p = &args[arg];
+      int64_t acc = 0;
+      bool open = false;
+      for (size_t i = 0; i < suf.size(); ++i) {
+        bool into = suf[i].deref || open;
+        if (into) {
+          if (!p->child.count(acc)) {
+            Piece ch;
+            ch.size = std::max<uint64_t>(width, 8);
+            p->child.emplace(acc, std::move(ch));
+          }
+          p->symAt.erase(acc);
+          p->size = std::max(p->size, (uint64_t)(acc < 0 ? 0 : acc) + dl.getPointerSize(0));
+          p = &p->child[acc];
+          acc = 0;
+        }
+        acc += suf[i].off < 0 ? 0 : suf[i].off;
+        open = fieldIsPointer(suf[i].type, suf[i].off) && i + 1 < suf.size();
+      }
+      p->size = std::max(p->size, (uint64_t)(acc < 0 ? 0 : acc) + width);
     };
-    // One benign stub serves every unresolved function pointer. It takes any
-    // signature and returns zero, so a handler call neither crashes nor steers
-    // a branch on uninitialized control state.
-    Function *stub = H.getFunction("__scaffold_stub");
-    if (!stub) {
-      auto *stubTy = FunctionType::get(i64, {}, true);
-      stub = Function::Create(stubTy, GlobalValue::InternalLinkage, "__scaffold_stub", &H);
-      auto *sb = BasicBlock::Create(ctx, "e", stub);
-      IRBuilder<> SB(sb);
-      SB.CreateRet(ConstantInt::get(i64, 0));
+    for (auto &sk : sum) {
+      Function *F = sk.first;
+      auto bit = binds.find(F);
+      if (bit == binds.end())
+        continue;
+      for (const Need &n : sk.second.needs) {
+        if (n.formal < 0 || (unsigned)n.formal >= bit->second.size())
+          continue;
+        for (const Bind &b : bit->second[(unsigned)n.formal]) {
+          Bind cell;
+          if (!compose(b, n.suf, false, cell))
+            continue;
+          ensureObj(cell.arg, cell.suf, n.width);
+        }
+      }
     }
+    auto realize = [&](Acc &a) -> std::vector<Function *> {
+      std::vector<Function *> fns;
+      if (a.bad || !a.have)
+        return fns;
+      for (Function *F : a.fns)
+        if (F && (!a.ty || F->getFunctionType() == a.ty))
+          fns.push_back(F);
+      std::sort(fns.begin(), fns.end(), [](Function *A, Function *B) { return A->getName() < B->getName(); });
+      fns.erase(std::unique(fns.begin(), fns.end()), fns.end());
+      return fns;
+    };
+    std::map<int, std::vector<Function *>> argChoice;
+    for (auto &kv : accs) {
+      Acc &a = kv.second;
+      std::vector<Function *> may = realize(a);
+      std::vector<Function *> fns;
+      // One named target determines the cell. A larger set is every function
+      // that call could reach, which is not a value of the cell. It becomes a
+      // witness only when the solved frontier names a function inside that set.
+      if (may.size() == 1)
+        fns = may;
+      if (a.bad) {
+        continue;
+      }
+      auto it = locOfKey.find(kv.first);
+      if (it == locOfKey.end()) {
+        continue;
+      }
+      const Loc &loc = it->second;
+      if (!args.count(loc.arg))
+        args[loc.arg] = Piece{};
+      auto pl = placeIn(loc.arg, loc.suf);
+      if (!pl.first) {
+        continue;
+      }
+      if (pl.first->child.count(pl.second)) {
+        continue;
+      }
+      Piece *p = pl.first;
+      int64_t off = pl.second;
+      if (p->word.count(off)) {
+        std::vector<Function *> pinned;
+        bool ok = true;
+        for (const std::string &v : p->word[off]) {
+          Function *B = bodyOf(fnNamed(v));
+          if (!B) {
+            ok = false;
+            break;
+          }
+          if (a.ty && B->getFunctionType() != a.ty)
+            continue;
+          if (!may.empty() && std::find(may.begin(), may.end(), B) == may.end())
+            continue;
+          pinned.push_back(B);
+        }
+        if (!ok || pinned.empty()) {
+          continue;
+        }
+        fns = std::move(pinned);
+        p->word.erase(off);
+      }
+      if (fns.empty()) {
+        continue;
+      }
+      p->symAt.erase(off);
+      p->choiceAt[off] = std::move(fns);
+      p->size = std::max(p->size, (uint64_t)off + dl.getPointerSize(0));
+    }
+    // A callee cell inside the pointee of a pointer cell constrains that
+    // pointer: the slot at its offset holds a function of the call's set.
+    // The values the program gives such a pointer are the constant tables it
+    // stores at that field, at the address point it stores. The domain of
+    // the pointer is every stored table whose slots meet all constraints.
+    // An empty domain leaves the pointee an object built from its cells.
+    {
+      indexVtables();
+      // A slot the residual calls holds a defined function of the call's
+      // type; a named set narrows it further.
+      struct Slot {
+        int64_t at = 0;
+        FunctionType *ty = nullptr;
+        std::set<std::string> fns;
+      };
+      struct Table {
+        int arg = -1;
+        Suffix prefix;
+        std::vector<Slot> slots;
+      };
+      std::map<std::string, Table> tables;
+      for (auto &kv : accs) {
+        Acc &a = kv.second;
+        auto it = locOfKey.find(kv.first);
+        if (a.bad || it == locOfKey.end())
+          continue;
+        const Loc &loc = it->second;
+        size_t j = loc.suf.size();
+        while (j > 0 && !loc.suf[j - 1].deref)
+          --j;
+        if (j == 0)
+          continue;
+        --j;
+        Slot s;
+        s.ty = a.ty;
+        for (size_t i = j; i < loc.suf.size(); ++i)
+          s.at += loc.suf[i].off;
+        auto pl = placeIn(loc.arg, loc.suf);
+        if (pl.first && pl.first->choiceAt.count(pl.second))
+          for (Function *F : pl.first->choiceAt.at(pl.second))
+            s.fns.insert(F->getName().str());
+        else
+          for (Function *F : realize(a))
+            s.fns.insert(F->getName().str());
+        if (s.fns.empty() && a.have)
+          continue;
+        Suffix prefix(loc.suf.begin(), loc.suf.begin() + (long)j);
+        Table &t = tables[std::to_string(loc.arg) + sufKey(prefix)];
+        t.arg = loc.arg;
+        t.prefix = prefix;
+        t.slots.push_back(std::move(s));
+      }
+      for (auto &kv : tables) {
+        const Table &t = kv.second;
+        auto pl = placeIn(t.arg, t.prefix);
+        if (!pl.first)
+          continue;
+        std::vector<std::pair<GlobalVariable *, uint64_t>> dom;
+        uint64_t extent = 0;
+        for (const VTab &vt : vtAll) {
+          if (!vt.last || !vt.g || !vt.g->hasInitializer() || vt.field != pl.second)
+            continue;
+          bool ok = true;
+          for (const Slot &s : t.slots) {
+            if (s.at < 0) {
+              ok = false;
+              break;
+            }
+            Function *F = functionAt(vt.g->getInitializer(), 0, vt.base + (uint64_t)s.at);
+            if (!F || F->isDeclaration() || (s.ty && F->getFunctionType() != s.ty) ||
+                (!s.fns.empty() && !s.fns.count(F->getName().str()))) {
+              ok = false;
+              break;
+            }
+          }
+          if (!ok)
+            continue;
+          extent = std::max(extent, vt.extent);
+          if (std::find(dom.begin(), dom.end(), std::make_pair(vt.g, vt.base)) == dom.end())
+            dom.push_back({vt.g, vt.base});
+        }
+        if (dom.empty())
+          continue;
+        Piece *p = pl.first;
+        int64_t off = pl.second;
+        // The table fixes the object's layout, so the object spans the
+        // largest layout among the tables it may hold.
+        p->size = std::max(p->size, extent);
+        p->child.erase(off);
+        p->symAt.erase(off);
+        p->word.erase(off);
+        p->choiceAt.erase(off);
+        p->tableAt[off] = std::move(dom);
+        p->size = std::max(p->size, (uint64_t)off + dl.getPointerSize(0));
+      }
+    }
+    for (auto &kv : argAcc) {
+      Acc &a = kv.second;
+      std::vector<Function *> fns = realize(a);
+      if (fns.size() != 1)
+        fns.clear();
+      bool object = false;
+      if (args.count(kv.first)) {
+        const Piece &p = args[kv.first];
+        object = !p.child.empty() || !p.symAt.empty() || !p.word.empty() || !p.text.empty() || !p.globAt.empty() ||
+                 !p.fileAt.empty() || !p.pathPtrAt.empty() || !p.choiceAt.empty() || !p.tableAt.empty();
+      }
+      if (fns.empty() || object) {
+        continue;
+      }
+      argChoice[kv.first] = std::move(fns);
+    }
+    auto pick = [&](IRBuilder<> &IB, const std::vector<Constant *> &elems) -> Value * {
+      if (elems.empty())
+        return nullptr;
+      if (elems.size() == 1)
+        return elems[0];
+      auto *arrTy = ArrayType::get(ptrTy, elems.size());
+      auto *table = new GlobalVariable(H, arrTy, true, GlobalValue::PrivateLinkage, ConstantArray::get(arrTy, elems),
+                                      "callee.tab." + std::to_string(nameN++));
+      Value *mem = IB.CreateAlloca(i32);
+      auto *nm = IB.CreateGlobalString("c" + std::to_string(nameN++));
+      IB.CreateCall(sym, {mem, ConstantInt::get(i64, 4), nm});
+      Value *k = IB.CreateLoad(i32, mem);
+      Value *inRange = IB.CreateICmpULT(k, ConstantInt::get(i32, elems.size()));
+      IB.CreateCall(assume, {IB.CreateZExt(inRange, i64)});
+      Value *slot = IB.CreateInBoundsGEP(arrTy, table, {ConstantInt::get(i64, 0), k});
+      return IB.CreateLoad(ptrTy, slot);
+    };
+    auto choose = [&](IRBuilder<> &IB, const std::vector<Function *> &fns) -> Value * {
+      std::vector<Constant *> decls;
+      for (Function *F : fns)
+        if (Function *D = declare(F))
+          decls.push_back(D);
+      return pick(IB, decls);
+    };
+    auto chooseTable = [&](IRBuilder<> &IB, const std::vector<std::pair<GlobalVariable *, uint64_t>> &dom) -> Value * {
+      std::vector<Constant *> addrs;
+      for (const auto &t : dom) {
+        GlobalVariable *g = H.getNamedGlobal(t.first->getName());
+        if (!g)
+          g = new GlobalVariable(H, t.first->getValueType(), true, GlobalValue::ExternalLinkage, nullptr,
+                                 t.first->getName());
+        addrs.push_back(ConstantExpr::getGetElementPtr(i8, g, ConstantInt::get(i64, t.second)));
+      }
+      return pick(IB, addrs);
+    };
     std::function<Built(const Piece &)> mat = [&](const Piece &p) -> Built {
+      // A determined cell is a byte range [off, off + width) whose value a
+      // fact fixes. The object holds every determined cell, and its symbolic
+      // bytes are the ranges no determined cell covers.
+      const uint64_t ptrW = dl.getPointerSize(0);
+      std::vector<std::pair<int64_t, uint64_t>> fixed;
+      auto wordWidth = [&](int64_t off) -> uint64_t {
+        unsigned wd = p.width.count(off) ? p.width.at(off) : 8;
+        return wd == 1 || wd == 2 || wd == 4 || wd == 8 ? wd : 8;
+      };
+      for (const auto &kv : p.child)
+        fixed.push_back({kv.first, ptrW});
+      for (const auto &kv : p.choiceAt)
+        fixed.push_back({kv.first, ptrW});
+      for (const auto &kv : p.tableAt)
+        fixed.push_back({kv.first, ptrW});
+      for (const auto &kv : p.boundAt)
+        fixed.push_back({kv.first, ptrW});
+      for (const auto &kv : p.globAt)
+        fixed.push_back({kv.first, ptrW});
+      for (const auto &kv : p.fileAt)
+        fixed.push_back({kv.first, ptrW});
+      for (int64_t off : p.pathPtrAt)
+        fixed.push_back({off, ptrW});
+      for (const auto &kv : p.word)
+        if (!p.child.count(kv.first))
+          fixed.push_back({kv.first, wordWidth(kv.first)});
+      for (const auto &kv : p.text) {
+        uint64_t n = 0;
+        for (const std::string &s : kv.second)
+          n = std::max<uint64_t>(n, s.size() + 1);
+        if (n && !p.child.count(kv.first))
+          fixed.push_back({kv.first, n});
+      }
       uint64_t nbytes = p.size ? p.size : 8;
-      auto *arr = ArrayType::get(i8, nbytes);
-      Value *base = B.CreateAlloca(arr);
+      for (const auto &c : fixed)
+        if (c.first >= 0)
+          nbytes = std::max(nbytes, (uint64_t)c.first + c.second);
+      std::vector<bool> owned(nbytes, false);
+      for (const auto &c : fixed)
+        for (uint64_t i = 0; c.first >= 0 && i < c.second; ++i)
+          owned[(uint64_t)c.first + i] = true;
+      // The program may take ownership of an entry object and free it, so
+      // every object lives on the heap.
+      FunctionCallee mallocF = H.getOrInsertFunction("malloc", FunctionType::get(ptrTy, {i64}, false));
+      Value *base = B.CreateCall(mallocF, {ConstantInt::get(i64, nbytes)});
       B.CreateMemSet(base, ConstantInt::get(i8, 0), nbytes, MaybeAlign(1));
       Built built;
       built.base = base;
-      std::set<int64_t> fptr;
-      if (!p.type.empty()) {
-        auto it = fnPtrOff.find(bareName(p.type));
-        if (it != fnPtrOff.end())
-          fptr = it->second;
+      built.size = nbytes;
+      for (const auto &ch : p.choiceAt) {
+        if (ch.first < 0 || (uint64_t)ch.first + dl.getPointerSize(0) > nbytes || p.child.count(ch.first))
+          continue;
+        Value *chosen = choose(B, ch.second);
+        if (!chosen)
+          continue;
+        Value *slot = B.CreateGEP(i8, base, {ConstantInt::get(i64, (uint64_t)ch.first)});
+        B.CreateStore(chosen, slot);
       }
-      for (int64_t off : fptr) {
-        if (off < 0 || (uint64_t)off + dl.getPointerSize(0) > nbytes)
+      for (const auto &t : p.tableAt) {
+        if (t.first < 0 || p.child.count(t.first))
           continue;
-        if (p.word.count(off) || p.child.count(off))
+        Value *chosen = chooseTable(B, t.second);
+        if (!chosen)
           continue;
-        Value *slot = B.CreateGEP(i8, base, {ConstantInt::get(i64, (uint64_t)off)});
-        B.CreateStore(stub, slot);
+        B.CreateStore(chosen, B.CreateGEP(i8, base, {ConstantInt::get(i64, (uint64_t)t.first)}));
       }
       for (const auto &sm : p.symAt) {
         if (p.child.count(sm.first) || p.word.count(sm.first) || p.text.count(sm.first) ||
             p.pathPtrAt.count(sm.first) || p.fileAt.count(sm.first) || p.globAt.count(sm.first) ||
-            fptr.count(sm.first))
+            p.choiceAt.count(sm.first))
           continue;
         if ((uint64_t)sm.first >= nbytes)
           continue;
-        uint64_t n = sm.second;
-        if ((uint64_t)sm.first + n > nbytes)
-          n = nbytes - (uint64_t)sm.first;
-        if (n == 0)
-          continue;
-        Value *slot = B.CreateGEP(i8, base, {ConstantInt::get(i64, (uint64_t)sm.first)});
-        // klee_make_symbolic names one whole object. These bytes are a range
-        // of the cell, so they are a separate object copied into that range.
-        Value *tmp = B.CreateAlloca(ArrayType::get(i8, n));
-        auto *nm = B.CreateGlobalString("a" + std::to_string(nameN++));
-        B.CreateCall(sym, {tmp, ConstantInt::get(i64, n), nm});
-        B.CreateMemCpy(slot, MaybeAlign(1), tmp, MaybeAlign(1), ConstantInt::get(i64, n));
+        uint64_t end = std::min<uint64_t>(nbytes, (uint64_t)sm.first + sm.second);
+        for (uint64_t at = (uint64_t)sm.first; at < end;) {
+          if (owned[at]) {
+            ++at;
+            continue;
+          }
+          uint64_t stop = at;
+          while (stop < end && !owned[stop])
+            ++stop;
+          uint64_t n = stop - at;
+          Value *slot = B.CreateGEP(i8, base, {ConstantInt::get(i64, at)});
+          // klee_make_symbolic names one whole object. These bytes are a range
+          // of the cell, so they are a separate object copied into that range.
+          Value *tmp = B.CreateAlloca(ArrayType::get(i8, n));
+          auto *nm = B.CreateGlobalString("a" + std::to_string(nameN++));
+          B.CreateCall(sym, {tmp, ConstantInt::get(i64, n), nm});
+          B.CreateMemCpy(slot, MaybeAlign(1), tmp, MaybeAlign(1), ConstantInt::get(i64, n));
+          at = stop;
+        }
       }
       for (const auto &b : p.ban) {
         auto sit = p.symAt.find(b.first);
@@ -720,7 +1450,7 @@ void Model::emit(Module &H) const {
         auto pit = p.child.find(bd.second);
         if (cit == built.child.end() || pit == p.child.end())
           continue;
-        Value *end = B.CreateGEP(i8, cit->second.base, {ConstantInt::get(i64, pit->second.size)});
+        Value *end = B.CreateGEP(i8, cit->second.base, {ConstantInt::get(i64, cit->second.size)});
         Value *slot = B.CreateGEP(i8, base, {ConstantInt::get(i64, (uint64_t)bd.first)});
         B.CreateStore(end, slot);
       }
@@ -841,6 +1571,8 @@ void Model::emit(Module &H) const {
       } else if (!a.fn.empty()) {
         Function *F = fnNamed(a.fn);
         act = F ? declare(F) : Constant::getNullValue(A.getType());
+      } else if (argChoice.count((int)acts.size()) && A.getType()->isPointerTy()) {
+        act = choose(B, argChoice[(int)acts.size()]);
       } else if (A.getType()->isIntegerTy()) {
         auto tc = tiedCount.find((int)acts.size());
         if (tc != tiedCount.end())

@@ -859,13 +859,17 @@ void Model::indexVtables() const {
         }
       }
       std::set<std::string> types;
+      uint64_t extent = 0;
       for (Instruction &I : instructions(F)) {
         auto *G = dyn_cast<GetElementPtrInst>(&I);
         if (!G || !th.count(G->getPointerOperand()->stripPointerCasts()))
           continue;
         if (auto *ST = dyn_cast<StructType>(G->getSourceElementType()))
-          if (ST->hasName())
+          if (ST->hasName()) {
             types.insert(ST->getName().str());
+            if (ST->isSized())
+              extent = std::max<uint64_t>(extent, dl.getTypeAllocSize(ST).getFixedValue());
+          }
       }
       for (Instruction &I : instructions(F)) {
         auto *S = dyn_cast<StoreInst>(&I);
@@ -894,12 +898,41 @@ void Model::indexVtables() const {
         }
         if (!th.count(P))
           continue;
-        VTab vt{GV, (uint64_t)bo.getSExtValue(), field};
+        VTab vt{GV, (uint64_t)bo.getSExtValue(), field, &F, extent};
         vtAll.push_back(vt);
         for (const std::string &ty : types)
           vtOf[ty].push_back(vt);
       }
     });
+    // A table is overwritten in every construction when each caller of the
+    // storing function itself stores a table into the same field.
+    std::map<int64_t, std::set<const Function *>> storers;
+    for (const VTab &vt : vtAll)
+      storers[vt.field].insert(vt.by);
+    std::function<void(const Value *, const std::set<const Function *> &, bool &, std::set<const Value *> &)> callers =
+        [&](const Value *V, const std::set<const Function *> &st, bool &last, std::set<const Value *> &seen) {
+          if (!seen.insert(V).second)
+            return;
+          for (const User *U : V->users()) {
+            if (last)
+              return;
+            if (auto *GA = dyn_cast<GlobalAlias>(U)) {
+              callers(GA, st, last, seen);
+              continue;
+            }
+            auto *CB = dyn_cast<CallBase>(U);
+            if (!CB || CB->getCalledOperand()->stripPointerCasts() != V || !st.count(CB->getFunction()))
+              last = true;
+          }
+        };
+    for (VTab &vt : vtAll) {
+      bool last = false;
+      std::set<const Value *> seen;
+      callers(vt.by, storers[vt.field], last, seen);
+      if (vt.by->use_empty())
+        last = true;
+      vt.last = last;
+    }
   }
 
 Model::VSlot Model::vslot(CallBase *CB) const {
