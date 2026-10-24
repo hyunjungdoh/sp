@@ -7,13 +7,11 @@ Function *Model::exportFn() const { return entry; }
 StructType *Model::structNamed(StringRef n) const {
     if (n.empty())
       return nullptr;
-    for (StructType *S : down.getIdentifiedStructTypes())
-      if (S->getName() == n)
-        return S;
-    for (StructType *S : up.getIdentifiedStructTypes())
-      if (S->getName() == n)
-        return S;
-    return nullptr;
+    if (StructType *S = source::irType(n.str()))
+      return S;
+    if (StructType *S = StructType::getTypeByName(down.getContext(), n))
+      return S;
+    return StructType::getTypeByName(up.getContext(), n);
   }
 
 bool Model::fieldIsPointer(StringRef type, int64_t off) const {
@@ -79,6 +77,25 @@ void Model::emit(Module &H) const {
       // it. The stored value is one of these addresses, chosen by a symbolic
       // index.
       std::map<int64_t, std::vector<std::pair<GlobalVariable *, uint64_t>>> tableAt;
+      // Pointer fields the code compares with null hold either null or their
+      // object, chosen symbolically.
+      std::set<int64_t> nullAt;
+      // Initializers that set a function cell: the offset where the struct
+      // they initialize begins, and the sites. One of them runs on the object
+      // in place of an independent choice of the cell.
+      struct Sites {
+        int64_t at = 0;
+        std::string type;
+        std::set<int64_t> cells;
+        // Each cell's full choice, kept for when the struct has no
+        // initializer.
+        std::map<int64_t, std::vector<Function *>> held;
+        std::vector<InitSite> sites;
+        // Some value of a cell comes from no initializer: running none of
+        // them is also a choice.
+        bool open = false;
+      };
+      std::map<int64_t, Sites> siteAt;
       uint64_t size = 8;
     };
     std::map<int, Piece> args;
@@ -549,12 +566,63 @@ void Model::emit(Module &H) const {
       Suffix suf;
       bool pointee = false;
     };
+    // A call's result is a path of the caller's formals when every return of
+    // the callee is the same path of the callee's formals: the actual's path
+    // followed by the returned one.
+    std::function<Form(Function *)> retOf;
+    // A writable global is a root of the entry state like an argument. Its
+    // root number is -2 - k for the k-th global met.
+    std::vector<GlobalVariable *> globalRoots;
+    std::map<GlobalVariable *, int> globalRoot;
+    auto rootOfGlobal = [&](GlobalVariable *G) {
+      auto it = globalRoot.find(G);
+      if (it != globalRoot.end())
+        return it->second;
+      int r = -2 - (int)globalRoots.size();
+      globalRoots.push_back(G);
+      globalRoot[G] = r;
+      return r;
+    };
+    auto then = [](Form b, const Form &r) -> Form {
+      if (r.suf.empty()) {
+        if (r.pointee) {
+          if (b.pointee)
+            b.suf.push_back(Step{"", 0, true});
+          b.pointee = true;
+        }
+        return b;
+      }
+      for (size_t i = 0; i < r.suf.size(); ++i) {
+        Step st = r.suf[i];
+        if (i == 0)
+          st.deref = st.deref || b.pointee;
+        b.suf.push_back(st);
+      }
+      b.pointee = r.pointee;
+      return b;
+    };
     auto formalOf = [&](Function *F, Value *V) -> Form {
       std::unordered_set<const Value *> seen;
       std::function<Form(Value *)> go = [&](Value *V) -> Form {
         Form bad;
         if (!V || !seen.insert(V).second)
           return bad;
+        if (auto *CB = dyn_cast<CallBase>(V)) {
+          Function *D = CB->getCalledFunction();
+          if (D && D->isDeclaration())
+            D = define(D->getName());
+          if (!D || D->isDeclaration())
+            return bad;
+          Form r = retOf(D);
+          if (r.ok && r.formal <= -2)
+            return r;
+          if (!r.ok || r.formal < 0 || (unsigned)r.formal >= CB->arg_size())
+            return bad;
+          Form b = go(CB->getArgOperand((unsigned)r.formal));
+          if (!b.ok)
+            return bad;
+          return then(b, r);
+        }
         if (auto *C = dyn_cast<CastInst>(V))
           return go(C->getOperand(0));
         if (auto *CE = dyn_cast<ConstantExpr>(V))
@@ -584,6 +652,8 @@ void Model::emit(Module &H) const {
           Form b = go(L->getPointerOperand());
           if (!b.ok)
             return bad;
+          if (b.pointee)
+            b.suf.push_back(Step{"", 0, true});
           b.pointee = true;
           return b;
         }
@@ -606,9 +676,44 @@ void Model::emit(Module &H) const {
           f.formal = (int)A->getArgNo();
           return f;
         }
+        if (auto *G = dyn_cast<GlobalVariable>(V)) {
+          if (G->isConstant() || !G->hasInitializer())
+            return bad;
+          Form f;
+          f.ok = true;
+          f.formal = rootOfGlobal(G);
+          return f;
+        }
         return bad;
       };
       return go(V);
+    };
+    std::unordered_map<Function *, Form> retMemo;
+    std::unordered_set<Function *> retBusy;
+    retOf = [&](Function *D) -> Form {
+      auto it = retMemo.find(D);
+      if (it != retMemo.end())
+        return it->second;
+      Form none;
+      if (!retBusy.insert(D).second || !D->getReturnType()->isPointerTy())
+        return none;
+      Form one;
+      bool first = true;
+      for (Instruction &I : instructions(*D)) {
+        auto *R = dyn_cast<ReturnInst>(&I);
+        if (!R)
+          continue;
+        Form f = R->getReturnValue() ? formalOf(D, R->getReturnValue()) : none;
+        if (!f.ok || (!first && (f.formal != one.formal || f.pointee != one.pointee || !(f.suf == one.suf)))) {
+          one = none;
+          break;
+        }
+        one = f;
+        first = false;
+      }
+      retBusy.erase(D);
+      retMemo[D] = one;
+      return one;
     };
     auto sufKey = [](const Suffix &s) {
       std::string k;
@@ -666,6 +771,9 @@ void Model::emit(Module &H) const {
       std::vector<Use> uses;
       std::vector<Edge> edges;
       std::vector<Need> needs;
+      // Pointer cells the code compares with null, by the address they are
+      // loaded from.
+      std::vector<Need> nulls;
     };
     auto bodyOf = [&](Function *T) -> Function * {
       if (!T)
@@ -691,7 +799,7 @@ void Model::emit(Module &H) const {
       return k;
     };
     auto remember = [&](Function *F, int formal, const Bind &b) -> bool {
-      if (!F || formal < 0 || (unsigned)formal >= F->arg_size() || b.arg < 0)
+      if (!F || formal < 0 || (unsigned)formal >= F->arg_size() || b.arg == -1)
         return false;
       auto &slot = seenBind[F];
       if (slot.size() < F->arg_size())
@@ -713,12 +821,6 @@ void Model::emit(Module &H) const {
         Form f = formalOf(F, ptr);
         if (!f.ok)
           return;
-        bool deref = f.pointee;
-        for (const Step &st : f.suf)
-          if (st.deref)
-            deref = true;
-        if (!deref)
-          return;
         Need n;
         n.formal = f.formal;
         n.suf = f.suf;
@@ -730,6 +832,51 @@ void Model::emit(Module &H) const {
         s.needs.push_back(std::move(n));
       };
       for (Instruction &I : instructions(*F)) {
+        if (auto *IC = dyn_cast<ICmpInst>(&I)) {
+          if (IC->isEquality() && IC->getOperand(0)->getType()->isPointerTy()) {
+            Value *other = isa<ConstantPointerNull>(IC->getOperand(1))   ? IC->getOperand(0)
+                           : isa<ConstantPointerNull>(IC->getOperand(0)) ? IC->getOperand(1)
+                                                                          : nullptr;
+            // Null is a value of the cell only when the code goes on with it:
+            // the null successor of the test reaches a return without
+            // passing a call that does not return.
+            bool goesOn = false;
+            for (User *U : IC->users()) {
+              auto *Br = dyn_cast<BranchInst>(U);
+              if (!Br || !Br->isConditional())
+                continue;
+              bool nullIfTrue = IC->getPredicate() == ICmpInst::ICMP_EQ;
+              BasicBlock *start = Br->getSuccessor(nullIfTrue ? 0 : 1);
+              std::set<BasicBlock *> seenBB;
+              std::vector<BasicBlock *> wl{start};
+              while (!wl.empty() && !goesOn) {
+                BasicBlock *BB = wl.back();
+                wl.pop_back();
+                if (!seenBB.insert(BB).second)
+                  continue;
+                bool stops = false;
+                for (Instruction &J : *BB)
+                  if (auto *C = dyn_cast<CallBase>(&J))
+                    if (C->doesNotReturn() || (C->getCalledFunction() && C->getCalledFunction()->doesNotReturn()))
+                      stops = true;
+                if (stops)
+                  continue;
+                if (isa<ReturnInst>(BB->getTerminator()))
+                  goesOn = true;
+                for (BasicBlock *S : successors(BB))
+                  wl.push_back(S);
+              }
+            }
+            Form f = other && goesOn ? formalOf(F, other) : Form{};
+            if (f.ok && f.pointee && !repeats(f.suf)) {
+              Need n;
+              n.formal = f.formal;
+              n.suf = f.suf;
+              s.nulls.push_back(std::move(n));
+            }
+          }
+          continue;
+        }
         if (auto *L = dyn_cast<LoadInst>(&I)) {
           if (L->getType()->isSized())
             noteDeref(L->getPointerOperand(), dl.getTypeStoreSize(L->getType()).getFixedValue());
@@ -838,8 +985,29 @@ void Model::emit(Module &H) const {
         if (dataKeys.count(std::to_string(reinterpret_cast<uintptr_t>(F)) + "#" + std::to_string(u.formal) + sufKey(addr)))
           u.mixed = true;
       }
+      for (const Edge &e : s.edges) {
+        if (e.formal > -2)
+          continue;
+        Bind root, nb;
+        root.arg = e.formal;
+        if (compose(root, e.suf, e.pointee, nb))
+          remember(e.to, e.toArg, nb);
+      }
       sum[F] = std::move(s);
       summarized.insert(F);
+    };
+    // The cells a formal of F stands for. A global root stands for itself in
+    // every function.
+    auto bindsOf = [&](Function *F, int formal) -> std::vector<Bind> {
+      if (formal <= -2) {
+        Bind b;
+        b.arg = formal;
+        return {b};
+      }
+      auto bit = binds.find(F);
+      if (formal < 0 || bit == binds.end() || (unsigned)formal >= bit->second.size())
+        return {};
+      return bit->second[(unsigned)formal];
     };
     auto drainFuncs = [&]() {
       while (!fq.empty()) {
@@ -891,22 +1059,89 @@ void Model::emit(Module &H) const {
       }
       return v;
     };
+    // A callee loaded from the pointee of a pointer cell may be any defined
+    // function of the call's type that a stored table places at that slot,
+    // when that table is the last one a construction stores at the pointer's
+    // field. These targets bind their formals like any other call.
+    indexVtables();
+    auto tableFns = [&](const Bind &cell, FunctionType *ty) {
+      std::vector<Function *> v;
+      const Suffix &s = cell.suf;
+      size_t j = s.size();
+      while (j > 0 && !s[j - 1].deref)
+        --j;
+      if (j == 0)
+        return v;
+      --j;
+      int64_t slot = 0;
+      for (size_t i = j; i < s.size(); ++i)
+        slot += s[i].off;
+      size_t start = j;
+      while (start > 0 && !s[start - 1].deref)
+        --start;
+      if (start > 0)
+        --start;
+      int64_t field = 0;
+      for (size_t i = start; i < j; ++i)
+        field += s[i].off;
+      if (slot < 0)
+        return v;
+      for (const VTab &vt : vtAll) {
+        if (!vt.last || !vt.g || !vt.g->hasInitializer() || vt.field != field)
+          continue;
+        Function *B = bodyOf(functionAt(vt.g->getInitializer(), 0, vt.base + (uint64_t)slot));
+        if (!B || B->isDeclaration() || (ty && B->getFunctionType() != ty))
+          continue;
+        if (std::find(v.begin(), v.end(), B) == v.end())
+          v.push_back(B);
+      }
+      return v;
+    };
+    auto openFns = [&](const Bind &cell, FunctionType *ty) {
+      std::vector<Function *> v = wordFns(cell, ty);
+      if (v.empty())
+        v = tableFns(cell, ty);
+      return v;
+    };
+    // A cell inside a global holds the global's initial value until the
+    // program stores another, so the function the initializer places there
+    // is a value of the cell.
+    auto initFns = [&](const Bind &cell, FunctionType *ty) {
+      std::vector<Function *> v;
+      if (cell.arg > -2)
+        return v;
+      int64_t off = 0;
+      for (const Step &st : cell.suf) {
+        if (st.deref)
+          return v;
+        off += st.off;
+      }
+      GlobalVariable *G = globalRoots[(size_t)(-2 - cell.arg)];
+      if (off < 0 || !G->hasInitializer())
+        return v;
+      Function *B = bodyOf(functionAt(G->getInitializer(), 0, (uint64_t)off));
+      if (B && !B->isDeclaration() && (!ty || B->getFunctionType() == ty))
+        v.push_back(B);
+      return v;
+    };
     bool grew = true;
     while (grew) {
       grew = false;
       for (auto &sk : sum) {
         Function *caller = sk.first;
         for (const Use &u : sk.second.uses) {
-          if (!u.open || u.formal < 0)
+          if (u.formal == -1)
             continue;
-          auto bit = binds.find(caller);
-          if (bit == binds.end() || (unsigned)u.formal >= bit->second.size())
-            continue;
-          for (const Bind &b : bit->second[(unsigned)u.formal]) {
+          for (const Bind &b : bindsOf(caller, u.formal)) {
             Bind cell;
             if (!compose(b, u.suf, false, cell))
               continue;
-            for (Function *D : wordFns(cell, u.ty)) {
+            std::vector<Function *> more = u.open ? openFns(cell, u.ty) : std::vector<Function *>{};
+            for (Function *D : initFns(cell, u.ty))
+              if (std::find(u.tg.begin(), u.tg.end(), D) == u.tg.end() &&
+                  std::find(more.begin(), more.end(), D) == more.end())
+                more.push_back(D);
+            for (Function *D : more) {
               if (!summarized.count(D)) {
                 fq.push_back(D);
                 grew = true;
@@ -917,10 +1152,7 @@ void Model::emit(Module &H) const {
                 Form f = formalOf(caller, u.cb->getArgOperand(i));
                 if (!f.ok)
                   continue;
-                auto cit = binds.find(caller);
-                if (cit == binds.end() || (unsigned)f.formal >= cit->second.size())
-                  continue;
-                for (const Bind &ab : cit->second[(unsigned)f.formal]) {
+                for (const Bind &ab : bindsOf(caller, f.formal)) {
                   Bind nb;
                   if (compose(ab, f.suf, f.pointee, nb) && remember(D, (int)i, nb))
                     grew = true;
@@ -932,6 +1164,23 @@ void Model::emit(Module &H) const {
       }
       drainFuncs();
       drainBinds();
+    }
+    if (const char *tr = getenv("MODEL_TRACE")) {
+      for (auto &sk : sum) {
+        if (sk.first->getName().find(tr) == StringRef::npos)
+          continue;
+        errs() << "TRACE " << sk.first->getName() << "\n";
+        for (unsigned i = 0; i < sk.first->arg_size(); ++i)
+          for (const Bind &b : bindsOf(sk.first, (int)i))
+            errs() << "  bind " << i << " = arg" << b.arg << sufKey(b.suf) << "\n";
+        for (const Need &n : sk.second.needs)
+          errs() << "  need f" << n.formal << sufKey(n.suf) << " w" << n.width << "\n";
+        for (const Edge &e : sk.second.edges)
+          errs() << "  edge f" << e.formal << sufKey(e.suf) << (e.pointee ? "*" : "") << " -> " << e.to->getName() << "#"
+                 << e.toArg << "\n";
+        for (const Use &u : sk.second.uses)
+          errs() << "  use f" << u.formal << sufKey(u.suf) << " open=" << u.open << " tg=" << u.tg.size() << "\n";
+      }
     }
     auto note = [&](Acc &a, const Use &u) {
       if (u.cb)
@@ -969,15 +1218,13 @@ void Model::emit(Module &H) const {
     for (auto &sk : sum) {
       Function *F = sk.first;
       for (const Use &u : sk.second.uses) {
-        auto bit = binds.find(F);
-        if (bit == binds.end() || u.formal < 0 || (unsigned)u.formal >= bit->second.size() ||
-            bit->second[(unsigned)u.formal].empty())
-          continue;
-        for (const Bind &b : bit->second[(unsigned)u.formal]) {
+        for (const Bind &b : bindsOf(F, u.formal)) {
           Bind cell;
           if (!compose(b, u.suf, false, cell))
             continue;
           if (u.argLevel && cell.suf.empty()) {
+            if (cell.arg < 0)
+              continue;
             note(argAcc[cell.arg], u);
             continue;
           }
@@ -991,7 +1238,7 @@ void Model::emit(Module &H) const {
       }
     }
     auto ensureObj = [&](int arg, const Suffix &suf, uint64_t width) {
-      if (arg < 0 || width == 0)
+      if (arg == -1 || width == 0)
         return;
       if (!args.count(arg))
         args[arg] = Piece{};
@@ -1018,13 +1265,8 @@ void Model::emit(Module &H) const {
     };
     for (auto &sk : sum) {
       Function *F = sk.first;
-      auto bit = binds.find(F);
-      if (bit == binds.end())
-        continue;
       for (const Need &n : sk.second.needs) {
-        if (n.formal < 0 || (unsigned)n.formal >= bit->second.size())
-          continue;
-        for (const Bind &b : bit->second[(unsigned)n.formal]) {
+        for (const Bind &b : bindsOf(F, n.formal)) {
           Bind cell;
           if (!compose(b, n.suf, false, cell))
             continue;
@@ -1061,6 +1303,13 @@ void Model::emit(Module &H) const {
         continue;
       }
       const Loc &loc = it->second;
+      // The values of the cell are the functions the program stores in its
+      // field; those the call can take form the cell's domain, chosen
+      // symbolically.
+      if (may.size() > 1)
+        for (Function *F : storedAt(loc.suf))
+          if (std::find(may.begin(), may.end(), F) != may.end())
+            fns.push_back(F);
       if (!args.count(loc.arg))
         args[loc.arg] = Piece{};
       auto pl = placeIn(loc.arg, loc.suf);
@@ -1097,9 +1346,62 @@ void Model::emit(Module &H) const {
         continue;
       }
       p->symAt.erase(off);
-      p->choiceAt[off] = std::move(fns);
       p->size = std::max(p->size, (uint64_t)off + dl.getPointerSize(0));
+      // A function the program stores here by an initializer of the
+      // enclosing struct is the value that initializer gives, with the fields
+      // it sets beside. The initializer runs when its other formals are
+      // scalars the harness can choose.
+      if (!loc.suf.empty()) {
+        const Step &last = loc.suf.back();
+        auto sit = initSites.find({last.type, last.off});
+        int64_t at = off - last.off;
+        std::vector<Function *> rest;
+        bool any = false;
+        for (Function *F : fns) {
+          bool by = false;
+          if (sit != initSites.end() && at >= 0)
+            for (const InitSite &s : sit->second)
+              by = by || s.stored == F;
+          any = any || by;
+          if (!by)
+            rest.push_back(F);
+        }
+        if (any) {
+          auto &g = p->siteAt[at];
+          g.at = at;
+          g.type = last.type;
+          g.cells.insert(last.off);
+          g.held[off] = fns;
+          g.open = g.open || !rest.empty();
+          fns = std::move(rest);
+          if (fns.empty())
+            continue;
+        }
+      }
+      p->choiceAt[off] = std::move(fns);
     }
+    // The cells an initializer sets take their values from one maximal
+    // initializer of the struct; without one they keep their choices.
+    std::function<void(Piece &)> settle = [&](Piece &p) {
+      for (auto &sg : p.siteAt) {
+        Piece::Sites &g = sg.second;
+        g.sites = initializers(g.type, g.cells);
+        if (g.sites.empty()) {
+          for (auto &h : g.held)
+            p.choiceAt[h.first] = h.second;
+          continue;
+        }
+        if (StructType *ST = structNamed(g.type))
+          if (ST->isSized())
+            p.size = std::max(p.size, (uint64_t)g.at + dl.getTypeAllocSize(ST).getFixedValue());
+      }
+      for (auto it = p.siteAt.begin(); it != p.siteAt.end();)
+        it = it->second.sites.empty() ? p.siteAt.erase(it) : std::next(it);
+      for (auto &ch : p.child)
+        settle(ch.second);
+    };
+    for (auto &kv : args)
+      settle(kv.second);
     // A callee cell inside the pointee of a pointer cell constrains that
     // pointer: the slot at its offset holds a function of the call's set.
     // The values the program gives such a pointer are the constant tables it
@@ -1196,6 +1498,18 @@ void Model::emit(Module &H) const {
         p->size = std::max(p->size, (uint64_t)off + dl.getPointerSize(0));
       }
     }
+    for (auto &sk : sum) {
+      for (const Need &n : sk.second.nulls) {
+        for (const Bind &b : bindsOf(sk.first, n.formal)) {
+          Bind cell;
+          if (!compose(b, n.suf, false, cell))
+            continue;
+          auto pl = placeIn(cell.arg, cell.suf);
+          if (pl.first && pl.first->child.count(pl.second))
+            pl.first->nullAt.insert(pl.second);
+        }
+      }
+    }
     for (auto &kv : argAcc) {
       Acc &a = kv.second;
       std::vector<Function *> fns = realize(a);
@@ -1246,6 +1560,98 @@ void Model::emit(Module &H) const {
         addrs.push_back(ConstantExpr::getGetElementPtr(i8, g, ConstantInt::get(i64, t.second)));
       }
       return pick(IB, addrs);
+    };
+    // A scalar formal takes the values its callers pass: when each passes a
+    // zero-extended narrower value or a constant, the formal is below
+    // 2^bits of the widest.
+    auto actualBits = [&](Function *F, unsigned j) -> unsigned {
+      unsigned full = F->getArg(j)->getType()->getIntegerBitWidth();
+      // Bits of one value; a local slot holds what is stored into it.
+      std::function<unsigned(Value *, int)> bits = [&](Value *V, int depth) -> unsigned {
+        if (auto *Z = dyn_cast<ZExtInst>(V))
+          return Z->getSrcTy()->getIntegerBitWidth();
+        if (auto *C = dyn_cast<ConstantInt>(V))
+          return C->getValue().getActiveBits();
+        if (auto *Sel = dyn_cast<SelectInst>(V))
+          return std::max(bits(Sel->getTrueValue(), depth), bits(Sel->getFalseValue(), depth));
+        auto *L = dyn_cast<LoadInst>(V);
+        auto *Al = L ? dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts()) : nullptr;
+        if (!Al || depth > 0)
+          return full;
+        unsigned w = 0;
+        for (User *U : Al->users()) {
+          if (auto *S = dyn_cast<StoreInst>(U)) {
+            if (S->getPointerOperand()->stripPointerCasts() == Al)
+              w = std::max(w, bits(S->getValueOperand(), depth + 1));
+          } else if (auto *CB = dyn_cast<CallBase>(U)) {
+            // A callee given the slot stores into it through that formal.
+            Function *C = CB->getCalledFunction();
+            Function *Bd = C ? bodyOf(C) : nullptr;
+            if (!Bd)
+              return full;
+            for (unsigned k = 0; k < CB->arg_size() && k < Bd->arg_size(); ++k) {
+              if (CB->getArgOperand(k)->stripPointerCasts() != Al)
+                continue;
+              for (Instruction &I : instructions(*Bd)) {
+                auto *S = dyn_cast<StoreInst>(&I);
+                if (!S || !S->getValueOperand()->getType()->isIntegerTy())
+                  continue;
+                Value *P = S->getPointerOperand()->stripPointerCasts();
+                bool viaK = false;
+                if (auto *A = dyn_cast<Argument>(P))
+                  viaK = A->getArgNo() == k;
+                else if (auto *PL = dyn_cast<LoadInst>(P))
+                  if (auto *PA = dyn_cast<AllocaInst>(PL->getPointerOperand()->stripPointerCasts()))
+                    for (User *PU : PA->users())
+                      if (auto *PS = dyn_cast<StoreInst>(PU))
+                        if (auto *A = dyn_cast<Argument>(PS->getValueOperand()->stripPointerCasts()))
+                          viaK = viaK || (A->getArgNo() == k && PS->getPointerOperand()->stripPointerCasts() == PA);
+                if (viaK)
+                  w = std::max(w, bits(S->getValueOperand(), depth + 1));
+              }
+            }
+          } else if (!isa<LoadInst>(U) && !isa<DbgInfoIntrinsic>(U)) {
+            return full;
+          }
+        }
+        return w;
+      };
+      unsigned w = 0;
+      bool any = false;
+      for (User *U : F->users()) {
+        auto *CB = dyn_cast<CallBase>(U);
+        if (!CB || CB->getCalledFunction() != F || j >= CB->arg_size())
+          continue;
+        any = true;
+        w = std::max(w, bits(CB->getArgOperand(j), 0));
+      }
+      return any ? std::min(w, full) : full;
+    };
+    // Runs one of the options, chosen by a symbolic index.
+    auto oneOf = [&](const std::vector<std::function<void(IRBuilder<> &)>> &opts) {
+      if (opts.empty())
+        return;
+      if (opts.size() == 1) {
+        opts[0](B);
+        return;
+      }
+      Value *mem = B.CreateAlloca(i32);
+      B.CreateCall(sym, {mem, ConstantInt::get(i64, 4), B.CreateGlobalString("s" + std::to_string(nameN++))});
+      Value *k = B.CreateLoad(i32, mem);
+      B.CreateCall(assume, {B.CreateZExt(B.CreateICmpULT(k, ConstantInt::get(i32, opts.size())), i64)});
+      Function *mf = B.GetInsertBlock()->getParent();
+      auto *cont = BasicBlock::Create(ctx, "scont", mf);
+      auto *def = BasicBlock::Create(ctx, "sdef", mf);
+      auto *sw = B.CreateSwitch(k, def, opts.size());
+      for (unsigned i = 0; i < opts.size(); ++i) {
+        BasicBlock *bb = i == 0 ? def : BasicBlock::Create(ctx, "scase", mf);
+        if (i != 0)
+          sw->addCase(cast<ConstantInt>(ConstantInt::get(i32, i)), bb);
+        IRBuilder<> IB(bb);
+        opts[i](IB);
+        IB.CreateBr(cont);
+      }
+      B.SetInsertPoint(cont);
     };
     std::function<Built(const Piece &)> mat = [&](const Piece &p) -> Built {
       // A determined cell is a byte range [off, off + width) whose value a
@@ -1442,7 +1848,17 @@ void Model::emit(Module &H) const {
       for (const auto &ch : p.child) {
         Built inner = mat(ch.second);
         Value *slot = B.CreateGEP(i8, base, {ConstantInt::get(i64, (uint64_t)ch.first)});
-        B.CreateStore(inner.base, slot);
+        Value *val = inner.base;
+        bool bounded = false;
+        for (const auto &bd : p.boundAt)
+          bounded = bounded || bd.second == ch.first;
+        if (p.nullAt.count(ch.first) && !bounded) {
+          Value *mem = B.CreateAlloca(i8);
+          B.CreateCall(sym, {mem, ConstantInt::get(i64, 1), B.CreateGlobalString("n" + std::to_string(nameN++))});
+          Value *some = B.CreateICmpNE(B.CreateLoad(i8, mem), ConstantInt::get(i8, 0));
+          val = B.CreateSelect(some, inner.base, ConstantPointerNull::get(ptrTy));
+        }
+        B.CreateStore(val, slot);
         built.child.emplace(ch.first, std::move(inner));
       }
       for (const auto &bd : p.boundAt) {
@@ -1488,6 +1904,33 @@ void Model::emit(Module &H) const {
           ok = B.CreateOr(ok, B.CreateICmpEQ(got, want));
         }
         B.CreateCall(assume, {B.CreateZExt(ok, i64)});
+      }
+      for (const auto &sg : p.siteAt) {
+        const Piece::Sites &g = sg.second;
+        std::vector<std::function<void(IRBuilder<> &)>> opts;
+        if (g.open)
+          opts.push_back([](IRBuilder<> &) {});
+        for (const InitSite &s : g.sites)
+          opts.push_back([&, s](IRBuilder<> &IB) {
+            std::vector<Value *> as;
+            for (Argument &A : s.fn->args()) {
+              if (A.getArgNo() == s.arg) {
+                as.push_back(IB.CreateGEP(i8, base, {ConstantInt::get(i64, (uint64_t)g.at)}));
+                continue;
+              }
+              Type *ty = A.getType();
+              unsigned n = std::max<unsigned>(1, ty->getIntegerBitWidth() / 8);
+              Value *mem = IB.CreateAlloca(ty);
+              IB.CreateCall(sym, {mem, ConstantInt::get(i64, n), IB.CreateGlobalString("i" + std::to_string(nameN++))});
+              Value *x = IB.CreateLoad(ty, mem);
+              unsigned w = actualBits(s.fn, A.getArgNo());
+              if (w < ty->getIntegerBitWidth())
+                IB.CreateCall(assume, {IB.CreateZExt(IB.CreateICmpULT(x, ConstantInt::get(ty, APInt(ty->getIntegerBitWidth(), 1).shl(w))), i64)});
+              as.push_back(x);
+            }
+            IB.CreateCall(declare(s.fn), as);
+          });
+        oneOf(opts);
       }
       return built;
     };
@@ -1602,6 +2045,205 @@ void Model::emit(Module &H) const {
         act = Constant::getNullValue(A.getType());
       }
       acts.push_back(act);
+    }
+    // A global's cells are written into the global itself. Its pointer cells
+    // take their values only when the program stores a non-null pointer into
+    // that global; otherwise the global keeps its initial value.
+    std::function<bool(Value *)> storesPointer = [&](Value *V) {
+      for (User *U : V->users()) {
+        if (auto *S = dyn_cast<StoreInst>(U)) {
+          if (S->getPointerOperand() == V && S->getValueOperand()->getType()->isPointerTy() &&
+              !isa<ConstantPointerNull>(S->getValueOperand()))
+            return true;
+        } else if (isa<GEPOperator>(U) || isa<BitCastOperator>(U) || isa<AddrSpaceCastOperator>(U)) {
+          if (storesPointer(U))
+            return true;
+        }
+      }
+      return false;
+    };
+    // A constant of the program as a value of the harness; null when the
+    // harness cannot name it.
+    std::function<Value *(Value *, GlobalVariable *, GlobalVariable *)> toH =
+        [&](Value *V, GlobalVariable *G, GlobalVariable *gH) -> Value * {
+      if (isa<ConstantInt>(V) || isa<ConstantPointerNull>(V))
+        return V;
+      if (auto *F = dyn_cast<Function>(V))
+        return declare(F);
+      if (auto *GV = dyn_cast<GlobalVariable>(V)) {
+        if (GV == G)
+          return gH;
+        if (GV->hasPrivateLinkage() || !GV->hasName())
+          return nullptr;
+        if (GlobalVariable *E = H.getNamedGlobal(GV->getName()))
+          return E;
+        return new GlobalVariable(H, GV->getValueType(), false, GlobalValue::ExternalLinkage, nullptr, GV->getName());
+      }
+      if (auto *CE = dyn_cast<ConstantExpr>(V)) {
+        APInt off(64, 0);
+        Value *base = CE->stripAndAccumulateConstantOffsets(dl, off, true);
+        if (base == CE)
+          return nullptr;
+        Value *b = toH(base, G, gH);
+        if (!b || !isa<Constant>(b))
+          return nullptr;
+        if (off.isZero())
+          return b;
+        return ConstantExpr::getGetElementPtr(i8, cast<Constant>(b), ConstantInt::get(i64, off.getSExtValue()));
+      }
+      return nullptr;
+    };
+    // The formal a pointer is, directly or through the slot that keeps it.
+    auto formalOfPtr = [&](Value *V) -> int {
+      V = V->stripPointerCasts();
+      if (auto *A = dyn_cast<Argument>(V))
+        return (int)A->getArgNo();
+      auto *L = dyn_cast<LoadInst>(V);
+      auto *Al = L ? dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts()) : nullptr;
+      if (!Al)
+        return -1;
+      int at = -1;
+      for (User *U : Al->users())
+        if (auto *S = dyn_cast<StoreInst>(U))
+          if (S->getPointerOperand()->stripPointerCasts() == Al) {
+            auto *A = dyn_cast<Argument>(S->getValueOperand()->stripPointerCasts());
+            if (!A || (at != -1 && at != (int)A->getArgNo()))
+              return -1;
+            at = (int)A->getArgNo();
+          }
+      return at;
+    };
+    struct GSites {
+      std::vector<std::function<void(IRBuilder<> &)>> run;
+      bool external = false;
+    };
+    auto sitesOf = [&](GlobalVariable *G, GlobalVariable *gH) -> GSites {
+      GSites out;
+      std::set<std::string> seen;
+      auto call = [&](CallBase *CB, bool keep) {
+        Function *F = CB->getCalledFunction();
+        if (!F || F->isVarArg())
+          return;
+        std::vector<Value *> as;
+        for (Value *A : CB->args()) {
+          Value *v = toH(A, G, gH);
+          if (!v)
+            return;
+          as.push_back(v);
+        }
+        std::string key = F->getName().str() + (keep ? "=" : "");
+        for (Value *A : as)
+          key += "," + std::to_string((uintptr_t)A);
+        if (!seen.insert(key).second)
+          return;
+        Function *D = declare(F);
+        out.run.push_back([=](IRBuilder<> &IB) {
+          Value *r = IB.CreateCall(D, as);
+          if (keep)
+            IB.CreateStore(r, gH);
+        });
+      };
+      std::function<void(Value *)> walk = [&](Value *V) {
+        for (User *U : V->users()) {
+          if (auto *S = dyn_cast<StoreInst>(U)) {
+            if (S->getPointerOperand() != V)
+              continue;
+            Value *W = S->getValueOperand()->stripPointerCasts();
+            if (isa<ConstantPointerNull>(W))
+              continue;
+            if (isa<Function>(W) || isa<GlobalVariable>(W)) {
+              if (Value *c = toH(W, G, gH))
+                if (seen.insert("const" + std::to_string((uintptr_t)c)).second)
+                  out.run.push_back([=](IRBuilder<> &IB) { IB.CreateStore(c, gH); });
+            } else if (auto *CB = dyn_cast<CallBase>(W)) {
+              if (CB->getType()->isPointerTy())
+                call(CB, true);
+            } else if (formalOfPtr(W) >= 0) {
+              out.external = true;
+            }
+          } else if (auto *CB = dyn_cast<CallBase>(U)) {
+            Function *F = CB->getCalledFunction();
+            Function *Bd = F ? bodyOf(F) : nullptr;
+            if (!Bd)
+              continue;
+            for (unsigned i = 0; i < CB->arg_size() && i < Bd->arg_size(); ++i) {
+              if (CB->getArgOperand(i) != V)
+                continue;
+              bool sets = false;
+              for (Instruction &I : instructions(*Bd))
+                if (auto *S = dyn_cast<StoreInst>(&I))
+                  if (formalOfPtr(S->getPointerOperand()) == (int)i &&
+                      S->getValueOperand()->getType()->isPointerTy() &&
+                      !isa<ConstantPointerNull>(S->getValueOperand()))
+                    sets = true;
+              if (sets)
+                call(CB, false);
+            }
+          } else if (isa<BitCastOperator>(U) || isa<AddrSpaceCastOperator>(U)) {
+            walk(U);
+          }
+        }
+      };
+      walk(G);
+      return out;
+    };
+    for (auto &kv : args) {
+      if (kv.first > -2)
+        continue;
+      const Piece &p = kv.second;
+      if (p.child.empty() && p.choiceAt.empty() && p.tableAt.empty())
+        continue;
+      GlobalVariable *G = globalRoots[(size_t)(-2 - kv.first)];
+      if (!storesPointer(G))
+        continue;
+      if (G->hasLocalLinkage()) {
+        G->setName(G->getName() + ".root" + std::to_string(-2 - kv.first));
+        G->setLinkage(GlobalValue::ExternalLinkage);
+      }
+      GlobalVariable *gH = H.getNamedGlobal(G->getName());
+      if (!gH)
+        gH = new GlobalVariable(H, G->getValueType(), false, GlobalValue::ExternalLinkage, nullptr, G->getName());
+      auto slotAt = [&](int64_t off) { return B.CreateGEP(i8, gH, {ConstantInt::get(i64, (uint64_t)off)}); };
+      for (const auto &ch : p.child) {
+        if (ch.first < 0)
+          continue;
+        // A pointer global holds its initial value or a value a store of the
+        // program puts there. A store the harness can perform from constants
+        // is performed; a pointer the program received from outside its
+        // reach is an object built from its cells.
+        if (ch.first == 0 && G->getValueType()->isPointerTy()) {
+          GSites gs = sitesOf(G, gH);
+          bool init = p.nullAt.count(0);
+          bool fake = gs.external || (gs.run.empty() && !init);
+          Value *obj = fake ? mat(ch.second).base : nullptr;
+          std::vector<std::function<void(IRBuilder<> &)>> opts;
+          if (init)
+            opts.push_back([](IRBuilder<> &) {});
+          for (const auto &r : gs.run)
+            opts.push_back(r);
+          if (obj)
+            opts.push_back([&, obj](IRBuilder<> &IB) { IB.CreateStore(obj, gH); });
+          oneOf(opts);
+          continue;
+        }
+        Built inner = mat(ch.second);
+        Value *val = inner.base;
+        if (p.nullAt.count(ch.first)) {
+          Value *mem = B.CreateAlloca(i8);
+          B.CreateCall(sym, {mem, ConstantInt::get(i64, 1), B.CreateGlobalString("n" + std::to_string(nameN++))});
+          val = B.CreateSelect(B.CreateICmpNE(B.CreateLoad(i8, mem), ConstantInt::get(i8, 0)), inner.base,
+                               ConstantPointerNull::get(ptrTy));
+        }
+        B.CreateStore(val, slotAt(ch.first));
+      }
+      for (const auto &c : p.choiceAt)
+        if (c.first >= 0 && !p.child.count(c.first))
+          if (Value *v = choose(B, c.second))
+            B.CreateStore(v, slotAt(c.first));
+      for (const auto &t : p.tableAt)
+        if (t.first >= 0 && !p.child.count(t.first))
+          if (Value *v = chooseTable(B, t.second))
+            B.CreateStore(v, slotAt(t.first));
     }
     for (const Rel &r : rels) {
       unsigned wd = r.bytes;

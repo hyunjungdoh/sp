@@ -102,10 +102,9 @@ Suffix Model::suffix(Value *V) const {
         APInt off(dl.getIndexSizeInBits(G->getPointerAddressSpace()), 0);
         if (!G->accumulateConstantOffset(dl, off))
           return {};
-        if (auto *ST = dyn_cast<StructType>(G->getSourceElementType())) {
-          if (ST->hasName())
-            s.insert(s.begin(), Step{ST->getName().str(), off.getSExtValue()});
-        }
+        std::string k = source::container(G, dl);
+        if (!k.empty())
+          s.insert(s.begin(), Step{k, off.getSExtValue()});
         V = G->getPointerOperand();
         continue;
       }
@@ -161,6 +160,240 @@ void Model::ensureSlots() const {
           put(tail, F);
       }
     }
+  }
+
+std::vector<Function *> Model::storedAt(const Suffix &s) const {
+    ensureSlots();
+    size_t from = 0;
+    for (size_t i = 0; i < s.size(); ++i)
+      if (s[i].deref)
+        from = i;
+    Suffix in(s.begin() + (long)from, s.end());
+    if (!in.empty())
+      in.front().deref = false;
+    for (size_t n = 0; n < in.size(); ++n) {
+      if (in[n].type.empty())
+        continue;
+      auto it = slotAt.find(Suffix(in.begin() + (long)n, in.end()));
+      if (it != slotAt.end() && !it->second.empty())
+        return it->second;
+    }
+    return {};
+  }
+
+std::vector<Model::InitSite> Model::initializers(const std::string &type, const std::set<int64_t> &cells) const {
+    auto memo = initMemo.find({type, cells});
+    if (memo != initMemo.end())
+      return memo->second;
+    auto callers = [&](Function *F) -> const std::vector<Function *> & {
+      static const std::vector<Function *> none;
+      auto it = callersOf.find(F);
+      return it == callersOf.end() ? none : it->second;
+    };
+    // Methods: the functions the struct's fields hold, and the helpers only
+    // they call.
+    std::set<Function *> methods;
+    for (const auto &kv : initSites)
+      if (kv.first.first == type && cells.count(kv.first.second))
+        for (const InitSite &s : kv.second)
+          methods.insert(s.stored);
+    for (const auto &kv : fnAt)
+      if (!kv.first.empty() && kv.first.back().type == type && cells.count(kv.first.back().off))
+        methods.insert(kv.second.begin(), kv.second.end());
+    std::set<Function *> callbacks;
+    for (const auto &kv : initSites)
+      if (kv.first.first == type)
+        for (const InitSite &s : kv.second)
+          callbacks.insert(s.stored);
+    for (const auto &kv : fnAt)
+      if (!kv.first.empty() && kv.first.back().type == type)
+        callbacks.insert(kv.second.begin(), kv.second.end());
+    for (bool grew = true; grew;) {
+      grew = false;
+      eachBody([&](Function &F) {
+        if (methods.count(&F))
+          return;
+        const auto &cs = callers(&F);
+        if (cs.empty())
+          return;
+        for (Function *C : cs)
+          if (!methods.count(C))
+            return;
+        methods.insert(&F);
+        grew = true;
+      });
+    }
+    std::map<Function *, unsigned> site;
+    for (const auto &kv : initSites)
+      if (kv.first.first == type && cells.count(kv.first.second))
+        for (const InitSite &s : kv.second)
+          if (!methods.count(s.fn))
+            site.emplace(s.fn, s.arg);
+    auto formalOf = [](Value *V) -> int {
+      V = V->stripPointerCasts();
+      if (auto *A = dyn_cast<Argument>(V))
+        return (int)A->getArgNo();
+      auto *L = dyn_cast<LoadInst>(V);
+      auto *Al = L ? dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts()) : nullptr;
+      if (!Al)
+        return -1;
+      int at = -1;
+      for (User *U : Al->users())
+        if (auto *S = dyn_cast<StoreInst>(U))
+          if (S->getPointerOperand()->stripPointerCasts() == Al) {
+            auto *A = dyn_cast<Argument>(S->getValueOperand()->stripPointerCasts());
+            if (!A || (at != -1 && at != (int)A->getArgNo()))
+              return -1;
+            at = (int)A->getArgNo();
+          }
+      return at;
+    };
+    auto scalarsBut = [](Function *F, unsigned obj) {
+      for (Argument &A : F->args())
+        if (A.getArgNo() != obj && !A.getType()->isIntegerTy())
+          return false;
+      return true;
+    };
+    // The formal whose object a pointer lies in.
+    auto rootOf = [&](Value *V) -> int {
+      for (int n = 0; n < 32 && V; ++n) {
+        V = V->stripPointerCasts();
+        if (auto *A = dyn_cast<Argument>(V))
+          return (int)A->getArgNo();
+        if (auto *G = dyn_cast<GEPOperator>(V)) {
+          V = G->getPointerOperand();
+          continue;
+        }
+        if (auto *L = dyn_cast<LoadInst>(V)) {
+          if (isa<AllocaInst>(L->getPointerOperand()->stripPointerCasts()))
+            return formalOf(L);
+          V = L->getPointerOperand();
+          continue;
+        }
+        return -1;
+      }
+      return -1;
+    };
+    // Deallocators: free, and the functions that pass a formal's object to a
+    // deallocator.
+    std::set<std::pair<Function *, unsigned>> frees;
+    for (bool grew = true; grew;) {
+      grew = false;
+      eachBody([&](Function &F) {
+        for (Instruction &I : instructions(F)) {
+          auto *CB = dyn_cast<CallBase>(&I);
+          Function *C = CB ? CB->getCalledFunction() : nullptr;
+          if (!C)
+            continue;
+          if (Function *D = define(C->getName()))
+            C = D;
+          for (unsigned i = 0; i < CB->arg_size(); ++i) {
+            if (C->getName() != "free" && !frees.count({C, i}))
+              continue;
+            int k = formalOf(CB->getArgOperand(i));
+            if (k >= 0 && frees.insert({&F, (unsigned)k}).second)
+              grew = true;
+          }
+        }
+      });
+    }
+    // A site that releases memory of its object ends that object's state
+    // rather than establishing it.
+    auto releases = [&](Function *S, unsigned obj) {
+      for (Instruction &I : instructions(*S)) {
+        auto *CB = dyn_cast<CallBase>(&I);
+        Function *C = CB ? CB->getCalledFunction() : nullptr;
+        if (!C)
+          continue;
+        if (Function *D = define(C->getName()))
+          C = D;
+        for (unsigned i = 0; i < CB->arg_size(); ++i)
+          if ((C->getName() == "free" || frees.count({C, i})) && rootOf(CB->getArgOperand(i)) == (int)obj)
+            return true;
+      }
+      return false;
+    };
+    for (auto it = site.begin(); it != site.end();)
+      it = callbacks.count(it->first) || releases(it->first, it->second) ? site.erase(it) : std::next(it);
+    // A site whose scalars its caller passes from its own formals is run
+    // through that caller, which chooses them as the program does.
+    std::vector<Function *> work;
+    for (const auto &kv : site)
+      work.push_back(kv.first);
+    while (!work.empty()) {
+      Function *S = work.back();
+      work.pop_back();
+      unsigned obj = site[S];
+      if (scalarsBut(S, obj) && S->arg_size() <= 1)
+        continue;
+      bool hasScalar = false;
+      for (Argument &A : S->args())
+        hasScalar = hasScalar || (A.getArgNo() != obj && A.getType()->isIntegerTy());
+      if (!hasScalar)
+        continue;
+      for (Function *P : callers(S)) {
+        if (site.count(P) || methods.count(P) || callbacks.count(P) || P->isDeclaration())
+          continue;
+        for (Instruction &I : instructions(*P)) {
+          auto *CB = dyn_cast<CallBase>(&I);
+          if (!CB || CB->arg_size() <= obj)
+            continue;
+          auto ts = targetsOf(CB);
+          if (std::find(ts.begin(), ts.end(), S) == ts.end())
+            continue;
+          int k = formalOf(CB->getArgOperand(obj));
+          if (k < 0 || !scalarsBut(P, (unsigned)k))
+            continue;
+          bool through = true;
+          for (unsigned i = 0; i < CB->arg_size(); ++i) {
+            if (i == obj)
+              continue;
+            Value *A = CB->getArgOperand(i);
+            if (!isa<ConstantInt>(A) && formalOf(A) < 0 && !isa<Argument>(A) && !isa<LoadInst>(A))
+              through = false;
+          }
+          if (!through || releases(P, (unsigned)k))
+            continue;
+          site.emplace(P, (unsigned)k);
+          work.push_back(P);
+          break;
+        }
+      }
+    }
+    std::vector<InitSite> out;
+    auto runs = [&](Function *F) {
+      auto it = site.find(F);
+      return it != site.end() && scalarsBut(F, it->second);
+    };
+    // Functions run only within initializers or methods: what every caller
+    // of one does is part of a larger initializer.
+    std::set<Function *> within;
+    for (bool grew = true; grew;) {
+      grew = false;
+      eachBody([&](Function &F) {
+        if (within.count(&F))
+          return;
+        const auto &cs = callers(&F);
+        if (cs.empty())
+          return;
+        for (Function *C : cs)
+          if (!runs(C) && !methods.count(C) && !within.count(C))
+            return;
+        within.insert(&F);
+        grew = true;
+      });
+    }
+    for (const auto &kv : site) {
+      if (!runs(kv.first))
+        continue;
+      bool inner = within.count(kv.first);
+      if (!inner)
+        out.push_back(InitSite{kv.first, kv.second, nullptr});
+    }
+    std::sort(out.begin(), out.end(),
+              [](const InitSite &a, const InitSite &b) { return a.fn->getName() < b.fn->getName(); });
+    initMemo[{type, cells}] = out;
+    return out;
   }
 
 void Model::addFn(const Suffix &s, Function *F) {
@@ -250,7 +483,7 @@ void Model::noteZero(Type *Ty, const Suffix &suf) {
         const StructLayout *SL = dl.getStructLayout(N);
         for (unsigned i = 0; i < N->getNumElements(); ++i) {
           Suffix n = suf;
-          n.push_back(Step{N->getName().str(), (int64_t)SL->getElementOffset(i)});
+          n.push_back(Step{source::key(nullptr, N, dl), (int64_t)SL->getElementOffset(i)});
           noteZero(N->getElementType(i), n);
         }
       }
@@ -267,7 +500,8 @@ void Model::noteZero(Type *Ty, const Suffix &suf) {
     }
   }
 
-void Model::walkInit(Constant *C, Type *Ty, const Suffix &suf, bool scalars) {
+// D is the source type of the object C initializes, when DWARF declares it.
+void Model::walkInit(Constant *C, Type *Ty, const Suffix &suf, bool scalars, const DIType *D) {
     if (!C)
       return;
     if (isa<ConstantPointerNull>(C) || isa<ConstantAggregateZero>(C))
@@ -291,7 +525,7 @@ void Model::walkInit(Constant *C, Type *Ty, const Suffix &suf, bool scalars) {
         Suffix n = suf;
         if (!n.empty() && es)
           n.back().off += (int64_t)i * (int64_t)es;
-        walkInit(CDS->getElementAsConstant(i), ET, n, scalars);
+        walkInit(CDS->getElementAsConstant(i), ET, n, scalars, source::element(D));
       }
       return;
     }
@@ -303,12 +537,20 @@ void Model::walkInit(Constant *C, Type *Ty, const Suffix &suf, bool scalars) {
           walkInit(S->getOperand(i), S->getOperand(i)->getType(), suf, scalars);
         return;
       }
+      // A declared source type names the one struct the constant is; the
+      // IR shape stands for every struct it may be only when DWARF is silent.
+      if (D && !source::name(D).empty())
+        named.resize(1);
       for (StructType *N : named) {
         const StructLayout *SL = dl.getStructLayout(N);
+        std::string k = source::key(D, N, dl);
         for (unsigned i = 0; i < S->getNumOperands() && i < N->getNumElements(); ++i) {
           Suffix n = suf;
-          n.push_back(Step{N->getName().str(), (int64_t)SL->getElementOffset(i)});
-          walkInit(S->getOperand(i), N->getElementType(i), n, scalars);
+          uint64_t o = SL->getElementOffset(i);
+          n.push_back(Step{k, (int64_t)o});
+          Type *E = N->getElementType(i);
+          walkInit(S->getOperand(i), E, n, scalars,
+                   D ? source::member(D, o, E->isSized() ? dl.getTypeAllocSize(E).getFixedValue() : 0) : nullptr);
         }
       }
       return;
@@ -321,7 +563,7 @@ void Model::walkInit(Constant *C, Type *Ty, const Suffix &suf, bool scalars) {
         Suffix n = suf;
         if (!n.empty() && es)
           n.back().off += (int64_t)i * (int64_t)es;
-        walkInit(A->getOperand(i), ET, n, scalars);
+        walkInit(A->getOperand(i), ET, n, scalars, source::element(D));
       }
     }
   }
@@ -370,7 +612,8 @@ Suffix Model::suffixFromAccess(const StoreInst *S) const {
     auto it = accessNames.find(Name->getString().str());
     if (it == accessNames.end() || it->second.empty())
       return {};
-    return {Step{it->second.front(), CI->getSExtValue()}};
+    StructType *ST = structNamed(it->second.front());
+    return {Step{ST ? source::key(nullptr, ST, dl) : it->second.front(), CI->getSExtValue()}};
   }
 
 void Model::indexFunctions() {
@@ -385,14 +628,14 @@ void Model::indexFunctions() {
         Suffix suf = suffix(S->getPointerOperand());
         if (suf.empty())
           suf = suffixFromAccess(S);
-        walkInit(C, C->getType(), suf, false);
+        walkInit(C, C->getType(), suf, false, source::pointee(S->getPointerOperand()));
       }
     });
     for (Module *M : {&down, &up})
       for (GlobalVariable &G : M->globals()) {
       if (!G.hasInitializer())
         continue;
-      walkInit(G.getInitializer(), G.getValueType(), {}, true);
+      walkInit(G.getInitializer(), G.getValueType(), {}, true, source::ofGlobal(G));
     }
     for (auto &kv : fnAt) {
       std::sort(kv.second.begin(), kv.second.end(), [](Function *A, Function *B) { return pretty(A->getName()) < pretty(B->getName()); });
@@ -526,7 +769,7 @@ std::map<std::string, std::set<int64_t>> Model::keyFields() {
             if (i == j)
               continue;
             if (CB->getArgOperand(j)->stripPointerCasts() == base)
-              out[ST->getName().str()].insert(delta.getSExtValue());
+              out[source::container(G, dl)].insert(delta.getSExtValue());
           }
         }
       }
@@ -650,6 +893,20 @@ void Model::indexArgFns() {
                   if (auto *A = dyn_cast<Argument>(St->getValueOperand()->stripPointerCasts()))
                     arg = (int)A->getArgNo();
                 }
+            }
+          }
+          if (auto *Fn = dyn_cast<Function>(S->getValueOperand()->stripPointerCasts())) {
+            Loc L;
+            if (locOf(m, S->getPointerOperand(), L) && L.arg >= 0 && L.suf.size() == 1 && !L.suf[0].deref &&
+                !L.suf[0].type.empty()) {
+              if (Function *D = define(Fn->getName()))
+                Fn = D;
+              auto &v = initSites[{L.suf[0].type, L.suf[0].off}];
+              bool have = false;
+              for (const InitSite &s : v)
+                have = have || (s.fn == &F && s.stored == Fn);
+              if (!have)
+                v.push_back(InitSite{&F, (unsigned)L.arg, Fn});
             }
           }
           Suffix suf = suffix(S->getPointerOperand());
@@ -866,7 +1123,7 @@ void Model::indexVtables() const {
           continue;
         if (auto *ST = dyn_cast<StructType>(G->getSourceElementType()))
           if (ST->hasName()) {
-            types.insert(ST->getName().str());
+            types.insert(source::container(cast<GEPOperator>(G), dl));
             if (ST->isSized())
               extent = std::max<uint64_t>(extent, dl.getTypeAllocSize(ST).getFixedValue());
           }
@@ -940,13 +1197,16 @@ Model::VSlot Model::vslot(CallBase *CB) const {
     auto *fnLoad = dyn_cast<LoadInst>(CB->getCalledOperand()->stripPointerCasts());
     if (!fnLoad)
       return s;
-    auto *slotG = dyn_cast<GEPOperator>(fnLoad->getPointerOperand()->stripPointerCasts());
-    if (!slotG || !slotG->hasAllConstantIndices())
-      return s;
-    APInt slot(dl.getIndexSizeInBits(slotG->getPointerAddressSpace()), 0);
-    if (!slotG->accumulateConstantOffset(dl, slot))
-      return s;
-    auto *vLoad = dyn_cast<LoadInst>(slotG->getPointerOperand()->stripPointerCasts());
+    // The slot is the vtable pointer advanced by a constant, by none for the
+    // first slot (whose all-zero GEP stripPointerCasts removes).
+    Value *vt = fnLoad->getPointerOperand()->stripPointerCasts();
+    APInt slot(dl.getIndexSizeInBits(fnLoad->getPointerAddressSpace()), 0);
+    if (auto *slotG = dyn_cast<GEPOperator>(vt)) {
+      if (!slotG->hasAllConstantIndices() || !slotG->accumulateConstantOffset(dl, slot))
+        return s;
+      vt = slotG->getPointerOperand()->stripPointerCasts();
+    }
+    auto *vLoad = dyn_cast<LoadInst>(vt);
     if (!vLoad)
       return s;
     Value *obj = vLoad->getPointerOperand()->stripPointerCasts();
@@ -1098,9 +1358,9 @@ std::vector<Function *> Model::vtableTargets(CallBase *CB) const {
         continue;
       if (!objs.count(G->getPointerOperand()->stripPointerCasts()))
         continue;
-      if (auto *ST = dyn_cast<StructType>(G->getSourceElementType()))
-        if (ST->hasName())
-          types.insert(ST->getName().str());
+      std::string k = source::container(cast<GEPOperator>(G), dl);
+      if (!k.empty())
+        types.insert(k);
     }
     for (const std::string &ty : types) {
       auto it = vtOf.find(ty);
@@ -1110,22 +1370,16 @@ std::vector<Function *> Model::vtableTargets(CallBase *CB) const {
         if (std::find(out.begin(), out.end(), Fn) == out.end())
           out.push_back(Fn);
     }
-    if (out.empty()) {
-      uint64_t want = objectBytes(s.obj, CB->getFunction());
-      std::vector<Function *> found;
-      if (want)
-        for (const auto &kv : vtOf) {
-          if (typeBytes(kv.first) != want)
-            continue;
-          for (Function *Fn : fromVtabs(kv.second, s.field, s.slot))
-            if (std::find(found.begin(), found.end(), Fn) == found.end())
-              found.push_back(Fn);
+    // Without the receiver's type, class hierarchy analysis by slot: every
+    // vtable's function at this slot whose type is the call's.
+    if (out.empty())
+      for (const auto &kv : vtOf)
+        for (Function *Fn : fromVtabs(kv.second, s.field, s.slot)) {
+          Function *B = define(Fn->getName());
+          Function *T = B ? B : Fn;
+          if (T->getFunctionType() == CB->getFunctionType() && std::find(out.begin(), out.end(), T) == out.end())
+            out.push_back(T);
         }
-      // Several structs share the size. The slot names one function, or it
-      // does not name the call.
-      if (found.size() == 1)
-        out.push_back(found[0]);
-    }
     vtableCache[CB] = out;
     return out;
   }
@@ -1282,6 +1536,16 @@ std::vector<Function *> Model::targetsOf(CallBase *CB) const {
     auto it = slotAt.find(s);
     if (it != slotAt.end())
       return it->second;
+    // A field of type T at offset o holds what the program places in any
+    // field of T at o, whatever object encloses it: a struct copy carries
+    // the source's fields into the destination's.
+    for (size_t n = 1; n < s.size(); ++n) {
+      if (s[n].type.empty())
+        continue;
+      auto tl = slotAt.find(Suffix(s.begin() + (long)n, s.end()));
+      if (tl != slotAt.end() && !tl->second.empty())
+        return tl->second;
+    }
     auto at = argCallTargets.find(CB);
     // A formal that callers pass a function through is that function.
     // An empty list is a call through the object, which a vtable may name.
@@ -1307,7 +1571,7 @@ bool Model::exported(const Function &F) {
 std::vector<Function *> Model::findExports() {
     std::vector<Function *> v;
     for (Function &F : down)
-      if (!F.isDeclaration() && exported(F))
+      if (!F.isDeclaration() && exported(F) && (interfaceNames.empty() || interfaceNames.count(F.getName().str())))
         v.push_back(&F);
     std::sort(v.begin(), v.end(), [](Function *A, Function *B) { return pretty(A->getName()) < pretty(B->getName()); });
     return v;
@@ -1345,7 +1609,7 @@ std::vector<Function *> Model::findStarts() {
       if (!cone.count(E))
         continue;
       bool inside = false;
-      auto it = callersOf.find(E);
+      auto it = interfaceNames.empty() ? callersOf.find(E) : callersOf.end();
       if (it != callersOf.end())
         for (Function *C : it->second)
           if (cone.count(C))

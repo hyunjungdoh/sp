@@ -4,8 +4,10 @@
 //
 // A cell is a constant-offset access path from an export argument. The same
 // cell has the same root and the same suffix of (struct type, constant
-// byte offset). A variable index of an array held by a constant field is
-// one element cell. A variable field of a struct is not a cell.
+// byte offset). The struct type is the source type of the object (Source.h),
+// not the IR struct the linker may have merged it into. A variable index of
+// an array held by a constant field is one element cell. A variable field
+// of a struct is not a cell.
 //
 // State 0 leaves every cell unknown. The formula is one memory per sequence
 // function. An instruction is on the transition only when every path to the
@@ -28,11 +30,15 @@
 // residual runs once. The sink instruction stays there. Its overflow is not
 // a clause.
 //
-// Sequence 0 is the best simple path from a caller-facing export to the
-// sink: fewer indirect edges, then fewer calls, then earlier call sites
-// and demangled names. A caller-facing export reaches the sink and is not
-// called by another function on those paths. Index k is that path in the
+// Sequence 0 is the best simple path from an interface function of D to
+// the sink: fewer indirect edges, then fewer calls, then earlier call sites
+// and demangled names. The interface is what D's shared object exports;
+// those are the functions a client calls. Without it, a caller-facing
+// export stands in: one that reaches the sink and is not called by another
+// function on those paths. Index k is that path in the
 // graph that no longer contains the last edge of any earlier path.
+
+#include "Source.h"
 
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
@@ -100,7 +106,7 @@ using Suffix = std::vector<Step>;
 
 // A constant GEP moves the address by a byte offset, and that offset is the
 // step whatever type the GEP indexes. A named struct source records the
-// field's type alongside it; any other source records none. An untyped GEP
+// source type of the struct alongside it; any other source records none. An untyped GEP
 // of offset zero does not move the address, so it adds no step.
 inline bool constStep(const DataLayout &dl, GEPOperator *G, Step &st) {
   if (!G->hasAllConstantIndices())
@@ -110,9 +116,7 @@ inline bool constStep(const DataLayout &dl, GEPOperator *G, Step &st) {
     return false;
   st = Step{};
   st.off = off.getSExtValue();
-  if (auto *ST = dyn_cast<StructType>(G->getSourceElementType()))
-    if (ST->hasName())
-      st.type = ST->getName().str();
+  st.type = source::container(G, dl);
   return true;
 }
 
@@ -394,6 +398,9 @@ inline bool ignorable(const Function *F) {
 
 class Model {
  public:
+  // D's interface: the functions its shared object exports. When known,
+  // sequences start only at these, the functions a client can call.
+  std::set<std::string> interfaceNames;
   Model(Module &down, Module &up, StringRef file, unsigned line) : down(down), up(up), dl(down.getDataLayout()), sinkFile(file), sinkLine(line) {}
 
   void run(int seqPick, raw_ostream &out);
@@ -410,6 +417,21 @@ class Model {
   std::map<Suffix, std::vector<Suffix>> besidePtr;
   std::map<Suffix, std::vector<Function *>> builderOf;
   std::map<Function *, std::vector<std::pair<unsigned, Suffix>>> argStored;
+  // An initializer of a struct: a function that stores a constant function
+  // into field (type, offset) of the object its formal points to. Running it
+  // on an object sets that field together with every field it stores beside.
+  struct InitSite {
+    Function *fn = nullptr;
+    unsigned arg = 0;
+    Function *stored = nullptr;
+  };
+  std::map<std::pair<std::string, int64_t>, std::vector<InitSite>> initSites;
+  // The maximal initializers of a struct for a set of its function cells:
+  // sites that are not methods of those cells (the functions they hold and
+  // the helpers only those call), lifted to callers that pass their own
+  // object and scalars, without those whose every caller is an initializer.
+  std::vector<InitSite> initializers(const std::string &type, const std::set<int64_t> &cells) const;
+  mutable std::map<std::pair<std::string, std::set<int64_t>>, std::vector<InitSite>> initMemo;
   mutable std::map<Suffix, std::vector<Function *>> slotAt;
   mutable bool slotReady = false;
   struct VTab {
@@ -584,6 +606,10 @@ class Model {
   // A private struct often begins with a public struct at offset zero. A call
   // through the public type reads the same slot the private store wrote.
   void ensureSlots() const;
+  // The functions the program places in the field a path ends at: those
+  // stored at the path inside the last loaded object, else at its innermost
+  // struct fields, whatever object encloses them.
+  std::vector<Function *> storedAt(const Suffix &s) const;
 
 
   void addFn(const Suffix &s, Function *F);
@@ -609,7 +635,7 @@ class Model {
   void noteZero(Type *Ty, const Suffix &suf);
 
 
-  void walkInit(Constant *C, Type *Ty, const Suffix &suf, bool scalars);
+  void walkInit(Constant *C, Type *Ty, const Suffix &suf, bool scalars, const DIType *D = nullptr);
 
 
   static bool typeNameMatches(StringRef llvmName, StringRef access);

@@ -14,6 +14,8 @@ add_executable(model
   src/Solve.cpp
   src/Emit.cpp
   src/Origin.cpp
+  src/Client.cpp
+  src/Source.cpp
 )
 target_include_directories(model PRIVATE ${LLVM_INCLUDE_DIRS})
 target_compile_definitions(model PRIVATE ${LLVM_DEFINITIONS})

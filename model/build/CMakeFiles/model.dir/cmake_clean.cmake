@@ -1,4 +1,6 @@
 file(REMOVE_RECURSE
+  "CMakeFiles/model.dir/src/Client.cpp.o"
+  "CMakeFiles/model.dir/src/Client.cpp.o.d"
   "CMakeFiles/model.dir/src/Emit.cpp.o"
   "CMakeFiles/model.dir/src/Emit.cpp.o.d"
   "CMakeFiles/model.dir/src/Index.cpp.o"
@@ -11,6 +13,8 @@ file(REMOVE_RECURSE
   "CMakeFiles/model.dir/src/Origin.cpp.o.d"
   "CMakeFiles/model.dir/src/Solve.cpp.o"
   "CMakeFiles/model.dir/src/Solve.cpp.o.d"
+  "CMakeFiles/model.dir/src/Source.cpp.o"
+  "CMakeFiles/model.dir/src/Source.cpp.o.d"
   "model"
   "model.pdb"
 )

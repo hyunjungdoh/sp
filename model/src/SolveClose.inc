@@ -204,9 +204,9 @@
           auto *G = dyn_cast<GetElementPtrInst>(&GI);
           if (!G || !objs.count(G->getPointerOperand()->stripPointerCasts()))
             continue;
-          if (auto *ST = dyn_cast<StructType>(G->getSourceElementType()))
-            if (ST->hasName())
-              types.insert(ST->getName().str());
+          std::string k = source::container(cast<GEPOperator>(G), dl);
+          if (!k.empty())
+            types.insert(k);
         }
         std::vector<const VTab *> hits;
         std::set<std::tuple<GlobalVariable *, uint64_t, int64_t>> seenVt;

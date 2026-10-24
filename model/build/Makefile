@@ -181,6 +181,30 @@ model/fast:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/model.dir/build.make CMakeFiles/model.dir/build
 .PHONY : model/fast
 
+src/Client.o: src/Client.cpp.o
+.PHONY : src/Client.o
+
+# target to build an object file
+src/Client.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/model.dir/build.make CMakeFiles/model.dir/src/Client.cpp.o
+.PHONY : src/Client.cpp.o
+
+src/Client.i: src/Client.cpp.i
+.PHONY : src/Client.i
+
+# target to preprocess a source file
+src/Client.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/model.dir/build.make CMakeFiles/model.dir/src/Client.cpp.i
+.PHONY : src/Client.cpp.i
+
+src/Client.s: src/Client.cpp.s
+.PHONY : src/Client.s
+
+# target to generate assembly for a file
+src/Client.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/model.dir/build.make CMakeFiles/model.dir/src/Client.cpp.s
+.PHONY : src/Client.cpp.s
+
 src/Emit.o: src/Emit.cpp.o
 .PHONY : src/Emit.o
 
@@ -325,6 +349,30 @@ src/Solve.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/model.dir/build.make CMakeFiles/model.dir/src/Solve.cpp.s
 .PHONY : src/Solve.cpp.s
 
+src/Source.o: src/Source.cpp.o
+.PHONY : src/Source.o
+
+# target to build an object file
+src/Source.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/model.dir/build.make CMakeFiles/model.dir/src/Source.cpp.o
+.PHONY : src/Source.cpp.o
+
+src/Source.i: src/Source.cpp.i
+.PHONY : src/Source.i
+
+# target to preprocess a source file
+src/Source.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/model.dir/build.make CMakeFiles/model.dir/src/Source.cpp.i
+.PHONY : src/Source.cpp.i
+
+src/Source.s: src/Source.cpp.s
+.PHONY : src/Source.s
+
+# target to generate assembly for a file
+src/Source.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/model.dir/build.make CMakeFiles/model.dir/src/Source.cpp.s
+.PHONY : src/Source.cpp.s
+
 # Help Target
 help:
 	@echo "The following are some of the valid targets for this Makefile:"
@@ -338,6 +386,9 @@ help:
 	@echo "... intrinsics_gen"
 	@echo "... omp_gen"
 	@echo "... model"
+	@echo "... src/Client.o"
+	@echo "... src/Client.i"
+	@echo "... src/Client.s"
 	@echo "... src/Emit.o"
 	@echo "... src/Emit.i"
 	@echo "... src/Emit.s"
@@ -356,6 +407,9 @@ help:
 	@echo "... src/Solve.o"
 	@echo "... src/Solve.i"
 	@echo "... src/Solve.s"
+	@echo "... src/Source.o"
+	@echo "... src/Source.i"
+	@echo "... src/Source.s"
 .PHONY : help
 
 
