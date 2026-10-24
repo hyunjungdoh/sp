@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Model.h"
+#include <tuple>
 
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Dominators.h"
@@ -153,8 +154,25 @@ private:
   // The functions whose own stores modify a field.
   mutable std::map<std::pair<std::string, int64_t>, std::vector<Function *>> modifiers;
   void buildModRef();
-  mutable std::map<std::pair<Function *, unsigned>, std::vector<std::string>> comparedOf;
-  const std::vector<std::string> &compared(Function *F, unsigned i) const;
+  // Where a pointer of a function points: *(..*(formal + p1)..+ pk) + off;
+  // root -1 where it is no such pointer, -2 where only a slot or call
+  // already being evaluated defines it.
+  struct Position {
+    int root = -1;
+    std::vector<int64_t> path;
+    int64_t off = 0;
+    bool exact = true;
+  };
+  mutable FnMap<Position> returnOfFn;
+  mutable FnSet returnOpen;
+  Position positionOf(Value *V, std::set<AllocaInst *> &open, bool &cut) const;
+  Position returnOf(Function *F, bool &cut) const;
+  static Position agreed(const std::vector<Position> &vs);
+  // A text read inside a call of F: formal i, then a pointer loaded at each
+  // offset of path in turn.
+  using TextPlace = std::tuple<Function *, unsigned, std::vector<int64_t>>;
+  mutable std::map<TextPlace, std::vector<std::string>> comparedOf;
+  const std::vector<std::string> &compared(Function *F, unsigned i, const std::vector<int64_t> &path = {}) const;
   bool needs(const std::string &U, const std::string &T, std::set<std::string> &seen) const;
   std::vector<Function *> dependences(Function *P, const std::string &T) const;
   bool guardOf(Function *E, const Cell &c, Guard &g, bool config = false) const;

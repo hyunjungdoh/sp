@@ -1020,17 +1020,140 @@ const std::set<std::pair<std::string, int64_t>> &Client::transitive(Function *F,
   return modRefOf[key] = std::move(out);
 }
 
-// The string constants text formal i of F is compared against with the C
-// library's comparisons: where the text, or a pointer into it, is an
-// argument of a comparison, the constants among its other arguments; where
-// it is passed on to a function the library defines, those of the callee's
-// formal; where it names a file the library opens, the input file's name.
-// Nearest first (breadth-first from F), at most 32. The texts that meet none
-// of these form one class, which a fresh text represents. The classes are
-// what the whole call can tell apart, so the search does not stop at other
+// The one position all of vs agree on, those only being evaluated aside
+// (greatest fixpoint, as rootOf).
+Client::Position Client::agreed(const std::vector<Position> &vs) {
+  Position at{-2};
+  for (const Position &k : vs) {
+    if (k.root == -2)
+      continue;
+    if (k.root < 0 ||
+        (at.root != -2 && (k.root != at.root || k.path != at.path || k.off != at.off || k.exact != at.exact)))
+      return {};
+    at = k;
+  }
+  return at;
+}
+
+// Where pointer V of a function points, through -O0 slots, address
+// arithmetic and the results of calls; off is not exact past a variable
+// index. cut is set where a call already being evaluated was met, so that
+// what depends on it is not kept as final.
+Client::Position Client::positionOf(Value *V, std::set<AllocaInst *> &open, bool &cut) const {
+  V = V->stripPointerCasts();
+  if (auto *A = dyn_cast<Argument>(V))
+    return {(int)A->getArgNo(), {}, 0, true};
+  if (auto *G = dyn_cast<GEPOperator>(V)) {
+    Position p = positionOf(G->getPointerOperand(), open, cut);
+    const DataLayout &DL = dl;
+    APInt o(DL.getIndexTypeSizeInBits(G->getType()), 0);
+    if (p.root >= 0 && p.exact && G->accumulateConstantOffset(DL, o))
+      p.off += o.getSExtValue();
+    else
+      p.exact = false;
+    return p;
+  }
+  if (!V->getType()->isPointerTy())
+    return {};
+  if (auto *CB = dyn_cast<CallBase>(V)) {
+    // The callee returns a place of one of its formals: the same place
+    // seen from the argument.
+    auto *C = dyn_cast<Function>(CB->getCalledOperand()->stripPointerCasts());
+    Function *B = C ? (C->isDeclaration() ? body(C->getName().str()) : C) : nullptr;
+    if (!B || B->isDeclaration())
+      return {};
+    Position r = returnOf(B, cut);
+    if (r.root < 0 || (unsigned)r.root >= CB->arg_size())
+      return {r.root == -2 ? -2 : -1};
+    Position p = positionOf(CB->getArgOperand(r.root), open, cut);
+    if (p.root < 0)
+      return p;
+    if (r.path.empty()) {
+      p.off += r.off;
+      p.exact = p.exact && r.exact;
+      return p;
+    }
+    if (!p.exact)
+      return {};
+    p.path.push_back(p.off + r.path[0]);
+    p.path.insert(p.path.end(), r.path.begin() + 1, r.path.end());
+    p.off = r.off;
+    p.exact = r.exact;
+    return p;
+  }
+  auto *L = dyn_cast<LoadInst>(V);
+  if (!L)
+    return {};
+  Value *A = L->getPointerOperand()->stripPointerCasts();
+  auto *Al = dyn_cast<AllocaInst>(A);
+  if (Al && Al->getAllocatedType()->isPointerTy()) {
+    // A spill slot holds the position all its stores agree on.
+    if (!open.insert(Al).second)
+      return {-2};
+    std::vector<Position> vs;
+    for (User *U : Al->users()) {
+      auto *S = dyn_cast<StoreInst>(U);
+      if (S && S->getPointerOperand()->stripPointerCasts() == Al)
+        vs.push_back(positionOf(S->getValueOperand(), open, cut));
+    }
+    open.erase(Al);
+    return agreed(vs);
+  }
+  Position p = positionOf(A, open, cut);
+  if (p.root < 0 || !p.exact)
+    return {};
+  p.path.push_back(p.off);
+  p.off = 0;
+  return p;
+}
+
+// Where F's pointer result points, seen from its formals: the position all
+// its returns agree on. Kept only when no call being evaluated was met, so
+// the result does not depend on the order of the queries.
+Client::Position Client::returnOf(Function *F, bool &cut) const {
+  auto it = returnOfFn.find(F);
+  if (it != returnOfFn.end())
+    return it->second;
+  if (!returnOpen.insert(F).second) {
+    cut = true;
+    return {-2};
+  }
+  bool inner = false;
+  std::vector<Position> vs;
+  for (BasicBlock &BB : *F)
+    if (auto *R = dyn_cast<ReturnInst>(BB.getTerminator()))
+      if (Value *V = R->getReturnValue()) {
+        std::set<AllocaInst *> slots;
+        vs.push_back(positionOf(V, slots, inner));
+      }
+  returnOpen.erase(F);
+  Position r = agreed(vs);
+  if (r.root == -2)
+    r = {};
+  if (inner)
+    cut = true;
+  else
+    returnOfFn[F] = r;
+  return r;
+}
+
+// The string constants the text at path from formal i of F is compared
+// against with the C library's comparisons: where the text, or a pointer
+// into it, is an argument of a comparison, the constants among its other
+// arguments; where it, or an object on the way to it, is passed on to a
+// function the library defines, those of the text's place in the callee;
+// where it names a file the library opens, or it or an object holding it is
+// stored to memory other than a spill slot, the input file's name: what the
+// library compares it with later is unknown. Nearest first (breadth-first
+// from F), at most 32. The texts that meet none of these form one class,
+// which a fresh text represents, so the classes only refine the texts. They
+// are what the whole call can tell apart: the search does not stop at other
 // interface functions the way the attribution of effects does.
-const std::vector<std::string> &Client::compared(Function *F, unsigned i) const {
-  auto key = std::make_pair(F, i);
+//
+// A pointer at offset o of an object reaches the field at x of it only for
+// 0 <= o <= x, at x - o: the offsets only fall, so the places are finite.
+const std::vector<std::string> &Client::compared(Function *F, unsigned i, const std::vector<int64_t> &path) const {
+  TextPlace key{F, i, path};
   auto it = comparedOf.find(key);
   if (it != comparedOf.end())
     return it->second;
@@ -1038,23 +1161,48 @@ const std::vector<std::string> &Client::compared(Function *F, unsigned i) const 
                                          "bcmp",   "strstr",  "strcasestr", "strcoll"};
   static const std::set<std::string> open{"fopen", "fopen64", "freopen", "open", "open64", "openat", "creat",
                                           "stat",  "stat64",  "lstat",   "access"};
-  std::vector<std::pair<Function *, unsigned>> order{key};
-  std::set<std::pair<Function *, unsigned>> queued{key};
+  std::vector<TextPlace> order{key};
+  std::set<TextPlace> queued{key};
   std::vector<std::string> out;
   std::set<std::string> seen;
+  auto file = [&] {
+    if (seen.insert("f").second)
+      out.push_back("f");
+  };
   for (size_t q = 0; q < order.size() && out.size() < 32; ++q) {
-    auto [G, j] = order[q];
+    auto [G, j, P] = order[q];
+    // How V stands to the text: 0 it is the text or points into it, 1 it
+    // points into an object on the way, the text at rest from it; -1
+    // neither.
+    auto relate = [&](Value *V, std::vector<int64_t> &rest) -> int {
+      if (!V->getType()->isPointerTy())
+        return -1;
+      std::set<AllocaInst *> slots;
+      bool cut = false;
+      Position p = positionOf(V, slots, cut);
+      if (p.root != (int)j || p.path.size() > P.size() || !std::equal(p.path.begin(), p.path.end(), P.begin()))
+        return -1;
+      if (p.path.size() == P.size())
+        return 0;
+      int64_t x = P[p.path.size()];
+      if (!p.exact || p.off < 0 || p.off > x)
+        return -1;
+      rest.assign(P.begin() + p.path.size(), P.end());
+      rest[0] = x - p.off;
+      return 1;
+    };
     for (Instruction &I : instructions(*G)) {
-      // A text stored to memory other than a spill slot escapes this
-      // analysis: what the library compares it with later is unknown, so
-      // the environment's file name is one of its classes.
+      std::vector<int64_t> rest;
       if (auto *S = dyn_cast<StoreInst>(&I)) {
-        std::set<AllocaInst *> slots;
         auto *Al = dyn_cast<AllocaInst>(S->getPointerOperand()->stripPointerCasts());
         bool spill = Al && Al->getAllocatedType()->isPointerTy();
-        if (!spill && S->getValueOperand()->getType()->isPointerTy() && rootOf(S->getValueOperand(), slots) == (int)j &&
-            seen.insert("f").second)
-          out.push_back("f");
+        if (!spill && relate(S->getValueOperand(), rest) >= 0)
+          file();
+        continue;
+      }
+      if (auto *M = dyn_cast<MemTransferInst>(&I)) {
+        if (relate(M->getRawSource(), rest) == 1)
+          file();
         continue;
       }
       auto *CB = dyn_cast<CallBase>(&I);
@@ -1064,15 +1212,21 @@ const std::vector<std::string> &Client::compared(Function *F, unsigned i) const 
       bool isCmp = cmp.count(bareName(C->getName().str())) > 0;
       bool isOpen = open.count(bareName(C->getName().str())) > 0;
       Function *B = C->isDeclaration() ? body(C->getName().str()) : C;
+      bool follow = !isCmp && B && !B->isDeclaration();
       for (unsigned a = 0; a < CB->arg_size(); ++a) {
-        std::set<AllocaInst *> slots;
-        if (rootOf(CB->getArgOperand(a), slots) != (int)j)
+        int r = relate(CB->getArgOperand(a), rest);
+        if (r < 0)
           continue;
-        if (isOpen && seen.insert("f").second)
-          out.push_back("f");
+        if (r == 1) {
+          if (follow && a < B->arg_size() && queued.insert({B, a, rest}).second)
+            order.push_back({B, a, rest});
+          continue;
+        }
+        if (isOpen)
+          file();
         if (!isCmp) {
-          if (B && !B->isDeclaration() && a < B->arg_size() && queued.insert({B, a}).second)
-            order.push_back({B, a});
+          if (follow && a < B->arg_size() && queued.insert({B, a, {}}).second)
+            order.push_back({B, a, {}});
           continue;
         }
         for (unsigned b = 0; b < CB->arg_size(); ++b) {
@@ -2581,7 +2735,9 @@ void Client::emit(const Plan &P, Module &H) const {
   };
   // Val(tau), the values a client can hold of source type tau.
   //   V-Int     a scalar is any bit pattern;
-  //   V-Text    char* is a fresh text of at most L characters;
+  //   V-Text    char* is a text of at most L characters, one of each class
+  //             the call reading it can tell apart (compared), wherever
+  //             it lies: a formal or a field of an object the call reads;
   //   V-Fn      a function pointer is the most general callback of its type;
   //   V-Adt     a pointer to a type the interface constructs is a held handle;
   //   V-Obj     a pointer to a public type with pointer fields is one object
@@ -2632,8 +2788,31 @@ void Client::emit(const Plan &P, Module &H) const {
     return pointerMemo[T] = r;
   };
   std::vector<std::pair<std::string, Value *>> enclosing;
-  std::function<Value *(IRBuilder<> &, const DIType *, unsigned, bool)> pointer;
-  std::function<void(IRBuilder<> &, Value *, const DIType *, unsigned)> fields;
+  // Where a value the client builds is read by the call it is passed to:
+  // what formal i of F reaches through path, plus base for an object built
+  // in place. An aggregate the ABI splits into eightbytes is read as
+  // formals i, i+1, ...; F is null where no call reads it (a callback's
+  // result), and the texts there have no classes.
+  struct Where {
+    Function *F = nullptr;
+    unsigned i = 0;
+    std::vector<int64_t> path;
+    int64_t base = 0;
+    bool split = false;
+  };
+  // The place of the pointer at offset o of the object w describes.
+  auto fieldOf = [](const Where &w, int64_t o) -> Where {
+    int64_t at = w.base + o;
+    if (!w.F || (w.split && at % 8))
+      return {};
+    if (w.split)
+      return {w.F, w.i + (unsigned)(at / 8), {}, 0, false};
+    Where f{w.F, w.i, w.path, 0, false};
+    f.path.push_back(at);
+    return f;
+  };
+  std::function<Value *(IRBuilder<> &, const DIType *, unsigned, bool, const Where &)> pointer;
+  std::function<void(IRBuilder<> &, Value *, const DIType *, unsigned, const Where &)> fields;
   auto nullOr = [&](IRBuilder<> &C, bool nullable, const std::function<Value *(IRBuilder<> &)> &make) -> Value * {
     if (!nullable)
       return make(C);
@@ -2646,22 +2825,27 @@ void Client::emit(const Plan &P, Module &H) const {
   };
   // The pointer fields of the object of type T at address at, its bytes
   // already the client's.
-  fields = [&](IRBuilder<> &C, Value *at, const DIType *T, unsigned d) {
+  fields = [&](IRBuilder<> &C, Value *at, const DIType *T, unsigned d, const Where &w) {
     T = strip(T);
     if (!pointerIn(T))
       return;
     if (isPointer(T)) {
-      C.CreateStore(pointer(C, T, d, false), at);
+      C.CreateStore(pointer(C, T, d, false, fieldOf(w, 0)), at);
       return;
     }
     auto *S = def(T);
     if (!S)
       return;
+    auto inner = [&](int64_t o) {
+      Where v = w;
+      v.base += o;
+      return v;
+    };
     if (S->getTag() == dwarf::DW_TAG_array_type) {
       const DIType *E = S->getBaseType();
       uint64_t es = strip(E) ? strip(E)->getSizeInBits() / 8 : 0;
       for (uint64_t o = 0; es && o + es <= S->getSizeInBits() / 8; o += es)
-        fields(C, C.CreateGEP(C.getInt8Ty(), at, C.getInt64(o)), E, d);
+        fields(C, C.CreateGEP(C.getInt8Ty(), at, C.getInt64(o)), E, d, inner((int64_t)o));
       return;
     }
     std::string name = source::name(S);
@@ -2669,9 +2853,9 @@ void Client::emit(const Plan &P, Module &H) const {
       int64_t o = (int64_t)(M->getOffsetInBits() / 8);
       Value *f = D.CreateGEP(D.getInt8Ty(), at, D.getInt64(o));
       if (isPointer(strip(M->getBaseType())))
-        D.CreateStore(pointer(D, M->getBaseType(), d, nullFields.count({name, o}) > 0), f);
+        D.CreateStore(pointer(D, M->getBaseType(), d, nullFields.count({name, o}) > 0, fieldOf(w, o)), f);
       else
-        fields(D, f, M->getBaseType(), d);
+        fields(D, f, M->getBaseType(), d, inner(o));
     };
     if (S->getTag() == dwarf::DW_TAG_union_type) {
       // A union holds one member: the client picks which.
@@ -2707,7 +2891,7 @@ void Client::emit(const Plan &P, Module &H) const {
       }
     }
   };
-  pointer = [&](IRBuilder<> &C, const DIType *T, unsigned d, bool nullable) -> Value * {
+  pointer = [&](IRBuilder<> &C, const DIType *T, unsigned d, bool nullable, const Where &w) -> Value * {
     T = strip(T);
     const DIType *P = isPointer(T) ? strip(cast<DIDerivedType>(T)->getBaseType()) : nullptr;
     if (P && isa<DISubroutineType>(P)) {
@@ -2723,7 +2907,7 @@ void Client::emit(const Plan &P, Module &H) const {
       Function *cb = record ? K.callback(FT, R, [&, R](IRBuilder<> &D) {
         auto outer = std::move(enclosing);
         enclosing.clear();
-        Value *v = pointer(D, R, d, false);
+        Value *v = pointer(D, R, d, false, Where{});
         enclosing = std::move(outer);
         return v;
       })
@@ -2732,7 +2916,9 @@ void Client::emit(const Plan &P, Module &H) const {
     }
     if (auto *B = dyn_cast_or_null<DIBasicType>(P))
       if (B->getEncoding() == dwarf::DW_ATE_signed_char && B->getName() == "char")
-        return nullOr(C, nullable, [&](IRBuilder<> &D) { return K.text(D); });
+        return nullOr(C, nullable, [&](IRBuilder<> &D) {
+          return w.F ? K.text(D, compared(w.F, w.i, w.path)) : K.text(D);
+        });
     auto *S = def(P);
     std::string key = S ? typeKey(S) : "";
     bool record = S && S->getTag() != dwarf::DW_TAG_enumeration_type && S->getTag() != dwarf::DW_TAG_array_type;
@@ -2764,7 +2950,7 @@ void Client::emit(const Plan &P, Module &H) const {
     return nullOr(C, nullable, [&](IRBuilder<> &D) -> Value * {
       Value *o = K.object(D, P->getSizeInBits() / 8);
       enclosing.push_back({key, o});
-      fields(D, o, P, d - 1);
+      fields(D, o, P, d - 1, Where{w.F, w.i, w.path, 0, false});
       enclosing.pop_back();
       return o;
     });
@@ -2826,7 +3012,7 @@ void Client::emit(const Plan &P, Module &H) const {
         else {
           A = K.entryAlloca(C, ArrayType::get(C.getInt8Ty(), span));
           C.CreateCall(K.mkSym, {A, C.getInt64(span), C.CreateGlobalStringPtr("aggregate." + std::to_string(K.names++))});
-          fields(C, A, declared(at[i]), objectDepth);
+          fields(C, A, declared(at[i]), objectDepth, Where{F, i, {}, 0, !byval});
         }
         if (byval) {
           args.push_back(A);
@@ -2858,7 +3044,7 @@ void Client::emit(const Plan &P, Module &H) const {
             });
             break;
           }
-          v = pointer(C, declared(at[i]), objectDepth, nullable);
+          v = pointer(C, declared(at[i]), objectDepth, nullable, Where{F, i});
           break;
         case Kind::Text:
           // The format of a variadic function, or the one before a va_list,
@@ -2879,7 +3065,7 @@ void Client::emit(const Plan &P, Module &H) const {
           }
           auto dt = fnDecl.find({F, i});
           if (dt != fnDecl.end()) {
-            v = pointer(C, dt->second, objectDepth, nullable);
+            v = pointer(C, dt->second, objectDepth, nullable, Where{F, i});
             break;
           }
           Function *cb = K.callback(ct->second);
@@ -2897,7 +3083,7 @@ void Client::emit(const Plan &P, Module &H) const {
           break;
         }
         default:
-          v = at[i] >= 0 ? pointer(C, declared(at[i]), objectDepth, nullable)
+          v = at[i] >= 0 ? pointer(C, declared(at[i]), objectDepth, nullable, Where{F, i})
                          : nullOr(C, nullable, [&](IRBuilder<> &D) { return K.bytes(D, p.elem); });
           break;
         }
