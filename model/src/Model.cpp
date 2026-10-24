@@ -295,15 +295,67 @@ struct Witness {
 };
 
 // A run prints every sequence it tries and stops at the first satisfiable
-// one, so the witness is its last block.
+// one, so the witness is its last block. The atoms to discharge are the
+// entry formula (model lines). A model line with no fact is not an atom.
+// The may cell list is the formula only when this block has no model lines.
 Witness parseWitness(std::istream &st) {
   Witness w;
+  std::vector<Client::Cell> may, facts;
+  bool sawModel = false;
+  auto take = [](const std::string &s, std::vector<Client::Cell> &into) {
+    std::istringstream in(s);
+    std::string head, root, tok, last;
+    in >> head >> root;
+    std::string op;
+    auto bound = [](const std::string &t) {
+      return t == "ule" || t == "uge" || t == "ult" || t == "sle" || t == "sge";
+    };
+    std::vector<std::string> path;
+    while (in >> tok) {
+      if (tok == "unknown")
+        return;
+      if (tok == "=" || tok == "!=" || tok[0] == '<' || tok[0] == '>' || bound(tok)) {
+        op = tok;
+        break;
+      }
+      last = tok;
+      auto p = tok.rfind('+');
+      if (p != std::string::npos && p > 0)
+        path.push_back(tok.substr(0, p));
+    }
+    auto plus = last.rfind('+');
+    if (plus == std::string::npos || plus == 0 || op.empty())
+      return;
+    auto off = asI64(last.substr(plus + 1));
+    if (!off)
+      return;
+    Client::Cell c{last.substr(0, plus), *off, s};
+    if (root.rfind("arg", 0) == 0)
+      c.root = std::atoi(root.c_str() + 3);
+    c.path = std::move(path);
+    c.op = op;
+    while (in >> tok) {
+      if (tok == "file") {
+        c.file = true;
+        break;
+      }
+      if (bound(tok))
+        break;
+      if (tok.size() >= 2 && tok.front() == '"' && tok.back() == '"')
+        tok = tok.substr(1, tok.size() - 2);
+      c.values.push_back(tok);
+    }
+    into.push_back(std::move(c));
+  };
   for (std::string s; std::getline(st, s);) {
     std::istringstream in(s);
     std::string head;
     in >> head;
     if (head == "sequence") {
       w = Witness{};
+      may.clear();
+      facts.clear();
+      sawModel = false;
       std::string n, absent;
       in >> n >> absent;
       if (absent.empty())
@@ -318,48 +370,13 @@ Witness parseWitness(std::istream &st) {
       in >> name;
       w.seq.push_back(name);
     } else if (head == "cell") {
-      std::string root, tok, last;
-      std::vector<std::string> path;
-      in >> root;
-      std::string op;
-      while (in >> tok) {
-        if (tok == "=" || tok == "!=" || tok[0] == '<' || tok[0] == '>') {
-          op = tok;
-          break;
-        }
-        last = tok;
-        auto p = tok.rfind('+');
-        if (p != std::string::npos && p > 0)
-          path.push_back(tok.substr(0, p));
-      }
-      auto plus = last.rfind('+');
-      if (plus == std::string::npos || plus == 0)
-        continue;
-      auto off = asI64(last.substr(plus + 1));
-      if (!off)
-        continue;
-      Client::Cell c{last.substr(0, plus), *off, s};
-      if (root.rfind("arg", 0) == 0)
-        c.root = std::atoi(root.c_str() + 3);
-      c.path = path;
-      if (op == "=" || op == "!=") {
-        c.op = op;
-        // Values run to the end, or to "file", which marks the cell the
-        // input file is named or read through.
-        while (in >> tok) {
-          if (tok == "file") {
-            c.file = true;
-            break;
-          }
-          if (tok.size() >= 2 && tok.front() == '"' && tok.back() == '"')
-            tok = tok.substr(1, tok.size() - 2);
-          c.values.push_back(tok);
-        }
-      } else if (s.find(" file") != std::string::npos)
-        c.file = true;
-      w.phi.push_back(c);
+      take(s, may);
+    } else if (head == "model") {
+      sawModel = true;
+      take(s, facts);
     }
   }
+  w.phi = sawModel ? facts : may;
   if (w.seq.empty())
     w.index = -1;
   return w;

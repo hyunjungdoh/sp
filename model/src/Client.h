@@ -103,6 +103,9 @@ public:
     FnMap<std::vector<Cell>> files;
     std::vector<std::pair<Cell, std::vector<Function *>>> cellWriters;
     std::vector<Function *> writers;
+    // One line per witness: whether its library cells are discharged by at
+    // most four interface calls that are not the entry itself.
+    std::vector<std::string> verdicts;
     // Per producer of a held type, the calls that can establish the state
     // it reads before it can produce.
     std::map<std::pair<Function *, std::string>, std::vector<Function *>, FnOrder> deps;
@@ -258,6 +261,14 @@ private:
   bool callable(Function *F) const;
   std::vector<Function *> entries(Function *E) const;
   std::vector<Function *> writers(const Cell &c) const;
+  // Whether any defined function stores to the field (struct type, offset).
+  // A field no body writes is immutable after construction: its value is the
+  // one the library's own static data (a const table, a zeroed allocation)
+  // established, identical in every execution. The client neither can nor
+  // needs to set it, so it is not a client obligation.
+  bool everStored(const std::string &type, int64_t off) const;
+  mutable std::set<std::pair<std::string, int64_t>> storedFields;
+  mutable bool storedBuilt = false;
   static std::string abstractValue(Value *V);
   static std::string bareName(const std::string &n);
   static bool satisfies(const std::string &v, const Cell &c);

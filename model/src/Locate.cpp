@@ -766,14 +766,14 @@ void Model::propagateObject(Model::Mem &m, Function *F) const {
         if (auto *S = dyn_cast<StoreInst>(&I)) {
           auto *A = dyn_cast<AllocaInst>(S->getPointerOperand()->stripPointerCasts());
           Loc v;
-          if (A && objectLoc(m, S->getValueOperand(), v) && !m.slot.count(A)) {
+          if (A && cellLoc(m, S->getValueOperand(), v) && !m.slot.count(A)) {
             m.slot[A] = v;
             grew = true;
           }
           continue;
         }
         Loc v;
-        if (objectLoc(m, &I, v) && !m.loc.count(&I)) {
+        if (cellLoc(m, &I, v) && !m.loc.count(&I)) {
           m.loc[&I] = v;
           grew = true;
         }
@@ -930,6 +930,66 @@ bool Model::summarizes(Function *F, const std::vector<std::optional<Loc>> &args,
     stack.erase(key);
     cache[key] = ok;
     return ok;
+  }
+
+std::unordered_set<const BasicBlock *> Model::chosenPath(Function *F, const std::unordered_set<Instruction *> &goals) const {
+    std::unordered_set<const BasicBlock *> reach;
+    if (!F || F->isDeclaration() || goals.empty())
+      return reach;
+    std::vector<const BasicBlock *> stack;
+    std::unordered_set<const BasicBlock *> goalB;
+    for (Instruction *g : goals)
+      if (g && g->getFunction() == F) {
+        stack.push_back(g->getParent());
+        goalB.insert(g->getParent());
+      }
+    while (!stack.empty()) {
+      const BasicBlock *BB = stack.back();
+      stack.pop_back();
+      if (!BB || !reach.insert(BB).second)
+        continue;
+      for (const BasicBlock *P : predecessors(BB))
+        stack.push_back(P);
+    }
+    const BasicBlock *entry = &F->getEntryBlock();
+    if (!reach.count(entry) || goalB.empty())
+      return reach;
+    std::unordered_map<const BasicBlock *, const BasicBlock *> prev;
+    std::unordered_set<const BasicBlock *> seen;
+    std::queue<const BasicBlock *> q;
+    q.push(entry);
+    seen.insert(entry);
+    const BasicBlock *hit = nullptr;
+    while (!q.empty()) {
+      const BasicBlock *BB = q.front();
+      q.pop();
+      if (goalB.count(BB)) {
+        hit = BB;
+        break;
+      }
+      std::vector<const BasicBlock *> succs;
+      for (const BasicBlock *S : successors(BB))
+        if (reach.count(S))
+          succs.push_back(S);
+      std::sort(succs.begin(), succs.end(), [](const BasicBlock *A, const BasicBlock *B) { return A->getName() < B->getName(); });
+      for (const BasicBlock *S : succs) {
+        if (!seen.insert(S).second)
+          continue;
+        prev[S] = BB;
+        q.push(S);
+      }
+    }
+    if (!hit)
+      return reach;
+    std::unordered_set<const BasicBlock *> path;
+    for (const BasicBlock *BB = hit;;) {
+      path.insert(BB);
+      auto it = prev.find(BB);
+      if (it == prev.end())
+        break;
+      BB = it->second;
+    }
+    return path;
   }
 
 std::unordered_set<const BasicBlock *> Model::sliceReach(Function *F, const std::vector<Function *> &seq) const {

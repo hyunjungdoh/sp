@@ -725,19 +725,9 @@
                       bool enterCallee, Function *reachTo) {
         if (!F || F->isDeclaration() || goals.empty())
           return;
-        std::unordered_set<const BasicBlock *> reach;
-        std::vector<const BasicBlock *> stack;
-        for (Instruction *g : goals)
-          if (g)
-            stack.push_back(g->getParent());
-        while (!stack.empty()) {
-          const BasicBlock *BB = stack.back();
-          stack.pop_back();
-          if (!BB || !reach.insert(BB).second)
-            continue;
-          for (const BasicBlock *P : predecessors(BB))
-            stack.push_back(P);
-        }
+        // The branch condition of one path, not the intersection of every
+        // path that can still reach the goal.
+        auto reach = chosenPath(F, goals);
         Mem m;
         bindFormals(m, F, args);
         propagateObject(m, F);
@@ -1081,17 +1071,135 @@
       curStep = i;
       walk(seq[i], frames[i]);
     }
+    std::set<std::string> demandedFn;
+    for (const auto &kv : stepEdge)
+      for (const auto &cell : kv.second)
+        demandedFn.insert(cell.second.begin(), cell.second.end());
+    std::unordered_map<const Function *, char> demandedReach;
+    std::function<bool(Function *)> mayStoreDemanded = [&](Function *T) -> bool {
+      if (!T)
+        return false;
+      if (Function *D = define(T->getName()))
+        T = D;
+      if (!T || T->isDeclaration())
+        return false;
+      if (auto it = demandedReach.find(T); it != demandedReach.end())
+        return it->second == 2;
+      demandedReach[T] = 1;
+      bool yes = false;
+      for (Instruction &I : instructions(*T)) {
+        if (auto *S = dyn_cast<StoreInst>(&I)) {
+          if (auto *Fn = dyn_cast<Function>(S->getValueOperand()->stripPointerCasts())) {
+            if (Function *D = define(Fn->getName()))
+              Fn = D;
+            if (demandedFn.count(Fn->getName().str()))
+              yes = true;
+          }
+        }
+        if (yes)
+          break;
+        if (auto *CB = dyn_cast<CallBase>(&I)) {
+          Function *C = CB->getCalledFunction();
+          if (C) {
+            if (Function *D = define(C->getName()))
+              C = D;
+            if (C && !C->isDeclaration() && mayStoreDemanded(C))
+              yes = true;
+          } else {
+            for (Function *Tgt : targetsOf(CB))
+              if (mayStoreDemanded(Tgt))
+                yes = true;
+          }
+        }
+      }
+      demandedReach[T] = yes ? 2 : 0;
+      return yes;
+    };
     // A direct callee reached with the export object contributes its
     // constant stores. Its constant-offset reads set the object size.
     // A store through a loaded pointer writes the cell those bytes belong to.
     // The bundle still folds only constant-offset stores of the export object.
+    // The callee walk follows the call graph to find the stores inside one
+    // interface call. The graph has cycles; a function reached through a
+    // pointer whose spelling grows each turn around a cycle keeps producing
+    // a new `walked` signature, so signature dedup alone does not terminate.
+    // A function already active on the current path is its own ancestor: it
+    // is a recursive cycle, and re-entering walks the same body again, which
+    // adds no store the acyclic visit did not already record. Cutting the
+    // cycle leaves the walk acyclic over a finite graph, so it terminates.
+    std::set<Function *> onPath;
     std::function<void(Function *, const std::vector<std::optional<Loc>> &, Instruction *, bool)> noteCallee =
         [&](Function *F, const std::vector<std::optional<Loc>> &args, Instruction *anchor, bool callMust) {
+          if (!onPath.insert(F).second)
+            return;
+          struct PathGuard {
+            std::set<Function *> &s;
+            Function *f;
+            ~PathGuard() { s.erase(f); }
+          } pathGuard{onPath, F};
           Mem m;
           bindFormals(m, F, args);
           propagateObject(m, F);
+          // Uses are located by cellLoc, so a store defines a use only when it
+          // is named the same way. objectLoc drops the dereference mark a load
+          // leaves, and the store then misses the cell the use named.
           auto located = [&](Value *Ptr, Loc &cell) {
-            return objectLoc(m, Ptr, cell) && !cell.suf.empty();
+            return cellLoc(m, Ptr, cell) && !cell.suf.empty();
+          };
+          auto sameBytes = [](const Suffix &a, const Suffix &b) {
+            // An offset of zero does not move the address. A cast through an
+            // empty prefix, or the first field of an embedded struct, is that
+            // step. Its dereference belongs to the next byte offset.
+            auto norm = [](Suffix in) {
+              Suffix out;
+              for (size_t i = 0; i < in.size(); ++i) {
+                if (in[i].off == 0 && i + 1 < in.size()) {
+                  in[i + 1].deref = in[i + 1].deref || in[i].deref;
+                  continue;
+                }
+                out.push_back(in[i]);
+              }
+              return out;
+            };
+            Suffix x = norm(a), y = norm(b);
+            if (x.size() != y.size())
+              return false;
+            for (size_t i = 0; i < x.size(); ++i) {
+              if (x[i].off != y[i].off || x[i].deref != y[i].deref)
+                return false;
+              if (!x[i].deref && x[i].type != y[i].type)
+                return false;
+            }
+            return true;
+          };
+          // A use recorded on this sequence demands v at cell. A store of v on
+          // the call's return path defines that use, so the entry formula must
+          // not keep it. The store is emitted on the use's own suffix.
+          auto demandedAt = [&](const Loc &cell, const std::string &v, Loc &as) {
+            for (size_t k = curStep; k < seq.size(); ++k) {
+              for (const auto *tab : {&stepEq[k], &stepEdge[k]}) {
+                for (const auto &kv : *tab) {
+                  if (!kv.second.count(v) || kv.first.first != cell.arg || !sameBytes(kv.first.second, cell.suf))
+                    continue;
+                  as = cell;
+                  as.suf = kv.first.second;
+                  return true;
+                }
+              }
+            }
+            return false;
+          };
+          auto demanded = [&](const Loc &cell, const std::string &v) {
+            Loc as;
+            return demandedAt(cell, v, as);
+          };
+          auto wantStore = [&](const Loc &cell, const std::set<std::string> &vals, Loc &as) {
+            if (F == seq[curStep])
+              return false;
+            for (const std::string &v : vals)
+              if (demandedAt(cell, v, as))
+                return true;
+            return false;
           };
           auto grow = [&](Value *Ptr, uint64_t n) {
             Loc cell;
@@ -1107,7 +1215,125 @@
                 argExtent[cell.arg] = end;
             }
           };
+          // A sequence function is cut at the next call. A callee returns to
+          // that path, so every block that reaches a return can run before
+          // the caller continues. The shortest path to a return is often the
+          // error return, which is not the path that stores the demanded value.
           auto reach = sliceReach(F, seq);
+          if (F != seq[curStep]) {
+            std::unordered_set<const BasicBlock *> back;
+            std::vector<const BasicBlock *> st;
+            for (BasicBlock &BB : *F)
+              if (isa<ReturnInst>(BB.getTerminator()))
+                st.push_back(&BB);
+            while (!st.empty()) {
+              const BasicBlock *BB = st.back();
+              st.pop_back();
+              if (!BB || !back.insert(BB).second)
+                continue;
+              for (const BasicBlock *P : predecessors(BB))
+                st.push_back(P);
+            }
+            if (!back.empty())
+              reach = std::move(back);
+          }
+          // An allocated object published into a cell carries the constant
+          // and function stores of its fields. The first field step is a
+          // dereference: the cell holds the pointer, the field is in the
+          // object.
+          std::unordered_map<const Value *, const Value *> rootOf;
+          struct Graft {
+            Suffix steps;
+            std::set<std::string> vals;
+          };
+          std::unordered_map<const Value *, std::vector<Graft>> fields;
+          std::unordered_map<const Value *, Loc> published;
+          auto peel = [](Value *V) {
+            while (auto *C = dyn_cast<CastInst>(V))
+              V = C->getOperand(0);
+            return V;
+          };
+          auto asRoot = [&](Value *V) -> const Value * {
+            V = peel(V);
+            if (auto it = rootOf.find(V); it != rootOf.end())
+              return it->second;
+            if (auto *L = dyn_cast<LoadInst>(V)) {
+              if (auto *A = dyn_cast<AllocaInst>(peel(L->getPointerOperand())))
+                if (auto it = rootOf.find(A); it != rootOf.end())
+                  return it->second;
+            }
+            if (auto *CB = dyn_cast<CallBase>(V))
+              if (CB->getType()->isPointerTy())
+                return CB;
+            return nullptr;
+          };
+          auto fieldSteps = [&](Value *Ptr, const Value *&root, Suffix &steps) {
+            steps.clear();
+            std::vector<Step> rev;
+            std::unordered_set<const Value *> seen;
+            while (Ptr && seen.insert(Ptr).second) {
+              Ptr = peel(Ptr);
+              if (auto *G = dyn_cast<GEPOperator>(Ptr)) {
+                if (!G->hasAllConstantIndices())
+                  return false;
+                Step st;
+                if (!constStep(dl, G, st))
+                  return false;
+                if (movesAddress(st))
+                  rev.push_back(st);
+                Ptr = G->getPointerOperand();
+                continue;
+              }
+              root = asRoot(Ptr);
+              if (!root)
+                return false;
+              for (size_t i = rev.size(); i-- > 0;)
+                steps.push_back(rev[i]);
+              return !steps.empty();
+            }
+            return false;
+          };
+          auto graftLoc = [&](const Loc &base, const Suffix &steps, Loc &out) {
+            out = base;
+            bool first = true;
+            for (Step st : steps) {
+              if (first) {
+                st.deref = true;
+                first = false;
+              }
+              out.suf.push_back(st);
+            }
+          };
+          auto emitKilling = [&](Instruction *At, const Loc &cell, const std::set<std::string> &vals) {
+            Loc as = cell;
+            if (!wantStore(cell, vals, as))
+              return;
+            cells.insert({as.arg, as.suf});
+            Ev ev;
+            ev.at = At;
+            ev.fn = F;
+            ev.anchor = anchor;
+            // The use demands this value, so the witness is a path through
+            // the store. Domination of every return is a different question.
+            ev.callMust = true;
+            ev.mustExit = dominatesReturns(At);
+            ev.kind = 's';
+            ev.cell = {as.arg, as.suf};
+            ev.vals = vals;
+            for (const std::string &v : vals)
+              stepStore[curStep][{as.arg, as.suf}].insert(v);
+            stepEv[curStep].push_back(std::move(ev));
+          };
+          auto emitGrafts = [&](Instruction *At, const Value *root, const Loc &base) {
+            auto it = fields.find(root);
+            if (it == fields.end())
+              return;
+            for (const Graft &g : it->second) {
+              Loc cell;
+              graftLoc(base, g.steps, cell);
+              emitKilling(At, cell, g.vals);
+            }
+          };
           for (Instruction &I : instructions(*F)) {
             if (!reach.count(I.getParent()))
               continue;
@@ -1128,16 +1354,80 @@
                   seqStore[{cell.arg, cell.suf}].insert(dec(CI));
                   stepStore[curStep][{cell.arg, cell.suf}].insert(dec(CI));
                   ev.vals.insert(dec(CI));
-                  if (F != seq[curStep])
+                  Loc as;
+                  if (wantStore(cell, ev.vals, as)) {
+                    ev.cell = {as.arg, as.suf};
+                    ev.callMust = true;
                     stepEv[curStep].push_back(std::move(ev));
+                  }
+                } else if (auto *Sel = dyn_cast<SelectInst>(S->getValueOperand())) {
+                  // store (select cmp, c1, c2) kills the cell with the arm a
+                  // later use demands, and conjoins that comparison. The other
+                  // arm is a different path.
+                  auto *T = dyn_cast<ConstantInt>(Sel->getTrueValue());
+                  auto *Fv = dyn_cast<ConstantInt>(Sel->getFalseValue());
+                  auto *Cmp = dyn_cast<ICmpInst>(Sel->getCondition());
+                  if (T && Fv && Cmp) {
+                    std::string tv = dec(T), fv = dec(Fv);
+                    bool wantT = demanded(cell, tv), wantF = demanded(cell, fv);
+                    if (wantT != wantF) {
+                      Value *lhs = Cmp->getOperand(0);
+                      Value *rhs = Cmp->getOperand(1);
+                      while (auto *C = dyn_cast<CastInst>(lhs))
+                        lhs = C->getOperand(0);
+                      while (auto *C = dyn_cast<CastInst>(rhs))
+                        rhs = C->getOperand(0);
+                      Loc cond;
+                      ConstantInt *ck = nullptr;
+                      bool left = false;
+                      auto side = [&](Value *loadSide, Value *constSide, bool ldLeft) {
+                        auto *Ld = dyn_cast<LoadInst>(loadSide);
+                        if (!Ld || !isa<ConstantInt>(constSide) || !located(Ld->getPointerOperand(), cond))
+                          return false;
+                        ck = cast<ConstantInt>(constSide);
+                        left = ldLeft;
+                        return true;
+                      };
+                      if (side(lhs, rhs, true) || side(rhs, lhs, false)) {
+                        auto pred = Cmp->getPredicate();
+                        if (!wantT)
+                          pred = Cmp->getInversePredicate();
+                        if (!left)
+                          pred = ICmpInst::getSwappedPredicate(pred);
+                        Ev br;
+                        br.at = Cmp;
+                        br.fn = F;
+                        br.anchor = anchor;
+                        br.callMust = callMust;
+                        br.mustExit = dominatesReturns(Cmp);
+                        br.cell = {cond.arg, cond.suf};
+                        br.vals.insert(dec(ck));
+                        br.pred = (int)pred;
+                        if (auto *IT = dyn_cast<IntegerType>(Cmp->getOperand(0)->getType()))
+                          br.bits = IT->getBitWidth();
+                        br.kind = pred == ICmpInst::ICMP_EQ ? 'e' : pred == ICmpInst::ICMP_NE ? 'n' : 'r';
+                        cells.insert(br.cell);
+                        stepEv[curStep].push_back(std::move(br));
+                        ev.vals.insert(wantT ? tv : fv);
+                        ev.callMust = true;
+                        br.callMust = true;
+                        stepStore[curStep][{cell.arg, cell.suf}].insert(*ev.vals.begin());
+                        stepEv[curStep].push_back(std::move(ev));
+                      }
+                    }
+                  }
                 } else if (auto *Fn = dyn_cast<Function>(S->getValueOperand()->stripPointerCasts())) {
                   if (Function *D = define(Fn->getName()))
                     Fn = D;
                   if (!Fn->isDeclaration()) {
                     stepStore[curStep][{cell.arg, cell.suf}].insert(Fn->getName().str());
                     ev.vals.insert(Fn->getName().str());
-                    if (F != seq[curStep])
+                    Loc as;
+                    if (wantStore(cell, ev.vals, as)) {
+                      ev.cell = {as.arg, as.suf};
+                      ev.callMust = true;
                       stepEv[curStep].push_back(std::move(ev));
+                    }
                   }
                 } else if (auto *Ld = dyn_cast<LoadInst>(S->getValueOperand()->stripPointerCasts())) {
                   Loc src;
@@ -1147,6 +1437,38 @@
                     ev.src = {src.arg, src.suf};
                     if (F != seq[curStep])
                       stepEv[curStep].push_back(std::move(ev));
+                  }
+                }
+              }
+              if (const Value *root = asRoot(S->getValueOperand())) {
+                Value *dst = peel(S->getPointerOperand());
+                if (auto *A = dyn_cast<AllocaInst>(dst))
+                  rootOf[A] = root;
+                else {
+                  Loc base;
+                  if (located(S->getPointerOperand(), base)) {
+                    published[root] = base;
+                    emitGrafts(S, root, base);
+                  }
+                }
+              } else {
+                const Value *fieldRoot = nullptr;
+                Suffix steps;
+                std::set<std::string> vals;
+                if (auto *CI = dyn_cast<ConstantInt>(S->getValueOperand()))
+                  vals.insert(dec(CI));
+                else if (auto *Fn = dyn_cast<Function>(S->getValueOperand()->stripPointerCasts())) {
+                  if (Function *D = define(Fn->getName()))
+                    Fn = D;
+                  if (!Fn->isDeclaration())
+                    vals.insert(Fn->getName().str());
+                }
+                if (!vals.empty() && fieldSteps(S->getPointerOperand(), fieldRoot, steps)) {
+                  fields[fieldRoot].push_back(Graft{steps, vals});
+                  if (auto it = published.find(fieldRoot); it != published.end()) {
+                    Loc gcell;
+                    graftLoc(it->second, steps, gcell);
+                    emitKilling(S, gcell, vals);
                   }
                 }
               }
@@ -1180,18 +1502,21 @@
                 }
               }
               Function *C = CB->getCalledFunction();
+              if (C)
+                if (Function *D = define(C->getName()))
+                  C = D;
               if (C && !C->isDeclaration()) {
                 std::vector<std::optional<Loc>> downArgs;
                 bool touch = false;
                 for (Value *Op : CB->args()) {
                   Loc L;
-                  if (objectLoc(m, Op, L)) {
+                  if (cellLoc(m, Op, L)) {
                     downArgs.push_back(L);
                     touch = true;
                   } else
                     downArgs.push_back(std::nullopt);
                 }
-                if (touch) {
+                  if (touch) {
                   std::string sg = C->getName().str();
                   for (const auto &a : downArgs) {
                     sg.push_back('|');
@@ -1211,6 +1536,46 @@
                 }
               }
               if (!C) {
+                // An indirect call reaches the target whose body stores a
+                // function the later use demands. The same test applies in a
+                // callee: the store is not required to sit in the sequence
+                // function itself. Other targets of the type do not define it.
+                for (Function *T : targetsOf(CB)) {
+                  if (!mayStoreDemanded(T))
+                    continue;
+                  if (Function *D = define(T->getName()))
+                    T = D;
+                  if (!T || T->isDeclaration())
+                    continue;
+                  std::vector<std::optional<Loc>> downArgs;
+                  bool touch = false;
+                  for (Value *Op : CB->args()) {
+                    Loc L;
+                    if (cellLoc(m, Op, L)) {
+                      downArgs.push_back(L);
+                      touch = true;
+                    } else
+                      downArgs.push_back(std::nullopt);
+                  }
+                  if (!touch)
+                    continue;
+                  std::string sg = T->getName().str();
+                  for (const auto &a : downArgs) {
+                    sg.push_back('|');
+                    if (!a) {
+                      sg.push_back('-');
+                      continue;
+                    }
+                    sg += std::to_string(a->arg);
+                    for (const Step &st : a->suf)
+                      sg += ":" + st.type + "+" + std::to_string(st.off);
+                  }
+                  if (!walked.insert(sg).second)
+                    continue;
+                  Instruction *useAnchor = F == seq[curStep] ? CB : anchor;
+                  if (useAnchor)
+                    noteCallee(T, downArgs, useAnchor, true);
+                }
                 Read rd = asRead(*CB);
                 Loc cell;
                 if (rd.ok && noBody(CB) && located(CB->getCalledOperand(), cell) && cells.count({cell.arg, cell.suf})) {

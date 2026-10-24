@@ -1,7 +1,0 @@
-/home/guswjd/sp/model/build-asan0/CMakeFiles/intrinsics_gen.dir
-/home/guswjd/sp/model/build-asan0/CMakeFiles/omp_gen.dir
-/home/guswjd/sp/model/build-asan0/CMakeFiles/acc_gen.dir
-/home/guswjd/sp/model/build-asan0/CMakeFiles/RISCVTargetParserTableGen.dir
-/home/guswjd/sp/model/build-asan0/CMakeFiles/model.dir
-/home/guswjd/sp/model/build-asan0/CMakeFiles/edit_cache.dir
-/home/guswjd/sp/model/build-asan0/CMakeFiles/rebuild_cache.dir

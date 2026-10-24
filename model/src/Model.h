@@ -856,6 +856,12 @@ class Model {
   // the sequence and has no return contributes no block.
   std::unordered_set<const BasicBlock *> sliceReach(Function *F, const std::vector<Function *> &seq) const;
 
+  // One simple path from the entry to a goal instruction, inside the blocks
+  // that can reach a goal. At a branch every successor that reaches a goal
+  // is eligible; the shortest such path is chosen, with the earlier block
+  // name breaking ties. The witness formula is the condition of this path.
+  std::unordered_set<const BasicBlock *> chosenPath(Function *F, const std::unordered_set<Instruction *> &goals) const;
+
 
   bool solve(const std::vector<Function *> &seq, raw_ostream &out);
 

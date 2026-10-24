@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/home/guswjd/sp/model/build-asan0/cmake_install.cmake"
-	],
-	"Parallel" : false
-}

@@ -27,6 +27,7 @@
 #include "llvm/IR/DebugInfoMetadata.h"
 
 #include <cstdio>
+#include <functional>
 #include <sstream>
 
 namespace {
@@ -2113,6 +2114,16 @@ std::vector<Function *> Client::writers(const Cell &c) const {
   return out;
 }
 
+bool Client::everStored(const std::string &type, int64_t off) const {
+  if (!storedBuilt) {
+    for (const auto &kv : stores)
+      for (const auto &s : kv.second)
+        storedFields.insert(s.first);
+    storedBuilt = true;
+  }
+  return storedFields.count({type, off}) > 0;
+}
+
 const char *Client::kindName(Kind k) {
   switch (k) {
   case Kind::Scalar:
@@ -2362,6 +2373,116 @@ Client::Plan Client::plan(const std::vector<std::pair<std::vector<std::string>, 
       P.cellWriters.push_back({c, w});
       writerSet.insert(w.begin(), w.end());
     }
+    // This witness alone. A call discharges a cell when it is an interface
+    // function other than the witness entry and its closure stores the
+    // cell's value. The entry's own stores are already substituted by the
+    // path condition; a cell only the entry stores is not a prefix.
+    {
+      std::vector<std::pair<Cell, std::vector<Function *>>> local;
+      Function *entry = es.empty() ? nullptr : es[0];
+      for (const Cell &c : phi) {
+        if (c.type.empty() || c.op.empty())
+          continue;
+        bool own = es.size() == 1 && es[0] == E && c.root >= 0 && (size_t)c.root < atE.size() && atE[c.root] >= 0 &&
+                   sigE[atE[c.root]].kind == Kind::Object;
+        for (const std::string &t : c.path)
+          own = own && isPublic(irName(t));
+        if (own)
+          continue;
+        // A bound or a relation between two cells is an entry obligation.
+        // A store of some other value does not discharge it.
+        std::vector<Function *> ww;
+        if (c.op != "=" && c.op != "!=") {
+          local.push_back({c, ww});
+          continue;
+        }
+        for (Function *W : writers(c)) {
+          if (W == entry || !ifaceD.count(W))
+            continue;
+          bool share = true;
+          if (c.root >= 0 && (size_t)c.root < sigE.size() && held(sigE[c.root])) {
+            share = false;
+            for (const Param &p : signature(W))
+              share = share || (held(p) && p.type == sigE[c.root].type);
+          }
+          if (share)
+            ww.push_back(W);
+        }
+        local.push_back({c, ww});
+      }
+      int uncovered = 0;
+      int construct = 0;
+      std::string openCells;
+      std::vector<Function *> cand;
+      std::vector<int> need;
+      for (size_t i = 0; i < local.size(); ++i) {
+        if (local[i].second.empty()) {
+          // A field no defined function writes is set only by the library's
+          // static initialization. The necessary condition the model read
+          // along the path is that fixed value, the same in every execution,
+          // so it is established by construction, not by a client call.
+          if (!everStored(local[i].first.type, local[i].first.off)) {
+            ++construct;
+            continue;
+          }
+          ++uncovered;
+          openCells += " " + local[i].first.type + "+" + std::to_string(local[i].first.off);
+          continue;
+        }
+        need.push_back((int)i);
+        for (Function *W : local[i].second)
+          if (std::find(cand.begin(), cand.end(), W) == cand.end())
+            cand.push_back(W);
+      }
+      std::sort(cand.begin(), cand.end(), [](Function *A, Function *B) { return A->getName() < B->getName(); });
+      std::vector<Function *> word;
+      if (!need.empty()) {
+        std::vector<int> left = need;
+        for (int n = 0; n < 4 && !left.empty(); ++n) {
+          Function *best = nullptr;
+          int got = -1;
+          for (Function *C : cand) {
+            int ncover = 0;
+            for (int i : left)
+              for (Function *W : local[i].second)
+                ncover += W == C;
+            if (ncover > got) {
+              got = ncover;
+              best = C;
+            }
+          }
+          if (!best || got <= 0)
+            break;
+          word.push_back(best);
+          std::vector<int> rest;
+          for (int i : left) {
+            bool hit = false;
+            for (Function *W : local[i].second)
+              hit = hit || W == best;
+            if (!hit)
+              rest.push_back(i);
+          }
+          left.swap(rest);
+        }
+        if (!left.empty())
+          word.clear();
+      }
+      bool inI = entry && ifaceD.count(entry);
+      int calls = (int)word.size() + (inI ? 1 : 0);
+      bool pass = inI && uncovered == 0 && (need.empty() || !word.empty()) && calls <= 5;
+      std::string line = std::string("result ") + (pass ? "pass" : "open");
+      line += " iface " + std::to_string(inI ? 1 : 0);
+      line += " lib " + std::to_string(local.size());
+      line += " uncovered " + std::to_string(uncovered);
+      line += " construct " + std::to_string(construct);
+      line += " calls " + std::to_string(calls);
+      for (Function *W : word)
+        line += " " + W->getName().str();
+      if (entry)
+        line += " " + entry->getName().str();
+      line += openCells;
+      P.verdicts.push_back(line);
+    }
   }
   // A witness that starts elsewhere constrains nothing at this entry: it is
   // an alternative with no configuration and no guard.
@@ -2471,6 +2592,8 @@ void Client::report(const Plan &P, raw_ostream &out) const {
     out << "\n";
   }
   out << "writers " << P.writers.size() << "\n";
+  for (const std::string &v : P.verdicts)
+    out << v << "\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -2812,6 +2935,15 @@ void Client::emit(const Plan &P, Module &H) const {
     return f;
   };
   std::function<Value *(IRBuilder<> &, const DIType *, unsigned, bool, const Where &)> pointer;
+  // The allowed set is empty. Null is a value only where the library
+  // compares the pointer with null; otherwise no client execution passes
+  // it, and the path ends.
+  auto empty = [&](IRBuilder<> &C, bool nullable) -> Value * {
+    if (nullable)
+      return ConstantPointerNull::get(p0);
+    K.require(C, C.getFalse());
+    return ConstantPointerNull::get(p0);
+  };
   std::function<void(IRBuilder<> &, Value *, const DIType *, unsigned, const Where &)> fields;
   auto nullOr = [&](IRBuilder<> &C, bool nullable, const std::function<Value *(IRBuilder<> &)> &make) -> Value * {
     if (!nullable)
@@ -2897,7 +3029,7 @@ void Client::emit(const Plan &P, Module &H) const {
     if (P && isa<DISubroutineType>(P)) {
       FunctionType *FT = fnTypeOf(T);
       if (!FT)
-        return ConstantPointerNull::get(p0);
+        return empty(C, nullable);
       auto rs = cast<DISubroutineType>(P)->getTypeArray();
       const DIType *R = rs.size() ? strip(rs[0]) : nullptr;
       auto *RC = R && isPointer(R) ? def(cast<DIDerivedType>(R)->getBaseType()) : nullptr;
@@ -2923,17 +3055,16 @@ void Client::emit(const Plan &P, Module &H) const {
     std::string key = S ? typeKey(S) : "";
     bool record = S && S->getTag() != dwarf::DW_TAG_enumeration_type && S->getTag() != dwarf::DW_TAG_array_type;
     if (record && constructed.count(key)) {
-      // V-Adt: a held handle; a type the client cannot construct has none.
-      bool got = cost.count(key) > 0;
-      return nullOr(C, nullable && got, [&](IRBuilder<> &D) {
-        return got ? obtain(D, key) : (Value *)ConstantPointerNull::get(p0);
-      });
+      // V-Adt: a held handle. One the client cannot construct is no value.
+      if (!cost.count(key))
+        return empty(C, nullable);
+      return nullOr(C, nullable, [&](IRBuilder<> &D) { return obtain(D, key); });
     }
-    if (record && (key.empty() ? S->isForwardDecl() : !isPublic(key)))
-      return ConstantPointerNull::get(p0);
+    // V-Opaque, and a class whose vptr only a constructor writes: the
+    // client has no object of this type.
     int ptrs = pointerIn(P);
-    if (ptrs == 2)
-      return ConstantPointerNull::get(p0);
+    if ((record && (key.empty() ? S->isForwardDecl() : !isPublic(key))) || ptrs == 2)
+      return empty(C, nullable);
     if (!ptrs) {
       uint64_t elem = P ? std::max<uint64_t>(1, P->getSizeInBits() / 8) : 1;
       return nullOr(C, nullable, [&](IRBuilder<> &D) { return K.bytes(D, elem); });
@@ -2942,10 +3073,7 @@ void Client::emit(const Plan &P, Module &H) const {
       for (auto it = enclosing.rbegin(); it != enclosing.rend(); ++it)
         if (it->first == key)
           return it->second;
-      if (nullable)
-        return ConstantPointerNull::get(p0);
-      K.require(C, C.getFalse());
-      return ConstantPointerNull::get(p0);
+      return empty(C, nullable);
     }
     return nullOr(C, nullable, [&](IRBuilder<> &D) -> Value * {
       Value *o = K.object(D, P->getSizeInBits() / 8);
@@ -3038,10 +3166,10 @@ void Client::emit(const Plan &P, Module &H) const {
         case Kind::Handle:
         case Kind::Object:
           if (held(p) || p.kind == Kind::Handle) {
-            bool got = cost.count(p.type) > 0;
-            v = nullOr(C, nullable && got, [&](IRBuilder<> &D) {
-              return got ? obtain(D, p.type) : (Value *)ConstantPointerNull::get(p0);
-            });
+            if (!cost.count(p.type))
+              v = empty(C, nullable);
+            else
+              v = nullOr(C, nullable, [&](IRBuilder<> &D) { return obtain(D, p.type); });
             break;
           }
           v = pointer(C, declared(at[i]), objectDepth, nullable, Where{F, i});
@@ -3060,7 +3188,7 @@ void Client::emit(const Plan &P, Module &H) const {
         case Kind::Callback: {
           auto ct = fnTypes.find({F, i});
           if (ct == fnTypes.end()) {
-            v = ConstantPointerNull::get(p0);
+            v = empty(C, nullable);
             break;
           }
           auto dt = fnDecl.find({F, i});

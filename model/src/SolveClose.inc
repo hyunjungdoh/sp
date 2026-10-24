@@ -1762,6 +1762,86 @@
       }
       if (goals.empty())
         continue;
+      std::unordered_set<Instruction *> gset(goals.begin(), goals.end());
+      auto blocks = chosenPath(SF, gset);
+      // The shortest path is one witness, not the only one. A demanded store
+      // whose call can reach the goal lies on another path from the entry to
+      // the same goal. That path is the witness for the cell the store writes.
+      std::unordered_set<const BasicBlock *> fromEntry;
+      if (!SF->isDeclaration()) {
+        std::vector<const BasicBlock *> walk{&SF->getEntryBlock()};
+        while (!walk.empty()) {
+          const BasicBlock *BB = walk.back();
+          walk.pop_back();
+          if (!BB || !fromEntry.insert(BB).second)
+            continue;
+          for (const BasicBlock *S : successors(BB))
+            walk.push_back(S);
+        }
+      }
+      auto reachesGoal = [&](Instruction *I, Instruction *G) {
+        if (!I || !G || I->getFunction() != G->getFunction())
+          return false;
+        if (!fromEntry.count(I->getParent()))
+          return false;
+        if (I->getParent() == G->getParent()) {
+          for (Instruction &J : *I->getParent()) {
+            if (&J == G)
+              return false;
+            if (&J == I)
+              return true;
+          }
+          return false;
+        }
+        std::unordered_set<const BasicBlock *> seen;
+        std::vector<const BasicBlock *> st{G->getParent()};
+        while (!st.empty()) {
+          const BasicBlock *BB = st.back();
+          st.pop_back();
+          if (!BB || !seen.insert(BB).second)
+            continue;
+          if (BB == I->getParent())
+            return true;
+          for (const BasicBlock *P : predecessors(BB))
+            st.push_back(P);
+        }
+        return false;
+      };
+      // An event is on the witness when its instruction lies on the chosen
+      // path and executes before the goal. Domination would keep only the
+      // facts common to every path, which is how a store on this path was
+      // left as an entry obligation.
+      auto beforeGoal = [&](Instruction *I, Instruction *G) {
+        if (!I || !G || I->getFunction() != G->getFunction())
+          return false;
+        if (I == G)
+          return true;
+        if (blocks.empty() || !blocks.count(I->getParent()) || !blocks.count(G->getParent()))
+          return dominatesBefore(I, G);
+        if (I->getParent() == G->getParent()) {
+          for (Instruction &J : *I->getParent()) {
+            if (&J == G)
+              return false;
+            if (&J == I)
+              return true;
+          }
+          return false;
+        }
+        std::unordered_set<const BasicBlock *> seen;
+        std::vector<const BasicBlock *> st{G->getParent()};
+        while (!st.empty()) {
+          const BasicBlock *BB = st.back();
+          st.pop_back();
+          if (!BB || !seen.insert(BB).second)
+            continue;
+          if (BB == I->getParent())
+            return true;
+          for (const BasicBlock *P : predecessors(BB))
+            if (blocks.count(P))
+              st.push_back(P);
+        }
+        return false;
+      };
       std::vector<const Ev *> kept;
       for (const Ev &e : stepEv[si]) {
         if (!e.at)
@@ -1774,9 +1854,12 @@
           }
           bool seqEv = e.fn == SF || !e.anchor;
           if (seqEv) {
-            if (!dominatesBefore(e.at, goal))
+            if (!beforeGoal(e.at, goal))
               all = false;
-          } else if (!(e.callMust && e.mustExit && dominatesBefore(e.anchor, goal)))
+          } else if (!(e.callMust && e.anchor &&
+                       (beforeGoal(e.anchor, goal) ||
+                        ((e.kind == 's' || e.kind == 'e' || e.kind == 'n' || e.kind == 'r') &&
+                         reachesGoal(e.anchor, goal)))))
             all = false;
           if (!all)
             break;
@@ -1923,9 +2006,12 @@
         boundConst(L.na, L.pred, nb.val, L.bytes);
         continue;
       }
+      // The witness formula is the value at entry of the sequence. A store on
+      // the path replaces the cell, so a use after that store constrains the
+      // stored value and is not an obligation on the client.
       auto onEntry = [&](const Cell &c, int id) {
-        auto it = residNode.find(c);
-        return it != residNode.end() && it->second == id;
+        auto it = entry.find(c);
+        return it != entry.end() && it->second == id;
       };
       if (!onEntry(L.a, L.na) || !onEntry(L.b, L.nb))
         continue;
@@ -1943,12 +2029,8 @@
       writeCell(L.b);
       out << "\n";
     }
-    for (const auto &kv : entry) {
-      int id = kv.second;
-      if (auto it = residNode.find(kv.first); it != residNode.end())
-        id = it->second;
-      mem[kv.first] = readNode(nodes, find, id);
-    }
+    for (const auto &kv : entry)
+      mem[kv.first] = readNode(nodes, find, kv.second);
     for (Solved &s : solvedCells) {
       auto it = mem.find({s.arg, s.suf});
       if (it == mem.end()) {
@@ -2027,6 +2109,605 @@
       out << "model";
       writeCell(c);
       out << " unknown\n";
+    }
+    // A library cell still in the entry formula is defined, when it is, by an
+    // earlier interface call. The call that stores it under a switch on one
+    // of its integer arguments has that argument as the tag and, when the
+    // stored bits are the caller's variadic value, that value as the client
+    // atom. The cell is then the image of those arguments, not an obligation
+    // the client writes by hand.
+    if (!tr.conflict) {
+      auto oneFormal = [&](Value *V) -> Argument * {
+        std::vector<Value *> st{V};
+        std::unordered_set<const Value *> seen;
+        std::unordered_set<Argument *> args;
+        while (!st.empty()) {
+          Value *X = st.back();
+          st.pop_back();
+          if (!X || !seen.insert(X).second)
+            continue;
+          if (auto *A = dyn_cast<Argument>(X->stripPointerCasts())) {
+            args.insert(A);
+            continue;
+          }
+          if (auto *C = dyn_cast<CastInst>(X)) {
+            st.push_back(C->getOperand(0));
+            continue;
+          }
+          if (auto *P = dyn_cast<PHINode>(X)) {
+            for (Value *in : P->incoming_values())
+              st.push_back(in);
+            continue;
+          }
+          if (auto *L = dyn_cast<LoadInst>(X)) {
+            auto *Al = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts());
+            if (!Al)
+              continue;
+            for (User *U : Al->users()) {
+              auto *S = dyn_cast<StoreInst>(U);
+              if (S && S->getPointerOperand()->stripPointerCasts() == Al)
+                st.push_back(S->getValueOperand());
+            }
+            continue;
+          }
+          if (auto *G = dyn_cast<GEPOperator>(X))
+            st.push_back(G->getPointerOperand());
+        }
+        return args.size() == 1 ? *args.begin() : nullptr;
+      };
+      auto viaVa = [](Value *V) {
+        std::vector<Value *> st{V};
+        std::unordered_set<const Value *> seen;
+        while (!st.empty()) {
+          Value *X = st.back();
+          st.pop_back();
+          if (!X || !seen.insert(X).second)
+            continue;
+          if (auto *C = dyn_cast<CastInst>(X)) {
+            st.push_back(C->getOperand(0));
+            continue;
+          }
+          if (auto *P = dyn_cast<PHINode>(X)) {
+            for (Value *in : P->incoming_values())
+              st.push_back(in);
+            continue;
+          }
+          if (auto *L = dyn_cast<LoadInst>(X)) {
+            auto *Al = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts());
+            if (Al) {
+              for (User *U : Al->users()) {
+                auto *St = dyn_cast<StoreInst>(U);
+                if (St && St->getPointerOperand()->stripPointerCasts() == Al)
+                  st.push_back(St->getValueOperand());
+              }
+              continue;
+            }
+            st.push_back(L->getPointerOperand());
+            continue;
+          }
+          if (auto *A = dyn_cast<AllocaInst>(X)) {
+            for (User *U : A->users()) {
+              auto *St = dyn_cast<StoreInst>(U);
+              if (St && St->getPointerOperand()->stripPointerCasts() == A)
+                st.push_back(St->getValueOperand());
+            }
+            continue;
+          }
+          if (auto *G = dyn_cast<GEPOperator>(X)) {
+            std::string ty;
+            raw_string_ostream os(ty);
+            G->getSourceElementType()->print(os);
+            if (ty.find("va_list") != std::string::npos)
+              return true;
+            st.push_back(G->getPointerOperand());
+          }
+        }
+        return false;
+      };
+      auto callsFn = [&](CallBase *CB, Function *callee) {
+        if (Function *C = CB->getCalledFunction()) {
+          if (Function *D = define(C->getName()))
+            C = D;
+          return C == callee;
+        }
+        for (Function *T : targetsOf(CB))
+          if (T == callee)
+            return true;
+        return false;
+      };
+      auto liftArg = [&](Function *caller, Function *callee, Argument *a) -> Argument * {
+        if (!a)
+          return nullptr;
+        for (Instruction &I : instructions(*caller)) {
+          auto *CB = dyn_cast<CallBase>(&I);
+          if (!CB || a->getArgNo() >= CB->arg_size() || !callsFn(CB, callee))
+            continue;
+          Argument *up = oneFormal(CB->getArgOperand(a->getArgNo()));
+          if (up && up->getParent() == caller)
+            return up;
+        }
+        return nullptr;
+      };
+      for (const auto &kv : mem) {
+        const SlotVal &fact = kv.second;
+        if (inRel(kv.first))
+          continue;
+        if (!fact.known && fact.any.empty() && fact.ban.empty() && !bounded(fact))
+          continue;
+        const Cell &want = kv.first;
+        if (want.second.empty())
+          continue;
+        const Step &last = want.second.back();
+        auto fits = [&](const ConstantInt *CI) {
+          if (CI->getBitWidth() > 64)
+            return false;
+          std::string d = dec(CI);
+          if (fact.known && fact.val != d)
+            return false;
+          if (!fact.any.empty() && !fact.any.count(d))
+            return false;
+          if (fact.ban.count(d))
+            return false;
+          int64_t v = CI->getSExtValue();
+          uint64_t u = CI->getZExtValue();
+          if (fact.slo && v < fact.sloV)
+            return false;
+          if (fact.shi && v > fact.shiV)
+            return false;
+          if (fact.ulo && u < fact.uloV)
+            return false;
+          if (fact.uhi && u > fact.uhiV)
+            return false;
+          return true;
+        };
+        bool done = false;
+        int nOff = 0, nVal = 0, nObj = 0, nSw = 0, nClimb = 0;
+        std::string climbFn;
+        eachBody([&](Function &F) {
+          if (done)
+            return;
+          std::optional<DominatorTree> DT;
+          auto domRets = [&](Instruction *S) {
+            if (!DT)
+              DT.emplace(F);
+            bool any = false;
+            for (BasicBlock &BB : F) {
+              auto *R = dyn_cast<ReturnInst>(BB.getTerminator());
+              if (!R)
+                continue;
+              any = true;
+              if (!DT->dominates(S, R))
+                return false;
+            }
+            return any;
+          };
+          for (Instruction &I : instructions(F)) {
+            auto *S = dyn_cast<StoreInst>(&I);
+            if (!S || done)
+              continue;
+            auto *G = dyn_cast<GEPOperator>(S->getPointerOperand()->stripPointerCasts());
+            if (!G || !G->hasAllConstantIndices())
+              continue;
+            APInt off(dl.getIndexSizeInBits(G->getPointerAddressSpace()), 0);
+            if (!G->accumulateConstantOffset(dl, off) || off.getSExtValue() != last.off)
+              continue;
+            std::string irTy;
+            if (auto *ST = dyn_cast<StructType>(G->getSourceElementType()))
+              if (ST->hasName())
+                irTy = ST->getName().str();
+            if (source::container(G, dl) != last.type && irTy != last.type)
+              continue;
+            ++nOff;
+            auto *CI = dyn_cast<ConstantInt>(S->getValueOperand());
+            bool isNull = isa<ConstantPointerNull>(S->getValueOperand()->stripPointerCasts());
+            bool va = !CI && !isNull && viaVa(S->getValueOperand());
+            if (CI) {
+              if (!fits(CI))
+                continue;
+            } else if (isNull) {
+              if (fact.known && fact.val != "0")
+                continue;
+              if (!fact.any.empty() && !fact.any.count("0"))
+                continue;
+              if (fact.ban.count("0"))
+                continue;
+            } else if (!va) {
+              continue;
+            }
+            ++nVal;
+            Argument *obj = oneFormal(S->getPointerOperand());
+            if (!obj || obj->getParent() != &F)
+              continue;
+            std::string outer;
+            {
+              std::vector<Value *> ost{S->getPointerOperand()};
+              std::unordered_set<const Value *> oseen;
+              while (!ost.empty()) {
+                Value *X = ost.back();
+                ost.pop_back();
+                if (!X || !oseen.insert(X).second)
+                  continue;
+                if (isa<Argument>(X->stripPointerCasts()))
+                  continue;
+                if (auto *C = dyn_cast<CastInst>(X)) {
+                  ost.push_back(C->getOperand(0));
+                  continue;
+                }
+                if (auto *P = dyn_cast<PHINode>(X)) {
+                  for (Value *in : P->incoming_values())
+                    ost.push_back(in);
+                  continue;
+                }
+                if (auto *L = dyn_cast<LoadInst>(X)) {
+                  auto *Al = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts());
+                  if (Al) {
+                    for (User *U : Al->users()) {
+                      auto *St = dyn_cast<StoreInst>(U);
+                      if (St && St->getPointerOperand()->stripPointerCasts() == Al)
+                        ost.push_back(St->getValueOperand());
+                    }
+                    continue;
+                  }
+                  ost.push_back(L->getPointerOperand());
+                  continue;
+                }
+                if (auto *GG = dyn_cast<GEPOperator>(X)) {
+                  if (auto *ST = dyn_cast<StructType>(GG->getSourceElementType()))
+                    if (ST->hasName())
+                      outer = ST->getName().str();
+                  ost.push_back(GG->getPointerOperand());
+                }
+              }
+            }
+            if (outer != want.second.front().type)
+              continue;
+            ++nObj;
+            std::unordered_set<const BasicBlock *> reach{S->getParent()};
+            std::unordered_map<const BasicBlock *, int> dist;
+            std::vector<const BasicBlock *> st{S->getParent()};
+            dist[S->getParent()] = 0;
+            while (!st.empty()) {
+              const BasicBlock *BB = st.back();
+              st.pop_back();
+              int d = dist[BB];
+              for (const BasicBlock *P : predecessors(BB))
+                if (reach.insert(P).second) {
+                  dist[P] = d + 1;
+                  st.push_back(P);
+                }
+            }
+            Argument *tag = nullptr;
+            int64_t tagV = 0;
+            int bestDist = 0;
+            for (const BasicBlock *BB : reach) {
+              auto *Sw = dyn_cast<SwitchInst>(BB->getTerminator());
+              if (!Sw || reach.count(Sw->getDefaultDest()))
+                continue;
+              int hits = 0;
+              int64_t one = 0;
+              for (auto &C : Sw->cases()) {
+                if (!reach.count(C.getCaseSuccessor()))
+                  continue;
+                if (C.getCaseValue()->getBitWidth() > 64)
+                  continue;
+                ++hits;
+                one = C.getCaseValue()->getSExtValue();
+              }
+              if (hits != 1)
+                continue;
+              Argument *A = oneFormal(Sw->getCondition());
+              if (!A || A->getParent() != &F)
+                continue;
+              int d = dist[BB];
+              if (tag && d >= bestDist)
+                continue;
+              tag = A;
+              tagV = one;
+              bestDist = d;
+            }
+            if (!tag && !domRets(S))
+              continue;
+            ++nSw;
+            struct Node {
+              Function *f;
+              Argument *obj;
+              Argument *tag;
+            };
+            std::queue<Node> q;
+            std::unordered_set<Function *> seenFn;
+            q.push({&F, obj, tag});
+            Function *iface = nullptr;
+            Argument *ifaceObj = nullptr;
+            Argument *ifaceTag = nullptr;
+            while (!q.empty() && !iface) {
+              Node n = q.front();
+              q.pop();
+              if (!seenFn.insert(n.f).second)
+                continue;
+              bool face = interfaceNames.count(n.f->getName().str()) != 0;
+              if (face && n.obj && (unsigned)want.first == n.obj->getArgNo() && (!va || n.f->isVarArg())) {
+                iface = n.f;
+                ifaceObj = n.obj;
+                ifaceTag = n.tag;
+                break;
+              }
+              auto it = callersOf.find(n.f);
+              if (it == callersOf.end())
+                continue;
+              for (Function *C : it->second) {
+                Argument *upObj = liftArg(C, n.f, n.obj);
+                if (!upObj)
+                  continue;
+                Argument *upTag = n.tag ? liftArg(C, n.f, n.tag) : nullptr;
+                if (n.tag && !upTag)
+                  continue;
+                q.push({C, upObj, upTag});
+              }
+            }
+            if (!iface) {
+              ++nClimb;
+              climbFn = F.getName().str();
+              continue;
+            }
+            out << "client " << iface->getName() << " arg" << ifaceObj->getArgNo();
+            if (ifaceTag)
+              out << " arg" << ifaceTag->getArgNo() << " = " << tagV;
+            if (va) {
+              if (fact.known)
+                out << " vararg = " << fact.val;
+              else {
+                for (const std::string &b : fact.ban)
+                  out << " vararg != " << b;
+                for (const std::string &a : fact.any)
+                  out << " vararg any " << a;
+                if (fact.slo)
+                  out << " vararg sge " << fact.sloV;
+                if (fact.shi)
+                  out << " vararg sle " << fact.shiV;
+                if (fact.ulo)
+                  out << " vararg uge " << fact.uloV;
+                if (fact.uhi)
+                  out << " vararg ule " << fact.uhiV;
+              }
+            }
+            out << "\n";
+            out << "discharges";
+            writeCell(want);
+            out << "\n";
+            done = true;
+          }
+        });
+        auto baseOf = [&](Value *V) -> Value * {
+          std::vector<Value *> st{V};
+          std::unordered_set<const Value *> seen;
+          Value *found = nullptr;
+          while (!st.empty()) {
+            Value *X = st.back();
+            st.pop_back();
+            if (!X || !seen.insert(X).second)
+              continue;
+            if (isa<ConstantPointerNull>(X) || isa<UndefValue>(X))
+              continue;
+            Value *S = X->stripPointerCasts();
+            if (isa<Argument>(S) || isa<GlobalValue>(S) || isa<CallBase>(X)) {
+              Value *Id = isa<CallBase>(X) ? X : S;
+              if (found && found != Id)
+                return nullptr;
+              found = Id;
+              continue;
+            }
+            if (auto *C = dyn_cast<CastInst>(X)) {
+              st.push_back(C->getOperand(0));
+              continue;
+            }
+            if (auto *P = dyn_cast<PHINode>(X)) {
+              for (Value *in : P->incoming_values())
+                st.push_back(in);
+              continue;
+            }
+            if (auto *L = dyn_cast<LoadInst>(X)) {
+              auto *Al = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts());
+              if (Al) {
+                for (User *U : Al->users()) {
+                  auto *St = dyn_cast<StoreInst>(U);
+                  if (St && St->getPointerOperand()->stripPointerCasts() == Al)
+                    st.push_back(St->getValueOperand());
+                }
+                continue;
+              }
+              st.push_back(L->getPointerOperand());
+              continue;
+            }
+            if (auto *G = dyn_cast<GEPOperator>(X))
+              st.push_back(G->getPointerOperand());
+          }
+          return found;
+        };
+        int64_t absOff = 0;
+        bool inlineField = true;
+        for (const Step &s : want.second) {
+          if (s.deref) {
+            inlineField = false;
+            break;
+          }
+          absOff += s.off;
+        }
+        bool zeroOk = inlineField && fact.ban.count("0") == 0 && (!fact.known || fact.val == "0") &&
+                      (fact.any.empty() || fact.any.count("0")) && !(fact.slo && fact.sloV > 0) &&
+                      !(fact.shi && fact.shiV < 0) && !(fact.ulo && fact.uloV > 0) &&
+                      (fact.known || !fact.any.empty() || !fact.ban.empty() || bounded(fact));
+        int nMem = 0, nSize = 0, nRoot = 0, nRet = 0, nWrite = 0, nFace = 0;
+        std::string wrote;
+        if (!done && zeroOk) {
+          eachBody([&](Function &F) {
+            if (done)
+              return;
+            for (Instruction &I : instructions(F)) {
+              auto *CB = dyn_cast<CallBase>(&I);
+              if (!CB || done)
+                continue;
+              Function *Cal = CB->getCalledFunction();
+              if (!Cal || Cal->getName().find("memset") == StringRef::npos)
+                continue;
+              if (CB->arg_size() < 3)
+                continue;
+              ++nMem;
+              Value *dest = CB->getArgOperand(0);
+              auto *zero = dyn_cast<ConstantInt>(CB->getArgOperand(1));
+              auto *len = dyn_cast<ConstantInt>(CB->getArgOperand(2));
+              if (!zero || !len || !zero->isZero() || len->getBitWidth() > 64)
+                continue;
+              if (len->getZExtValue() < (uint64_t)absOff + 1)
+                continue;
+              ++nSize;
+              Value *obj = baseOf(dest);
+              if (!obj)
+                continue;
+              auto *alloc = dyn_cast<CallBase>(obj);
+              if (!alloc)
+                continue;
+              ++nRoot;
+              DominatorTree DT(F);
+              bool anyRet = false;
+              bool covered = true;
+              for (BasicBlock &BB : F) {
+                auto *R = dyn_cast<ReturnInst>(BB.getTerminator());
+                if (!R || !R->getReturnValue())
+                  continue;
+                Value *RV = R->getReturnValue();
+                if (baseOf(RV) != obj)
+                  continue;
+                auto *Ld = dyn_cast<LoadInst>(RV->stripPointerCasts());
+                auto *Slot = Ld ? dyn_cast<AllocaInst>(Ld->getPointerOperand()->stripPointerCasts()) : nullptr;
+                if (!Slot) {
+                  anyRet = true;
+                  if (!DT.dominates(CB, R))
+                    covered = false;
+                  continue;
+                }
+                for (User *U : Slot->users()) {
+                  auto *St = dyn_cast<StoreInst>(U);
+                  if (!St || St->getPointerOperand()->stripPointerCasts() != Slot)
+                    continue;
+                  if (isa<ConstantPointerNull>(St->getValueOperand()->stripPointerCasts()))
+                    continue;
+                  if (baseOf(St->getValueOperand()) != obj)
+                    continue;
+                  anyRet = true;
+                  if (!DT.dominates(CB, St))
+                    covered = false;
+                }
+              }
+              if (!anyRet || !covered)
+                continue;
+              ++nRet;
+              std::unordered_set<Function *> visiting;
+              std::function<bool(Function *)> writes = [&](Function *G) {
+                if (!visiting.insert(G).second)
+                  return false;
+                for (Instruction &J : instructions(*G)) {
+                  if (auto *S = dyn_cast<StoreInst>(&J)) {
+                    auto *GG = dyn_cast<GEPOperator>(S->getPointerOperand()->stripPointerCasts());
+                    if (!GG || !GG->hasAllConstantIndices())
+                      continue;
+                    APInt o(dl.getIndexSizeInBits(GG->getPointerAddressSpace()), 0);
+                    if (!GG->accumulateConstantOffset(dl, o) || o.getSExtValue() != last.off)
+                      continue;
+                    std::string ty;
+                    if (auto *ST = dyn_cast<StructType>(GG->getSourceElementType()))
+                      if (ST->hasName())
+                        ty = ST->getName().str();
+                    if (source::container(GG, dl) == last.type || ty == last.type) {
+                      Value *V = S->getValueOperand();
+                      if (auto *C = dyn_cast<ConstantInt>(V))
+                        if (C->isZero())
+                          continue;
+                      if (isa<ConstantPointerNull>(V->stripPointerCasts()))
+                        continue;
+                      wrote = G->getName().str();
+                      return true;
+                    }
+                  }
+                  auto *Call = dyn_cast<CallBase>(&J);
+                  if (!Call || Call->getCalledFunction() == Cal)
+                    continue;
+                  if (Function *D = Call->getCalledFunction()) {
+                    if (Function *Def = define(D->getName()))
+                      D = Def;
+                    if (D && !D->isDeclaration() && writes(D))
+                      return true;
+                  } else {
+                    for (Value *A : Call->args())
+                      if (baseOf(A) == obj) {
+                        wrote = G->getName().str();
+                        return true;
+                      }
+                  }
+                }
+                return false;
+              };
+              if (writes(&F)) {
+                ++nWrite;
+                continue;
+              }
+              std::queue<Function *> cq;
+              std::unordered_set<Function *> cseen;
+              cq.push(&F);
+              Function *iface = nullptr;
+              while (!cq.empty() && !iface) {
+                Function *G = cq.front();
+                cq.pop();
+                if (!cseen.insert(G).second)
+                  continue;
+                if (interfaceNames.count(G->getName().str())) {
+                  iface = G;
+                  break;
+                }
+                auto it = callersOf.find(G);
+                if (it == callersOf.end())
+                  continue;
+                for (Function *C : it->second) {
+                  bool passes = false;
+                  for (Instruction &J : instructions(*C)) {
+                    auto *Call = dyn_cast<CallBase>(&J);
+                    if (!Call || !callsFn(Call, G))
+                      continue;
+                    for (BasicBlock &BB : *C) {
+                      auto *R = dyn_cast<ReturnInst>(BB.getTerminator());
+                      if (R && R->getReturnValue() && baseOf(R->getReturnValue()) == Call)
+                        passes = true;
+                    }
+                  }
+                  if (passes)
+                    cq.push(C);
+                }
+              }
+              if (!iface) {
+                ++nFace;
+                continue;
+              }
+              out << "client " << iface->getName() << " result arg" << want.first << "\n";
+              out << "discharges";
+              writeCell(want);
+              out << "\n";
+              done = true;
+            }
+          });
+        }
+        (void)nOff;
+        (void)nVal;
+        (void)nObj;
+        (void)nSw;
+        (void)nClimb;
+        (void)climbFn;
+        (void)nMem;
+        (void)nSize;
+        (void)nRoot;
+        (void)nRet;
+        (void)nWrite;
+        (void)nFace;
+        (void)wrote;
+      }
     }
     out << (tr.conflict ? "unsat\n" : "sat\n");
     return !tr.conflict;
