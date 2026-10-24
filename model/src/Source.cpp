@@ -396,6 +396,8 @@ std::vector<std::pair<std::string, int64_t>> levels(const GEPOperator *G, const 
     int64_t i = cast<ConstantInt>(*idx)->getSExtValue();
     ++idx;
     if (STy) {
+      if (!STy->isSized() || i < 0 || (unsigned)i >= STy->getNumElements())
+        break;
       uint64_t o = dl.getStructLayout(STy)->getElementOffset((unsigned)i);
       rest -= (int64_t)o;
       T = STy->getElementType((unsigned)i);

@@ -11,7 +11,27 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/BinaryFormat/Dwarf.h"
 
-
+// A total order on functions that does not depend on where they are
+// allocated: by name, then by module. Every iteration over functions follows
+// it, so equal inputs give the same client.
+struct FnOrder {
+  bool operator()(const Function *a, const Function *b) const {
+    if (a == b)
+      return false;
+    if (int c = a->getName().compare(b->getName()))
+      return c < 0;
+    if (int c = a->getParent()->getModuleIdentifier().compare(b->getParent()->getModuleIdentifier()))
+      return c < 0;
+    return a < b;
+  }
+  template <class T> bool operator()(const std::pair<Function *, T> &a, const std::pair<Function *, T> &b) const {
+    if (a.first != b.first)
+      return (*this)(a.first, b.first);
+    return a.second < b.second;
+  }
+};
+using FnSet = std::set<Function *, FnOrder>;
+template <class V> using FnMap = std::map<Function *, V, FnOrder>;
 
 class Client {
 public:
@@ -72,19 +92,19 @@ public:
   struct Plan {
     // Per entry, a disjunction over its witnesses of the conjunction of
     // their frozen constraints. An entry with an unguarded witness has none.
-    std::map<Function *, std::vector<std::vector<Guard>>> guards;
+    FnMap<std::vector<std::vector<Guard>>> guards;
     std::vector<Function *> firsts;
     std::vector<Function *> entries;
     std::vector<std::pair<std::string, std::vector<Producer>>> handles;
     std::vector<Cell> clientCells;
     // Per entry, the public fields of its arguments that name the input
     // file; the client writes the input's name into them before the call.
-    std::map<Function *, std::vector<Cell>> files;
+    FnMap<std::vector<Cell>> files;
     std::vector<std::pair<Cell, std::vector<Function *>>> cellWriters;
     std::vector<Function *> writers;
     // Per producer of a held type, the calls that can establish the state
     // it reads before it can produce.
-    std::map<std::pair<Function *, std::string>, std::vector<Function *>> deps;
+    std::map<std::pair<Function *, std::string>, std::vector<Function *>, FnOrder> deps;
   };
 
   Client(Module &down, Module &up, const fs::path &dir);
@@ -114,23 +134,23 @@ private:
   std::map<std::string, bool> defined;
   std::map<std::string, const DICompositeType *> composite;
   std::map<std::string, Function *> bodies;
-  std::set<Function *> ifaceD, ifaceU;
-  std::map<Function *, std::set<Function *>> calls;
-  std::map<Function *, std::set<std::pair<std::pair<std::string, int64_t>, std::string>>> stores;
+  FnSet ifaceD, ifaceU;
+  FnMap<FnSet> calls;
+  FnMap<std::set<std::pair<std::pair<std::string, int64_t>, std::string>>> stores;
   // Byte ranges memory intrinsics write: (struct, offset) and a length,
   // INT64_MAX when the length is not constant.
-  std::map<Function *, std::vector<std::tuple<std::string, int64_t, int64_t>>> ranges;
+  FnMap<std::vector<std::tuple<std::string, int64_t, int64_t>>> ranges;
   std::set<std::pair<Function *, unsigned>> releases;
   // Fields a function may modify or reference directly: through a store or
   // load, or by passing the field's address to a call.
-  std::map<Function *, std::set<std::pair<std::string, int64_t>>> mods, refs;
+  FnMap<std::set<std::pair<std::string, int64_t>>> mods, refs;
   mutable std::map<std::pair<Function *, bool>, std::set<std::pair<std::string, int64_t>>> modRefOf;
   const std::set<std::pair<std::string, int64_t>> &transitive(Function *F, bool mod) const;
   // Fields a branch condition reads, per function and over its closure.
-  std::map<Function *, std::set<std::pair<std::string, int64_t>>> crefs;
-  mutable std::map<Function *, std::set<std::pair<std::string, int64_t>>> crefOf;
+  FnMap<std::set<std::pair<std::string, int64_t>>> crefs;
+  mutable FnMap<std::set<std::pair<std::string, int64_t>>> crefOf;
   const std::set<std::pair<std::string, int64_t>> &controlRefs(Function *F) const;
-  mutable std::map<Function *, std::set<std::pair<std::string, int64_t>>> effectOf;
+  mutable FnMap<std::set<std::pair<std::string, int64_t>>> effectOf;
   const std::set<std::pair<std::string, int64_t>> &effects(Function *F) const;
   void buildModRef();
   mutable std::map<std::pair<Function *, unsigned>, std::vector<std::string>> comparedOf;
@@ -147,28 +167,42 @@ private:
   bool held(const Param &p) const;
   std::set<int> loadedFrom(Function *F) const;
   bool writesThrough(Function *F, unsigned i) const;
-  mutable std::map<std::pair<Function *, unsigned>, bool> writes;
-  mutable std::map<Function *, std::set<Function *>> closures, inner, callersOf;
+  std::set<std::pair<Function *, unsigned>> writes;
+  mutable FnMap<FnSet> closures, inner, callersOf;
   std::map<std::pair<Function *, unsigned>, FunctionType *> fnTypes;
   // The declared type of each callback formal, when the header declares one.
   std::map<std::pair<Function *, unsigned>, const DIType *> fnDecl;
   void buildCallbackTypes();
   // The IR type of a call through a pointer of declared type T, or null.
   FunctionType *fnTypeOf(const DIType *T) const;
-  const std::set<Function *> &innerClosure(Function *F) const;
+  const FnSet &innerClosure(Function *F) const;
   // Per formal of F, from F's SSA form: whether null has a meaning (A1),
   // and the largest pointer-to-record type a variable bound to it has.
   struct Formals {
     std::vector<bool> null;
     std::vector<const DIType *> as;
-    // A3, derived: for a pointer formal, the integer formal that bounds the
-    // elements F accesses through it, -1 for none.
-    std::vector<int> len;
+    // A3, derived: the pairs (i, j) such that integer formal j bounds the
+    // elements F accesses through pointer formal i.
+    std::set<std::pair<unsigned, unsigned>> len;
   };
-  mutable std::map<Function *, Formals> formals;
+  // A call of F that passes pointer and integer formals of F on: the callee,
+  // and per argument the pointer (resp. integer) formal of F it is, or -1.
+  struct LenCall {
+    Function *callee;
+    std::vector<int> ptr, num;
+  };
+  // What F's own body shows: Formals with len holding only direct evidence,
+  // and the calls through which Len(callee) transfers to Len(F).
+  struct LocalFormals {
+    Formals f;
+    std::vector<LenCall> calls;
+  };
+  mutable FnMap<LocalFormals> localFormals;
+  const LocalFormals &localFormalsOf(Function *F) const;
+  mutable FnMap<Formals> formals;
   const Formals &formalsOf(Function *F) const;
   bool nullTested(Function *F, unsigned i) const;
-  mutable std::map<Function *, std::vector<Param>> sigs;
+  mutable FnMap<std::vector<Param>> sigs;
   static std::vector<int> lower(Function *F, const std::vector<Param> &sig);
   // Fields (S, off) whose value some library function compares with null:
   // A1 for the pointer fields of client-built objects.
@@ -188,19 +222,21 @@ private:
   std::string constructs(Function *F) const;
   bool isPublic(const std::string &key) const;
   Kind classify(const DIType *T, std::string &key) const;
-  std::map<std::pair<std::string, int64_t>, std::set<Function *>> fnField;
+  std::map<std::pair<std::string, int64_t>, FnSet> fnField;
+  Value *fieldAddress(Value *P) const;
   std::vector<std::pair<std::string, int64_t>> fieldsOf(Value *P) const;
   void constFields(Constant *C, Type *T, std::string S, int64_t at, const DIType *D);
   void buildCalls();
   void buildStores();
   void buildReleases();
+  void buildWrites();
   void buildProducers();
   static int formalOf(Value *V);
   static int rootOf(Value *V, std::set<AllocaInst *> &open);
   Function *body(const std::string &name) const;
-  std::set<Function *> interface() const;
-  std::set<Function *> closure(Function *F) const;
-  const std::set<Function *> &closureOf(Function *F) const;
+  FnSet interface() const;
+  FnSet closure(Function *F) const;
+  const FnSet &closureOf(Function *F) const;
   bool callable(Function *F) const;
   std::vector<Function *> entries(Function *E) const;
   std::vector<Function *> writers(const Cell &c) const;

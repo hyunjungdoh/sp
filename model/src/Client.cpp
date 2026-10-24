@@ -478,6 +478,7 @@ Client::Client(Module &down, Module &up, const fs::path &dir) : down(down), up(u
   buildStores();
   buildModRef();
   buildReleases();
+  buildWrites();
   buildProducers();
   buildCallbackTypes();
   buildNullFields();
@@ -609,7 +610,7 @@ void Client::buildNullFields() {
       std::vector<LoadInst *> loads;
       if (auto *L = dyn_cast<LoadInst>(V)) {
         loads.push_back(L);
-        if (auto *Al = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts()))
+        if (auto *Al = dyn_cast<AllocaInst>(fieldAddress(L->getPointerOperand())))
           for (User *U : Al->users())
             if (auto *S = dyn_cast<StoreInst>(U))
               if (S->getPointerOperand()->stripPointerCasts() == Al)
@@ -636,7 +637,7 @@ void Client::buildFieldLengths() {
       if (!seen.insert(U).second)
         continue;
       if (auto *L = dyn_cast<LoadInst>(U)) {
-        if (auto *Al = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts())) {
+        if (auto *Al = dyn_cast<AllocaInst>(fieldAddress(L->getPointerOperand()))) {
           for (User *W : Al->users())
             if (auto *S = dyn_cast<StoreInst>(W); S && S->getPointerOperand()->stripPointerCasts() == Al)
               work.push_back(S->getValueOperand());
@@ -672,22 +673,25 @@ void Client::buildFieldLengths() {
               fieldLen.emplace(a, b.second);
       }
     }
-  if (getenv("DBG_FL"))
-    for (auto &[a, b] : fieldLen)
-      errs() << "FL " << a.first << " " << a.second << " " << b << "\n";
 }
 
-// The fields (S, off) a constant-offset GEP addresses, one per struct level
-// its indices pass, innermost last.
-std::vector<std::pair<std::string, int64_t>> Client::fieldsOf(Value *P) const {
-  // Casts only: an all-zero GEP addresses the first field, which is a field.
+// Through pointer casts only. An all-zero GEP stays: it addresses the first field.
+Value *Client::fieldAddress(Value *P) const {
   while (auto *O = dyn_cast<Operator>(P)) {
     if (O->getOpcode() != Instruction::BitCast && O->getOpcode() != Instruction::AddrSpaceCast)
       break;
     P = O->getOperand(0);
   }
+  return P;
+}
+
+// The fields (S, off) a constant-offset GEP addresses, one per struct level
+// its indices pass, innermost last. A GEP of one zero index only
+// reinterprets the pointer; the first field's GEP has a second index.
+std::vector<std::pair<std::string, int64_t>> Client::fieldsOf(Value *P) const {
+  P = fieldAddress(P);
   auto *G = dyn_cast<GEPOperator>(P);
-  if (!G)
+  if (!G || (G->hasAllZeroIndices() && G->getNumIndices() < 2))
     return {};
   return source::levels(G, dl);
 }
@@ -758,7 +762,7 @@ void Client::buildCalls() {
   // address point, then the virtual functions by slot. A call through slot
   // k of the vtable of an object of static class C goes to slot k of C's
   // vtable and of every class derived from C.
-  std::map<std::string, std::map<int64_t, std::set<Function *>>> vslots;
+  std::map<std::string, std::map<int64_t, FnSet>> vslots;
   for (Module *M : {&down, &up})
     for (GlobalVariable &G : M->globals()) {
       if (!G.hasInitializer() || !G.getName().starts_with("_ZTV"))
@@ -793,7 +797,7 @@ void Client::buildCalls() {
   };
   // The targets of a virtual call, or none when the callee is not loaded
   // from a vtable slot.
-  auto virtualTargets = [&](CallBase *CB, std::set<Function *> &fs) {
+  auto virtualTargets = [&](CallBase *CB, FnSet &fs) {
     auto *L = dyn_cast<LoadInst>(CB->getCalledOperand()->stripPointerCasts());
     if (!L)
       return;
@@ -848,7 +852,7 @@ void Client::buildCalls() {
           out.insert(B);
         continue;
       }
-      std::set<Function *> fs;
+      FnSet fs;
       virtualTargets(CB, fs);
       if (!fs.empty()) {
         out.insert(fs.begin(), fs.end());
@@ -1032,7 +1036,7 @@ const std::vector<std::string> &Client::compared(Function *F, unsigned i) const 
                                          "bcmp",   "strstr",  "strcasestr", "strcoll"};
   static const std::set<std::string> open{"fopen", "fopen64", "freopen", "open", "open64", "openat", "creat",
                                           "stat",  "stat64",  "lstat",   "access"};
-  const std::set<Function *> &within = innerClosure(F);
+  const FnSet &within = innerClosure(F);
   std::vector<std::pair<Function *, unsigned>> order{key};
   std::set<std::pair<Function *, unsigned>> queued{key};
   std::vector<std::string> out;
@@ -1236,15 +1240,16 @@ bool Client::nullTested(Function *F, unsigned i) const {
   return i < f.null.size() && f.null[i];
 }
 
-const Client::Formals &Client::formalsOf(Function *F) const {
-  auto it = formals.find(F);
-  if (it != formals.end())
+const Client::LocalFormals &Client::localFormalsOf(Function *F) const {
+  auto it = localFormals.find(F);
+  if (it != localFormals.end())
     return it->second;
-  Formals &out = formals[F];
+  LocalFormals &local = localFormals[F];
+  Formals &out = local.f;
   out.null.assign(F->arg_size(), false);
   out.as.assign(F->arg_size(), nullptr);
   if (F->isDeclaration())
-    return out;
+    return local;
   ValueToValueMapTy VM;
   Function *G = CloneFunction(F, VM);
   std::vector<AllocaInst *> slots;
@@ -1295,8 +1300,7 @@ const Client::Formals &Client::formalsOf(Function *F) const {
   // p_i + e with e derived from j, passes p_i to a memory function with a
   // length derived from j, indexes p_i with a variable compared against
   // one derived from j, or passes both to a callee in which the same holds
-  // (least fixpoint; a recursive call contributes what is known so far).
-  out.len.assign(F->arg_size(), -1);
+  // (the transfer through calls is closed in formalsOf).
   auto intFormal = [](Value *V) -> int {
     for (unsigned steps = 0; steps < 8; ++steps) {
       if (auto *A = dyn_cast<Argument>(V))
@@ -1329,8 +1333,8 @@ const Client::Formals &Client::formalsOf(Function *F) const {
     return -1;
   };
   auto bound = [&](int i, int j) {
-    if (i >= 0 && j >= 0 && out.len[i] < 0)
-      out.len[i] = j;
+    if (i >= 0 && j >= 0)
+      out.len.insert({(unsigned)i, (unsigned)j});
   };
   for (Instruction &I : instructions(*G)) {
     if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
@@ -1363,22 +1367,78 @@ const Client::Formals &Client::formalsOf(Function *F) const {
     }
     auto *Callee = dyn_cast<Function>(CB->getCalledOperand()->stripPointerCasts());
     Function *B = Callee ? body(Callee->getName().str()) : nullptr;
-    if (!B || B == F)
+    if (!B)
       continue;
+    LenCall call{B, {}, {}};
     bool p = false, n = false;
     for (Value *A : CB->args()) {
-      p = p || ptrFormal(A) >= 0;
-      n = n || intFormal(A) >= 0;
+      call.ptr.push_back(ptrFormal(A));
+      call.num.push_back(intFormal(A));
+      p = p || call.ptr.back() >= 0;
+      n = n || call.num.back() >= 0;
     }
-    if (!p || !n)
-      continue;
-    const Formals &cf = formalsOf(B);
-    for (unsigned a = 0; a < CB->arg_size() && a < cf.len.size(); ++a)
-      if (cf.len[a] >= 0 && (unsigned)cf.len[a] < CB->arg_size())
-        bound(ptrFormal(CB->getArgOperand(a)), intFormal(CB->getArgOperand(cf.len[a])));
+    if (p && n)
+      local.calls.push_back(std::move(call));
   }
   G->eraseFromParent();
-  return out;
+  return local;
+}
+
+// Len is the least relation with
+//   Len(F) ⊇ direct evidence in F
+//   Len(F) ⊇ {(ptr_c(a), num_c(b)) | (a, b) ∈ Len(callee_c)} for each call c of F,
+// computed over the functions reachable from F by such calls. That set is
+// closed under callees, so the fixpoint is exact for every member and all of
+// them are recorded.
+const Client::Formals &Client::formalsOf(Function *F) const {
+  auto it = formals.find(F);
+  if (it != formals.end())
+    return it->second;
+  std::vector<Function *> region;
+  FnMap<std::set<std::pair<unsigned, unsigned>>> len;
+  FnMap<std::vector<Function *>> callers;
+  std::vector<Function *> stack{F};
+  FnSet seen{F};
+  while (!stack.empty()) {
+    Function *G = stack.back();
+    stack.pop_back();
+    region.push_back(G);
+    const LocalFormals &l = localFormalsOf(G);
+    len[G] = l.f.len;
+    for (const LenCall &c : l.calls) {
+      callers[c.callee].push_back(G);
+      if (!formals.count(c.callee) && seen.insert(c.callee).second)
+        stack.push_back(c.callee);
+    }
+  }
+  auto lenOf = [&](Function *G) -> const std::set<std::pair<unsigned, unsigned>> & {
+    auto f = formals.find(G);
+    return f != formals.end() ? f->second.len : len[G];
+  };
+  std::vector<Function *> work(region.begin(), region.end());
+  FnSet queued(region.begin(), region.end());
+  while (!work.empty()) {
+    Function *G = work.back();
+    work.pop_back();
+    queued.erase(G);
+    auto &mine = len[G];
+    size_t before = mine.size();
+    for (const LenCall &c : localFormalsOf(G).calls)
+      for (auto [a, b] : lenOf(c.callee))
+        if (a < c.ptr.size() && b < c.num.size() && c.ptr[a] >= 0 && c.num[b] >= 0)
+          mine.insert({(unsigned)c.ptr[a], (unsigned)c.num[b]});
+    if (mine.size() == before)
+      continue;
+    for (Function *H : callers[G])
+      if (seen.count(H) && queued.insert(H).second)
+        work.push_back(H);
+  }
+  for (Function *G : region) {
+    Formals f = localFormalsOf(G).f;
+    f.len = std::move(len[G]);
+    formals[G] = std::move(f);
+  }
+  return formals[F];
 }
 
 // The formal whose value V is: the argument itself, or an -O0 reload of the
@@ -1493,32 +1553,57 @@ std::set<int> Client::loadedFrom(Function *F) const {
   return out;
 }
 
-// Whether F stores through formal i: to memory i points to, or by passing it
-// to a formal its callee stores through (least fixpoint).
-bool Client::writesThrough(Function *F, unsigned i) const {
-  auto key = std::make_pair(F, i);
-  if (auto it = writes.find(key); it != writes.end())
-    return it->second;
-  writes[key] = false;
-  bool w = false;
-  for (Instruction &I : instructions(*F)) {
-    std::set<AllocaInst *> open;
-    if (auto *S = dyn_cast<StoreInst>(&I)) {
-      w = rootOf(S->getPointerOperand(), open) == (int)i;
-    } else if (auto *CB = dyn_cast<CallBase>(&I)) {
-      Function *D = CB->getCalledFunction();
-      if (!D || D->isDeclaration())
+// Whether F stores through formal i.
+bool Client::writesThrough(Function *F, unsigned i) const { return writes.count({F, i}) > 0; }
+
+// W, the pairs (F, i) such that F stores through formal i, is the least set
+// closed under
+//   (F, i) in W  if a store of F writes to memory rooted at i;
+//   (F, i) in W  if F calls D passing a pointer rooted at i as argument a,
+//                and (D, a) in W.
+// The stores give the base; each pair then reaches the call sites that pass
+// into it along the reversed second rule, once per pair, so the set is
+// independent of the order functions are visited in.
+void Client::buildWrites() {
+  std::map<std::pair<Function *, unsigned>, std::vector<std::pair<Function *, unsigned>>> into;
+  std::vector<std::pair<Function *, unsigned>> work;
+  auto add = [&](Function *F, int i) {
+    if (i >= 0 && writes.insert({F, (unsigned)i}).second)
+      work.push_back({F, (unsigned)i});
+  };
+  for (const auto &kv : bodies) {
+    Function *F = kv.second;
+    for (Instruction &I : instructions(*F)) {
+      std::set<AllocaInst *> open;
+      if (auto *S = dyn_cast<StoreInst>(&I)) {
+        add(F, rootOf(S->getPointerOperand(), open));
         continue;
-      for (unsigned a = 0; a < CB->arg_size() && a < D->arg_size() && !w; ++a) {
+      }
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB)
+        continue;
+      auto *C = dyn_cast<Function>(CB->getCalledOperand()->stripPointerCasts());
+      Function *D = C ? body(C->getName().str()) : nullptr;
+      if (!D)
+        continue;
+      for (unsigned a = 0; a < CB->arg_size() && a < D->arg_size(); ++a) {
+        if (!CB->getArgOperand(a)->getType()->isPointerTy())
+          continue;
         open.clear();
-        w = CB->getArgOperand(a)->getType()->isPointerTy() && rootOf(CB->getArgOperand(a), open) == (int)i &&
-            writesThrough(D, a);
+        if (int k = rootOf(CB->getArgOperand(a), open); k >= 0)
+          into[{D, a}].push_back({F, (unsigned)k});
       }
     }
-    if (w)
-      break;
   }
-  return writes[key] = w;
+  while (!work.empty()) {
+    auto p = work.back();
+    work.pop_back();
+    auto it = into.find(p);
+    if (it == into.end())
+      continue;
+    for (const auto &[F, k] : it->second)
+      add(F, (int)k);
+  }
 }
 
 // A function releases formal k when it passes a pointer into k's object to
@@ -1564,8 +1649,8 @@ void Client::buildReleases() {
   }
 }
 
-std::set<Function *> Client::interface() const {
-  std::set<Function *> all(ifaceD);
+FnSet Client::interface() const {
+  FnSet all(ifaceD);
   all.insert(ifaceU.begin(), ifaceU.end());
   return all;
 }
@@ -1695,8 +1780,8 @@ void Client::buildProducers() {
   }
 }
 
-std::set<Function *> Client::closure(Function *F) const {
-  std::set<Function *> seen{F};
+FnSet Client::closure(Function *F) const {
+  FnSet seen{F};
   std::vector<Function *> work{F};
   while (!work.empty()) {
     Function *G = work.back();
@@ -1711,7 +1796,7 @@ std::set<Function *> Client::closure(Function *F) const {
   return seen;
 }
 
-const std::set<Function *> &Client::closureOf(Function *F) const {
+const FnSet &Client::closureOf(Function *F) const {
   auto it = closures.find(F);
   if (it != closures.end())
     return it->second;
@@ -1719,11 +1804,11 @@ const std::set<Function *> &Client::closureOf(Function *F) const {
 }
 
 // What F reaches without entering another callable interface function.
-const std::set<Function *> &Client::innerClosure(Function *F) const {
+const FnSet &Client::innerClosure(Function *F) const {
   auto it = inner.find(F);
   if (it != inner.end())
     return it->second;
-  std::set<Function *> seen{F};
+  FnSet seen{F};
   std::vector<Function *> work{F};
   while (!work.empty()) {
     Function *G = work.back();
@@ -1753,7 +1838,7 @@ const std::set<std::pair<std::string, int64_t>> &Client::effects(Function *F) co
     return SP && SP->getName().starts_with("~");
   };
   auto &out = effectOf[F];
-  std::set<Function *> seen{F};
+  FnSet seen{F};
   std::vector<Function *> work{F};
   while (!work.empty()) {
     Function *G = work.back();
@@ -1799,11 +1884,11 @@ bool Client::callable(Function *F) const {
 std::vector<Function *> Client::entries(Function *E) const {
   if (ifaceD.count(E) && callable(E))
     return {E};
-  std::map<Function *, std::set<Function *>> callers;
+  FnMap<FnSet> callers;
   for (const auto &kv : calls)
     for (Function *C : kv.second)
       callers[C].insert(kv.first);
-  std::map<Function *, unsigned> dist{{E, 0}};
+  FnMap<unsigned> dist{{E, 0}};
   std::deque<Function *> q{E};
   std::vector<Function *> out;
   unsigned found = ~0u;
@@ -1842,7 +1927,7 @@ std::vector<Function *> Client::writers(const Cell &c) const {
     for (const auto &kv : calls)
       for (Function *C : kv.second)
         callersOf[C].insert(kv.first);
-  std::set<Function *> reach;
+  FnSet reach;
   std::vector<Function *> work;
   for (const auto &[G, st] : stores)
     for (auto s = st.lower_bound({key, ""}); s != st.end() && s->first == key; ++s)
@@ -1992,7 +2077,7 @@ bool Client::guardOf(Function *E, const Cell &c, Guard &g, bool config) const {
   // A configuration field is the client's own and it sets it before the
   // call; the may side already fixed the value the entry must start with,
   // so a later store by the entry does not disqualify it.
-  for (Function *G : config ? std::set<Function *>{} : closureOf(E)) {
+  for (Function *G : config ? FnSet{} : closureOf(E)) {
     auto it = stores.find(G);
     if (it != stores.end()) {
       auto st = it->second.lower_bound({steps.back(), ""});
@@ -2033,7 +2118,7 @@ Client::Plan Client::plan(const std::vector<std::pair<std::vector<std::string>, 
       if (held(p) && cost.count(p.type))
         need.insert(p.type);
   };
-  std::set<Function *> entrySet, writerSet, unguarded;
+  FnSet entrySet, writerSet, unguarded;
   std::set<std::tuple<std::string, int64_t, std::string, std::vector<std::string>>> cellSet;
   for (const auto &[seq, phi] : ws) {
     if (seq.empty())
@@ -2489,13 +2574,13 @@ void Client::emit(const Plan &P, Module &H) const {
   auto declare = [&](Function *F) {
     return H.getOrInsertFunction(F->getName(), F->getFunctionType());
   };
-  // The pointer formal of F whose length integer formal j is (A3), or -1.
-  auto lengthOf = [&](Function *F, unsigned j) -> int {
-    const Formals &fs = formalsOf(F);
-    for (unsigned b = 0; b < fs.len.size(); ++b)
-      if (fs.len[b] == (int)j)
-        return (int)b;
-    return -1;
+  // The pointer formals of F that integer formal j bounds (A3).
+  auto lengthOf = [&](Function *F, unsigned j) {
+    std::vector<unsigned> out;
+    for (auto [b, k] : formalsOf(F).len)
+      if (k == j)
+        out.push_back(b);
+    return out;
   };
   // Val(tau), the values a client can hold of source type tau.
   //   V-Int     a scalar is any bit pattern;
@@ -2819,17 +2904,22 @@ void Client::emit(const Plan &P, Module &H) const {
                          : nullOr(C, nullable, [&](IRBuilder<> &D) { return K.bytes(D, p.elem); });
           break;
         }
-      } else if (int b = lengthOf(F, i); T->isIntegerTy() && b >= 0) {
+      } else if (auto bs = lengthOf(F, i); T->isIntegerTy() && !bs.empty()) {
         v = K.symbolic(C, T, "length");
         // The length counts elements or bytes; either way it stays within
-        // the buffer when it is at most the element count: a buffer of
-        // N bytes, a text of L characters, or the one object V-Obj builds.
-        uint64_t n = 1;
-        if (at[b] >= 0) {
-          const Param &q = sig[at[b]];
-          const DIType *D = strip(q.di);
-          bool one = isPointer(D) && pointerIn(strip(cast<DIDerivedType>(D)->getBaseType())) != 0;
-          n = q.kind == Kind::Text ? textBound : one ? 1 : K.capacity(q.elem);
+        // a buffer when it is at most the element count: a buffer of N
+        // bytes, a text of L characters, or the one object V-Obj builds. It
+        // must stay within every buffer it bounds.
+        uint64_t n = UINT64_MAX;
+        for (unsigned b : bs) {
+          uint64_t nb = 1;
+          if (at[b] >= 0) {
+            const Param &q = sig[at[b]];
+            const DIType *D = strip(q.di);
+            bool one = isPointer(D) && pointerIn(strip(cast<DIDerivedType>(D)->getBaseType())) != 0;
+            nb = q.kind == Kind::Text ? textBound : one ? 1 : K.capacity(q.elem);
+          }
+          n = std::min(n, nb);
         }
         K.require(C, C.CreateICmpULE(v, ConstantInt::get(T, n)));
       } else
