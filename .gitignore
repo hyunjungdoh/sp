@@ -4,3 +4,8 @@ engine/runs/
 *.bc
 *.istats
 model/build-asan/
+runs/
+model/build-asan/
+*.ll
+*.bc
+*.istats
