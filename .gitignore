@@ -1,1 +1,6 @@
 dataset/
+engine/runs/
+*.ll
+*.bc
+*.istats
+model/build-asan/
