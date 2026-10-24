@@ -570,9 +570,29 @@ void Model::emit(Module &H) const {
     // the callee is the same path of the callee's formals: the actual's path
     // followed by the returned one.
     std::function<Form(Function *)> retOf;
+    // A global's cells are written into the global itself. Its pointer cells
+    // take their values only when the program stores a non-null pointer into
+    // that global; otherwise the global keeps its initial value.
+    std::function<bool(Value *)> storesPointer = [&](Value *V) {
+      for (User *U : V->users()) {
+        if (auto *S = dyn_cast<StoreInst>(U)) {
+          if (S->getPointerOperand() == V && S->getValueOperand()->getType()->isPointerTy() &&
+              !isa<ConstantPointerNull>(S->getValueOperand()))
+            return true;
+        } else if (isa<GEPOperator>(U) || isa<BitCastOperator>(U) || isa<AddrSpaceCastOperator>(U)) {
+          if (storesPointer(U))
+            return true;
+        }
+      }
+      return false;
+    };
     // A writable global is a root of the entry state like an argument. Its
-    // root number is -2 - k for the k-th global met.
+    // root number is -2 - k for the k-th global met. The global's own bytes
+    // are cells; what its pointers reach is a cell only when the harness
+    // gives those pointers their values (storesPointer). Otherwise it is
+    // state the program builds, not part of the entry state.
     std::vector<GlobalVariable *> globalRoots;
+    std::vector<bool> reachesBeyond;
     std::map<GlobalVariable *, int> globalRoot;
     auto rootOfGlobal = [&](GlobalVariable *G) {
       auto it = globalRoot.find(G);
@@ -580,6 +600,7 @@ void Model::emit(Module &H) const {
         return it->second;
       int r = -2 - (int)globalRoots.size();
       globalRoots.push_back(G);
+      reachesBeyond.push_back(storesPointer(G));
       globalRoot[G] = r;
       return r;
     };
@@ -733,17 +754,60 @@ void Model::emit(Module &H) const {
             return true;
       return false;
     };
+    // Access paths are hash-consed: a path is a node of the prefix tree of all
+    // paths built so far, so equal paths are one node and a cell is a root
+    // and a node.
+    std::vector<Step> stepOf;
+    std::map<Step, uint32_t> stepId;
+    struct PathNode {
+      uint32_t parent = 0, step = 0, depth = 0;
+    };
+    std::vector<PathNode> paths{PathNode{}};
+    std::unordered_map<uint64_t, uint32_t> childOf;
+    // The path p followed by st, or nothing when st is already on p.
+    auto extend = [&](uint32_t p, const Step &st) -> std::optional<uint32_t> {
+      auto [sit, fresh] = stepId.emplace(st, (uint32_t)stepOf.size());
+      if (fresh)
+        stepOf.push_back(st);
+      uint32_t s = sit->second;
+      for (uint32_t q = p; q != 0; q = paths[q].parent)
+        if (paths[q].step == s)
+          return std::nullopt;
+      auto [cit, made] = childOf.emplace(((uint64_t)p << 32) | s, (uint32_t)paths.size());
+      if (made)
+        paths.push_back(PathNode{p, s, paths[p].depth + 1});
+      return cit->second;
+    };
+    auto suffixOf = [&](uint32_t p) {
+      Suffix s(paths[p].depth);
+      for (uint32_t q = p; q != 0; q = paths[q].parent)
+        s[paths[q].depth - 1] = stepOf[paths[q].step];
+      return s;
+    };
     struct Bind {
       int arg = -1;
-      Suffix suf;
+      uint32_t path = 0;
     };
     auto compose = [&](const Bind &base, const Suffix &extra, bool extraPointee, Bind &out) -> bool {
+      bool flat = base.arg <= -2 && !reachesBeyond[(size_t)(-2 - base.arg)];
+      if (flat && (extraPointee || std::any_of(extra.begin(), extra.end(), [](const Step &st) { return st.deref; })))
+        return false;
+      uint32_t p = base.path;
+      for (const Step &st : extra) {
+        auto q = extend(p, st);
+        if (!q)
+          return false;
+        p = *q;
+      }
+      if (extraPointee) {
+        auto q = extend(p, Step{"", 0, true});
+        if (!q)
+          return false;
+        p = *q;
+      }
       out.arg = base.arg;
-      out.suf = base.suf;
-      out.suf.insert(out.suf.end(), extra.begin(), extra.end());
-      if (extraPointee)
-        out.suf.push_back(Step{"", 0, true});
-      return !repeats(out.suf);
+      out.path = p;
+      return true;
     };
     struct Use {
       int formal = -1;
@@ -792,12 +856,8 @@ void Model::emit(Module &H) const {
     };
     std::deque<Item> bq;
     std::unordered_map<Function *, std::vector<std::vector<Bind>>> binds;
-    std::unordered_map<Function *, std::vector<std::unordered_set<std::string>>> seenBind;
-    auto bindKey = [&](const Bind &b) {
-      std::string k = std::to_string(b.arg);
-      k += sufKey(b.suf);
-      return k;
-    };
+    std::unordered_map<Function *, std::vector<std::unordered_set<uint64_t>>> seenBind;
+    auto bindKey = [](const Bind &b) { return ((uint64_t)(uint32_t)b.arg << 32) | b.path; };
     auto remember = [&](Function *F, int formal, const Bind &b) -> bool {
       if (!F || formal < 0 || (unsigned)formal >= F->arg_size() || b.arg == -1)
         return false;
@@ -1048,7 +1108,7 @@ void Model::emit(Module &H) const {
     drainBinds();
     auto wordFns = [&](const Bind &cell, FunctionType *ty) {
       std::vector<Function *> v;
-      auto pl = placeIn(cell.arg, cell.suf);
+      auto pl = placeIn(cell.arg, suffixOf(cell.path));
       if (!pl.first || !pl.first->word.count(pl.second))
         return v;
       for (const std::string &name : pl.first->word.at(pl.second)) {
@@ -1066,7 +1126,7 @@ void Model::emit(Module &H) const {
     indexVtables();
     auto tableFns = [&](const Bind &cell, FunctionType *ty) {
       std::vector<Function *> v;
-      const Suffix &s = cell.suf;
+      const Suffix s = suffixOf(cell.path);
       size_t j = s.size();
       while (j > 0 && !s[j - 1].deref)
         --j;
@@ -1111,7 +1171,7 @@ void Model::emit(Module &H) const {
       if (cell.arg > -2)
         return v;
       int64_t off = 0;
-      for (const Step &st : cell.suf) {
+      for (const Step &st : suffixOf(cell.path)) {
         if (st.deref)
           return v;
         off += st.off;
@@ -1172,7 +1232,7 @@ void Model::emit(Module &H) const {
         errs() << "TRACE " << sk.first->getName() << "\n";
         for (unsigned i = 0; i < sk.first->arg_size(); ++i)
           for (const Bind &b : bindsOf(sk.first, (int)i))
-            errs() << "  bind " << i << " = arg" << b.arg << sufKey(b.suf) << "\n";
+            errs() << "  bind " << i << " = arg" << b.arg << sufKey(suffixOf(b.path)) << "\n";
         for (const Need &n : sk.second.needs)
           errs() << "  need f" << n.formal << sufKey(n.suf) << " w" << n.width << "\n";
         for (const Edge &e : sk.second.edges)
@@ -1222,7 +1282,7 @@ void Model::emit(Module &H) const {
           Bind cell;
           if (!compose(b, u.suf, false, cell))
             continue;
-          if (u.argLevel && cell.suf.empty()) {
+          if (u.argLevel && cell.path == 0) {
             if (cell.arg < 0)
               continue;
             note(argAcc[cell.arg], u);
@@ -1230,7 +1290,7 @@ void Model::emit(Module &H) const {
           }
           Loc loc;
           loc.arg = cell.arg;
-          loc.suf = cell.suf;
+          loc.suf = suffixOf(cell.path);
           std::string k = locKey(loc);
           locOfKey[k] = loc;
           note(accs[k], u);
@@ -1270,7 +1330,7 @@ void Model::emit(Module &H) const {
           Bind cell;
           if (!compose(b, n.suf, false, cell))
             continue;
-          ensureObj(cell.arg, cell.suf, n.width);
+          ensureObj(cell.arg, suffixOf(cell.path), n.width);
         }
       }
     }
@@ -1504,7 +1564,7 @@ void Model::emit(Module &H) const {
           Bind cell;
           if (!compose(b, n.suf, false, cell))
             continue;
-          auto pl = placeIn(cell.arg, cell.suf);
+          auto pl = placeIn(cell.arg, suffixOf(cell.path));
           if (pl.first && pl.first->child.count(pl.second))
             pl.first->nullAt.insert(pl.second);
         }
@@ -2046,22 +2106,6 @@ void Model::emit(Module &H) const {
       }
       acts.push_back(act);
     }
-    // A global's cells are written into the global itself. Its pointer cells
-    // take their values only when the program stores a non-null pointer into
-    // that global; otherwise the global keeps its initial value.
-    std::function<bool(Value *)> storesPointer = [&](Value *V) {
-      for (User *U : V->users()) {
-        if (auto *S = dyn_cast<StoreInst>(U)) {
-          if (S->getPointerOperand() == V && S->getValueOperand()->getType()->isPointerTy() &&
-              !isa<ConstantPointerNull>(S->getValueOperand()))
-            return true;
-        } else if (isa<GEPOperator>(U) || isa<BitCastOperator>(U) || isa<AddrSpaceCastOperator>(U)) {
-          if (storesPointer(U))
-            return true;
-        }
-      }
-      return false;
-    };
     // A constant of the program as a value of the harness; null when the
     // harness cannot name it.
     std::function<Value *(Value *, GlobalVariable *, GlobalVariable *)> toH =

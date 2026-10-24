@@ -6,6 +6,9 @@
 #include "llvm/IR/IntrinsicInst.h"
 
 #include <dlfcn.h>
+#include <execinfo.h>
+#include <signal.h>
+#include <unistd.h>
 
 static bool loadSink(const fs::path &yaml, std::string &file, unsigned &line) {
   std::ifstream in(yaml);
@@ -406,6 +409,13 @@ int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, cons
 } // namespace
 
 int main(int argc, char **argv) {
+  // SIGUSR1 prints where the model is, for a run that takes long.
+  signal(SIGUSR1, [](int) {
+    void *frames[64];
+    int n = backtrace(frames, 64);
+    backtrace_symbols_fd(frames, n, STDERR_FILENO);
+    (void)!write(STDERR_FILENO, "--\n", 3);
+  });
   if (argc != 3 && argc != 4) {
     errs() << "usage: model <cve-dir> <out-dir> [sequence]\n";
     return 1;

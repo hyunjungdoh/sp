@@ -1023,10 +1023,12 @@ const std::set<std::pair<std::string, int64_t>> &Client::transitive(Function *F,
 // The string constants text formal i of F is compared against with the C
 // library's comparisons: where the text, or a pointer into it, is an
 // argument of a comparison, the constants among its other arguments; where
-// it is passed on within F's inner closure, those of the callee's formal;
-// where it names a file the library opens, the input file's name. Nearest
-// first (breadth-first from F), at most 32. The texts that meet none of
-// these form one class, which a fresh text represents.
+// it is passed on to a function the library defines, those of the callee's
+// formal; where it names a file the library opens, the input file's name.
+// Nearest first (breadth-first from F), at most 32. The texts that meet none
+// of these form one class, which a fresh text represents. The classes are
+// what the whole call can tell apart, so the search does not stop at other
+// interface functions the way the attribution of effects does.
 const std::vector<std::string> &Client::compared(Function *F, unsigned i) const {
   auto key = std::make_pair(F, i);
   auto it = comparedOf.find(key);
@@ -1036,7 +1038,6 @@ const std::vector<std::string> &Client::compared(Function *F, unsigned i) const 
                                          "bcmp",   "strstr",  "strcasestr", "strcoll"};
   static const std::set<std::string> open{"fopen", "fopen64", "freopen", "open", "open64", "openat", "creat",
                                           "stat",  "stat64",  "lstat",   "access"};
-  const FnSet &within = innerClosure(F);
   std::vector<std::pair<Function *, unsigned>> order{key};
   std::set<std::pair<Function *, unsigned>> queued{key};
   std::vector<std::string> out;
@@ -1070,7 +1071,7 @@ const std::vector<std::string> &Client::compared(Function *F, unsigned i) const 
         if (isOpen && seen.insert("f").second)
           out.push_back("f");
         if (!isCmp) {
-          if (B && within.count(B) && a < B->arg_size() && queued.insert({B, a}).second)
+          if (B && !B->isDeclaration() && a < B->arg_size() && queued.insert({B, a}).second)
             order.push_back({B, a});
           continue;
         }
@@ -1111,7 +1112,9 @@ bool Client::needs(const std::string &U, const std::string &T, std::set<std::str
 // establish the state P needs to produce. Releases are excluded, and so are
 // functions whose arguments would need T itself. As with writers, both
 // sides stop at other callable interface functions: an effect reached
-// through g is g's own, and the client calls g directly.
+// through g is g's own, and the client calls g directly. Effects also stop
+// at destructors: a destructor ends the lifetime of the object it runs on,
+// so its stores establish no state.
 std::vector<Function *> Client::dependences(Function *P, const std::string &T) const {
   std::set<std::string> share;
   for (const Param &p : signature(P))
@@ -1159,7 +1162,40 @@ std::vector<Function *> Client::dependences(Function *P, const std::string &T) c
     }
   }
   // Only a field that decides a branch of P can decide whether P produces.
-  const auto &ref = controlRefs(P);
+  // W's effects (the stores of what W reaches without entering a callable
+  // interface function or a destructor) meet those fields iff W reaches a
+  // function that stores one: search back from those functions, not passing
+  // to the callers of a function the search does not enter.
+  if (modifiers.empty())
+    for (const auto &[G, fs] : mods)
+      for (const auto &f : fs)
+        modifiers[f].push_back(G);
+  if (callersOf.empty())
+    for (const auto &kv : calls)
+      for (Function *C : kv.second)
+        callersOf[C].insert(kv.first);
+  auto ends = [](Function *G) {
+    DISubprogram *SP = G->getSubprogram();
+    return SP && SP->getName().starts_with("~");
+  };
+  std::unordered_set<Function *> reach;
+  std::vector<Function *> work;
+  for (const auto &f : controlRefs(P))
+    if (persists.count(f.first))
+      if (auto m = modifiers.find(f); m != modifiers.end())
+        for (Function *G : m->second)
+          if (reach.insert(G).second)
+            work.push_back(G);
+  while (!work.empty()) {
+    Function *G = work.back();
+    work.pop_back();
+    if (((ifaceD.count(G) || ifaceU.count(G)) && callable(G)) || ends(G))
+      continue;
+    if (auto it = callersOf.find(G); it != callersOf.end())
+      for (Function *C : it->second)
+        if (reach.insert(C).second)
+          work.push_back(C);
+  }
   for (Function *W : ifaceD) {
     if (W == P || !callable(W))
       continue;
@@ -1175,14 +1211,7 @@ std::vector<Function *> Client::dependences(Function *P, const std::string &T) c
     }
     if (!shares || cyc || rel)
       continue;
-    const auto &mod = effects(W);
-    bool dep = false;
-    for (const auto &f : mod)
-      if (ref.count(f) && persists.count(f.first)) {
-        dep = true;
-        break;
-      }
-    if (dep)
+    if (reach.count(W))
       out.push_back(W);
   }
   std::sort(out.begin(), out.end(), [](Function *a, Function *b) { return a->getName() < b->getName(); });
@@ -1824,38 +1853,6 @@ const FnSet &Client::innerClosure(Function *F) const {
     }
   }
   return inner[F] = seen;
-}
-
-// The fields a call of F can leave modified for a later call: the stores of
-// its inner closure, not entering destructors. A destructor ends the
-// lifetime of the object it runs on, so its stores establish no state.
-const std::set<std::pair<std::string, int64_t>> &Client::effects(Function *F) const {
-  auto it = effectOf.find(F);
-  if (it != effectOf.end())
-    return it->second;
-  auto ends = [](Function *G) {
-    DISubprogram *SP = G->getSubprogram();
-    return SP && SP->getName().starts_with("~");
-  };
-  auto &out = effectOf[F];
-  FnSet seen{F};
-  std::vector<Function *> work{F};
-  while (!work.empty()) {
-    Function *G = work.back();
-    work.pop_back();
-    if (auto m = mods.find(G); m != mods.end())
-      out.insert(m->second.begin(), m->second.end());
-    auto c = calls.find(G);
-    if (c == calls.end())
-      continue;
-    for (Function *C : c->second) {
-      if (((ifaceD.count(C) || ifaceU.count(C)) && callable(C)) || ends(C))
-        continue;
-      if (seen.insert(C).second)
-        work.push_back(C);
-    }
-  }
-  return out;
 }
 
 // A call is constructible when every argument has a value: a held type

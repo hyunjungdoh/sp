@@ -150,8 +150,8 @@ private:
   FnMap<std::set<std::pair<std::string, int64_t>>> crefs;
   mutable FnMap<std::set<std::pair<std::string, int64_t>>> crefOf;
   const std::set<std::pair<std::string, int64_t>> &controlRefs(Function *F) const;
-  mutable FnMap<std::set<std::pair<std::string, int64_t>>> effectOf;
-  const std::set<std::pair<std::string, int64_t>> &effects(Function *F) const;
+  // The functions whose own stores modify a field.
+  mutable std::map<std::pair<std::string, int64_t>, std::vector<Function *>> modifiers;
   void buildModRef();
   mutable std::map<std::pair<Function *, unsigned>, std::vector<std::string>> comparedOf;
   const std::vector<std::string> &compared(Function *F, unsigned i) const;
