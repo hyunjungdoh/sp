@@ -2348,6 +2348,17 @@ Client::Plan Client::plan(const std::vector<std::pair<std::vector<std::string>, 
   };
   FnSet entrySet, writerSet, unguarded;
   std::set<std::tuple<std::string, int64_t, std::string, std::vector<std::string>>> cellSet;
+  // §3.6 쓰기측 writer: entry가 교차 직전에 보유 핸들 H의 설정 필드를 교차 객체로
+  // 복사할 때, 교차 객체의 경계 셀 c에 대한 의무는 그 값을 공급한 소스 필드 d로
+  // 환원된다. copyMap은 entry 클로저의 복사 store(V=load(src)→dst)를 모은 dst→{src}
+  // 맵이고, 그로부터 d의 실제 세터를 c의 writer로 잡는다. entry마다 한 번 계산한다.
+  using FieldKey = std::pair<std::string, int64_t>;
+  std::map<Function *, std::map<FieldKey, std::set<FieldKey>>> copyCache;
+  // §3.6 클라이언트 레버: writer W가 어떤 필드를 "클라이언트가 고른 값"으로 쓰는지.
+  // W의 입력 형식인자(스칼라/바이트/텍스트)에서 전방 데이터흐름으로 전파해, tainted
+  // 값이 store되는 필드를 모은다. 상수나 다른 고정 라이브러리 상태만 쓰는 store는
+  // 여기 없다 — 그래서 경계 셀의 writer는 실제로 인자가 그 칸에 닿을 때만 인정된다.
+  std::map<Function *, std::set<FieldKey>> taintCache;
   for (const auto &[seq, phi] : ws) {
     if (seq.empty())
       continue;
@@ -2375,6 +2386,161 @@ Client::Plan Client::plan(const std::vector<std::pair<std::vector<std::string>, 
       return own;
     };
     auto obligated = [](const Cell &c, bool own) { return !c.crossing || c.boundary || own; };
+    // §3.6 쓰기측 writer 실현. entry 클로저의 복사 store(교차 객체 필드 dst ←
+    // 보유 핸들 필드 src의 load)를 모아 dst→{src} 맵을 만든다. 예: libtiff
+    // JPEGPreEncode의 cinfo.image_width = tif->tif_dir.td_imagewidth. 값의
+    // 캐스트(trunc/zext/bitcast 등)는 벗겨 소스 load까지 따라간다.
+    auto copyMap = [&](Function *En) -> const std::map<FieldKey, std::set<FieldKey>> & {
+      auto it = copyCache.find(En);
+      if (it != copyCache.end())
+        return it->second;
+      auto &out = copyCache[En];
+      for (Function *G : innerClosure(En))
+        for (Instruction &I : instructions(*G)) {
+          auto *S = dyn_cast<StoreInst>(&I);
+          if (!S)
+            continue;
+          Value *V = S->getValueOperand();
+          while (auto *C = dyn_cast<CastInst>(V))
+            V = C->getOperand(0);
+          auto *L = dyn_cast<LoadInst>(V);
+          if (!L)
+            continue;
+          auto dst = fieldsOf(S->getPointerOperand());
+          auto src = fieldsOf(L->getPointerOperand());
+          if (dst.empty() || src.empty())
+            continue;
+          for (const auto &d : dst)
+            for (const auto &s : src)
+              if (d != s)
+                out[d].insert(s);
+        }
+      return out;
+    };
+    // entry만 직접 쓰는 경계 셀 c의 설정 세터: c로 복사된 소스 필드 d를 쓰는
+    // 인터페이스 함수(= 그 설정 필드의 실제 세터, 예: TIFFSetField). 값 제약
+    // 없이(op="!=", 빈 집합) writers를 호출해 d의 세터 전부를 얻는다.
+    auto configOf = [&](Function *En, const Cell &c) {
+      std::vector<Function *> out;
+      const auto &cm = copyMap(En);
+      auto it = cm.find({c.type, c.off});
+      if (it == cm.end())
+        return out;
+      std::set<Function *> seen;
+      for (const FieldKey &d : it->second) {
+        Cell src;
+        src.type = d.first;
+        src.off = d.second;
+        src.op = "!=";
+        for (Function *W : writers(src))
+          if (W != En && seen.insert(W).second)
+            out.push_back(W);
+      }
+      std::sort(out.begin(), out.end(), [](Function *a, Function *b) { return a->getName() < b->getName(); });
+      return out;
+    };
+    // W가 클라이언트가 고른 값으로 쓰는 필드 집합. W의 입력 형식인자에서 시작해 W의
+    // 클로저를 전방 전파한다: 값 연산(캐스트·산술·GEP·phi 등)은 taint를 잇고, tainted
+    // 포인터의 load도 잇고(바이트 버퍼 읽기), 호출 인자는 피호출자 형식인자로 넘긴다.
+    // tainted 값이 store되는 (타입,오프셋)을 모은다.
+    std::function<const std::set<FieldKey> &(Function *)> taintWritten = [&](Function *W) -> const std::set<FieldKey> & {
+      auto it = taintCache.find(W);
+      if (it != taintCache.end())
+        return it->second;
+      std::set<FieldKey> &out = taintCache[W]; // 재귀 차단용으로 먼저 삽입
+      auto sig = signature(W);
+      auto at = irParams(W);
+      std::map<Function *, std::set<unsigned>> argT;
+      for (unsigned i = 0; i < W->arg_size(); ++i) {
+        Type *T = W->getArg(i)->getType();
+        int k = i < at.size() ? at[i] : -1;
+        Kind kd = k >= 0 ? sig[k].kind : (T->isIntegerTy() ? Kind::Scalar : Kind::Object);
+        if (T->isIntegerTy() || kd == Kind::Scalar || kd == Kind::Bytes || kd == Kind::Text)
+          argT[W].insert(i);
+      }
+      std::set<Function *> inWork;
+      std::vector<Function *> wl;
+      auto enqueue = [&](Function *F) {
+        if (inWork.insert(F).second)
+          wl.push_back(F);
+      };
+      enqueue(W);
+      while (!wl.empty()) {
+        Function *F = wl.back();
+        wl.pop_back();
+        inWork.erase(F);
+        if (F->isDeclaration())
+          continue;
+        std::set<Value *> tv;
+        std::vector<Value *> vwl;
+        auto taint = [&](Value *v) {
+          if (tv.insert(v).second)
+            vwl.push_back(v);
+        };
+        for (unsigned i : argT[F])
+          if (i < F->arg_size())
+            taint(F->getArg(i));
+        while (!vwl.empty()) {
+          Value *v = vwl.back();
+          vwl.pop_back();
+          for (User *U : v->users()) {
+            if (auto *S = dyn_cast<StoreInst>(U)) {
+              if (S->getValueOperand() == v)
+                for (const auto &f : fieldsOf(S->getPointerOperand()))
+                  out.insert(f);
+              continue;
+            }
+            if (auto *L = dyn_cast<LoadInst>(U)) {
+              if (L->getPointerOperand() == v)
+                taint(L);
+              continue;
+            }
+            if (auto *CB = dyn_cast<CallBase>(U)) {
+              if (auto *C = dyn_cast<Function>(CB->getCalledOperand()->stripPointerCasts()))
+                if (Function *B = body(C->getName().str()))
+                  for (unsigned j = 0; j < CB->arg_size() && j < B->arg_size(); ++j)
+                    if (CB->getArgOperand(j) == v && argT[B].insert(j).second)
+                      enqueue(B);
+              continue;
+            }
+            if (isa<Instruction>(U))
+              taint(U);
+          }
+        }
+      }
+      return out;
+    };
+    // 경계 셀 c의 writer W가 클라이언트 레버를 나르는가: W가 c를 직접 (입력으로) 쓰거나,
+    // §3.6 복사의 소스 필드 d를 (입력으로) 쓴다.
+    auto carries = [&](Function *W, const Cell &c, Function *En) {
+      const auto &tw = taintWritten(W);
+      if (tw.count({c.type, c.off}))
+        return true;
+      const auto &cm = copyMap(En);
+      auto it = cm.find({c.type, c.off});
+      if (it != cm.end())
+        for (const FieldKey &d : it->second)
+          if (tw.count(d))
+            return true;
+      return false;
+    };
+    // §3.5 정리 B(a): 교차 후 U가 스스로 할당·기록하는 내부 셀은 클라이언트 의무가
+    // 아니다. 신호는 그 필드를 쓰는 정의된 함수가 전부 U(up 모듈)에 있다는 것 —
+    // 포인터 너머 U가 할당한 하위 객체(예: libjpeg의 my_main_controller). D 함수가
+    // 하나라도 쓰면(예: libtiff의 JPEGPreEncode가 cinfo로 복사) U-내부가 아니라 D가
+    // 세우는 설정 유래 의무다.
+    auto uInternal = [&](const std::string &type, int64_t off) {
+      std::pair<std::string, int64_t> key{type, off};
+      bool any = false;
+      for (const auto &[G, st] : stores)
+        for (auto s = st.lower_bound({key, ""}); s != st.end() && s->first == key; ++s) {
+          any = true;
+          if (G->getParent() != &up)
+            return false;
+          break;
+        }
+      return any;
+    };
     // The witness's arguments are the entry's only when it starts there. A
     // cell of a public object the client passes is its configuration; any
     // other cell the entry does not change is a guard.
@@ -2456,6 +2622,23 @@ Client::Plan Client::plan(const std::vector<std::pair<std::vector<std::string>, 
         }
         w = shared;
       }
+      // §3.6 클라이언트 레버: 경계 셀의 writer는 그 store 값이 호출 인자에서 전파돼야
+      // 인정한다(상수·고정 상태 store 제외). 직접 writer를 레버로 거르고, entry만
+      // 직접 쓰면 복사 소스를 세우는 세터(configOf)를 레버 조건으로 더한다.
+      if (c.boundary && !es.empty()) {
+        std::vector<Function *> kept;
+        for (Function *W : w)
+          if (std::find(es.begin(), es.end(), W) != es.end() || carries(W, c, es[0]))
+            kept.push_back(W);
+        w = kept;
+        bool onlyEntry = true;
+        for (Function *W : w)
+          onlyEntry = onlyEntry && std::find(es.begin(), es.end(), W) != es.end();
+        if (onlyEntry)
+          for (Function *W : configOf(es[0], c))
+            if (carries(W, c, es[0]) && std::find(w.begin(), w.end(), W) == w.end())
+              w.push_back(W);
+      }
       if (w.empty())
         continue;
       P.cellWriters.push_back({c, w});
@@ -2488,7 +2671,9 @@ Client::Plan Client::plan(const std::vector<std::pair<std::vector<std::string>, 
           continue;
         }
         for (Function *W : writers(c)) {
-          if (W == entry || !ifaceD.count(W))
+          if (!ifaceD.count(W))
+            continue;
+          if (std::find(es.begin(), es.end(), W) != es.end())
             continue;
           bool share = true;
           if (c.root >= 0 && (size_t)c.root < sigE.size() && held(sigE[c.root])) {
@@ -2496,9 +2681,20 @@ Client::Plan Client::plan(const std::vector<std::pair<std::vector<std::string>, 
             for (const Param &p : signature(W))
               share = share || (held(p) && p.type == sigE[c.root].type);
           }
-          if (share)
-            ww.push_back(W);
+          if (!share)
+            continue;
+          // §3.6 클라이언트 레버: 경계 셀의 직접 writer는 인자가 그 칸에 닿을 때만.
+          if (c.boundary && entry && !carries(W, c, entry))
+            continue;
+          ww.push_back(W);
         }
+        // §3.6 클라이언트 레버: 경계 셀을 entry가 교차 직전 핸들 설정에서 복사로 지으면,
+        // 복사 소스를 세우는 세터(configOf)를 레버 조건으로 더한다. 그런 세터가 있으면
+        // 커버, 없으면 uncovered로 정직하게 남는다.
+        if (c.boundary && entry)
+          for (Function *W : configOf(entry, c))
+            if (carries(W, c, entry) && std::find(ww.begin(), ww.end(), W) == ww.end())
+              ww.push_back(W);
         local.push_back({c, ww});
       }
       int uncovered = 0;
@@ -2519,8 +2715,10 @@ Client::Plan Client::plan(const std::vector<std::pair<std::vector<std::string>, 
               // library's static initialization. The necessary condition the
               // model read along the path is that fixed value, the same in
               // every execution, so it is established by construction, not by
-              // a client call.
-              !everStored(local[i].first.type, local[i].first.off)) {
+              // a client call. §3.5 정리 B(a): U가 교차 후 스스로 세우는 내부 셀도
+              // 클라이언트 의무가 아니므로 같은 버킷(construct)이다.
+              (!everStored(local[i].first.type, local[i].first.off) ||
+               uInternal(local[i].first.type, local[i].first.off))) {
             ++construct;
             continue;
           }
