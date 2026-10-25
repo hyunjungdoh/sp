@@ -321,6 +321,11 @@ struct Witness {
 Witness parseWitness(std::istream &st) {
   Witness w;
   std::vector<Client::Cell> may, facts;
+  // §3.5 정의 3.5.2: 이 시퀀스의 경계 근 R(π). 각 근은 (export 인자, 타입 경로)다.
+  std::vector<std::pair<int, std::vector<std::string>>> roots;
+  // §3.5: 이 시퀀스에 D→U 교차가 있는가(해결·미해결 근 중 하나라도). 있으면 경계
+  // 투영이 정의되어 경계 셀만 의무다.
+  bool crossing = false;
   bool sawModel = false;
   auto take = [](const std::string &s, std::vector<Client::Cell> &into) {
     std::istringstream in(s);
@@ -375,6 +380,8 @@ Witness parseWitness(std::istream &st) {
       w = Witness{};
       may.clear();
       facts.clear();
+      roots.clear();
+      crossing = false;
       sawModel = false;
       std::string n, absent;
       in >> n >> absent;
@@ -389,6 +396,26 @@ Witness parseWitness(std::istream &st) {
       std::string name;
       in >> name;
       w.seq.push_back(name);
+    } else if (head == "boundary") {
+      // "boundary cells X of Y roots R unresolved U": 교차 존재 = R>0 또는 U>0.
+      for (std::string tok; in >> tok;)
+        if (tok == "roots" || tok == "unresolved") {
+          std::string n;
+          if (in >> n)
+            if (auto v = asI64(n); v && *v > 0)
+              crossing = true;
+        }
+    } else if (head == "boundaryroot") {
+      std::string root;
+      in >> root;
+      if (root.rfind("arg", 0) != 0)
+        continue;
+      std::vector<std::string> typePath;
+      for (std::string tok; in >> tok;) {
+        auto p = tok.rfind('+');
+        typePath.push_back(p == std::string::npos ? tok : tok.substr(0, p));
+      }
+      roots.push_back({std::atoi(root.c_str() + 3), std::move(typePath)});
     } else if (head == "cell") {
       take(s, may);
     } else if (head == "model") {
@@ -415,6 +442,38 @@ Witness parseWitness(std::istream &st) {
     }
   }
   w.phi = sawModel ? facts : may;
+  // §2.4 Open·§7 환경 모델: 입력 파일 통로("f"로 열고 심볼릭 내용을 받는 셀)는
+  // 값 fact가 아니라 구조적 의무다. fact 층(model 라인)은 값만 싣고 file 속성은
+  // 싣지 않으므로, 파일 내용이 심볼릭이라 값이 unknown인 file 셀은 facts에서
+  // 통째로 빠진다. may 층은 file 셀을 항상 내보내므로, phi=facts일 때 그 file
+  // 셀을 (root, path, off)로 phi에 되살린다. 이미 있으면 file 표시만 켠다.
+  if (sawModel)
+    for (const Client::Cell &m : may) {
+      if (!m.file)
+        continue;
+      bool have = false;
+      for (Client::Cell &c : w.phi)
+        if (c.root == m.root && c.off == m.off && c.path == m.path) {
+          c.file = true;
+          have = true;
+          break;
+        }
+      if (!have)
+        w.phi.push_back(m);
+    }
+  // §3.5 정의 3.5.3 (경계 투영): 셀 c가 경계 셀인 것은 어떤 경계 근 r에 대해
+  // r.root = c.root이고 r의 타입 경로가 c의 경로의 접두(자기 포함)인 때다. 즉 c가
+  // 어떤 교차 실인자 안에 있는 셀일 때다. 접미가 빈 근은 인자 전체가 교차함을
+  // 뜻하므로 그 인자의 모든 셀이 경계다.
+  for (Client::Cell &c : w.phi) {
+    c.crossing = crossing;
+    for (const auto &r : roots)
+      if (r.first == c.root && r.second.size() <= c.path.size() &&
+          std::equal(r.second.begin(), r.second.end(), c.path.begin())) {
+        c.boundary = true;
+        break;
+      }
+  }
   if (w.seq.empty())
     w.index = -1;
   return w;

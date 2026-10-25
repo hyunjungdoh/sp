@@ -77,6 +77,14 @@ public:
     std::vector<std::string> values;
     // The cell names or reads the client's input file.
     bool file = false;
+    // §3.5: the cell lies inside a D→U crossing actual, so it is part of the
+    // state the client must build and hand across the boundary (Phi_boundary).
+    bool boundary = false;
+    // §3.5: this witness has a D→U crossing (some resolved or unresolved
+    // boundary root), so the boundary projection applies: only boundary cells
+    // are client obligations. Without a crossing the projection is undefined
+    // and every cell stays an obligation.
+    bool crossing = false;
   };
   // A constraint on an integer field embedded in an entry argument: the
   // field at byte offset off of argument root, width bits wide.

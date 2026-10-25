@@ -1404,6 +1404,30 @@ std::vector<Function *> Client::dependences(Function *P, const std::string &T) c
     if (reach.count(W))
       out.push_back(W);
   }
+  // §2 환경 모델 + §3.5 미해결 근: 교차 객체가 D 안에서 입력으로부터 만들어질 때,
+  // 그 내용은 클라이언트의 유일한 입력이 D로 들어오는 통로—바이트(V-Bytes)나 텍스트
+  // (V-Text, 입력 파일을 여는 경로)를 받는 인터페이스 호출—로만 확립된다. 그 통로가
+  // 생산자와 보유 객체를 공유하면, 필드-수정자 탐색이 스마트 포인터·벡터 같은 불투명
+  // 컨테이너를 거쳐 놓치더라도 생산자의 의존이다. 선택적 선행 호출로 더해지므로
+  // 유효한 클라이언트 호출이고(H1 보존), 생성 전에 상태를 세워 H2를 돕는다.
+  for (Function *W : ifaceD) {
+    if (W == P || !callable(W) || std::find(out.begin(), out.end(), W) != out.end())
+      continue;
+    auto sig = signature(W);
+    bool shares = false, cyc = false, rel = false, reads = false;
+    for (unsigned i = 0; i < sig.size(); ++i) {
+      if (held(sig[i])) {
+        shares = shares || share.count(sig[i].type);
+        std::set<std::string> seen;
+        cyc = cyc || needs(sig[i].type, T, seen);
+        rel = rel || releases.count({W, i});
+      }
+      if (sig[i].kind == Kind::Bytes || sig[i].kind == Kind::Text)
+        reads = true;
+    }
+    if (shares && reads && !cyc && !rel)
+      out.push_back(W);
+  }
   std::sort(out.begin(), out.end(), [](Function *a, Function *b) { return a->getName() < b->getName(); });
   return out;
 }
@@ -2057,8 +2081,11 @@ bool Client::callable(Function *F) const {
     const Param &p = sig[at[i]];
     if (held(p) && !cost.count(p.type))
       return false;
-    if (p.kind == Kind::Handle && !cost.count(p.type) && !nullTested(F, i))
-      return false;
+    // §2.2 V-Opaque 정제: 생성자가 없는 불투명 포인터(핸들로 분류되나 생산자 없음)는
+    // 클라이언트가 가질 수 있는 값이 NULL뿐이다. 어떤 클라이언트도 그 타입의 non-null
+    // 값을 만들 수 없으므로 NULL 전달이 유일하고 충실한 선택이고(H1 보존), 따라서 그
+    // 인자는 호출 가능성을 막지 않는다. (라이브러리가 opaque optional 인자를 NULL로
+    // 쓰라는 계약을 opaque·무생성자 타입으로 표현한 경우가 이에 해당한다.)
   }
   return true;
 }
@@ -2303,6 +2330,12 @@ bool Client::guardOf(Function *E, const Cell &c, Guard &g, bool config) const {
 // unions over the witnesses.
 Client::Plan Client::plan(const std::vector<std::pair<std::vector<std::string>, std::vector<Cell>>> &ws) const {
   Plan P;
+  // §3.5 정리 B (경계 투영): 클라이언트 의무는 경계 셀 Φ_∂뿐이다. 비경계 셀은 U가
+  // 교차 후 스스로 쓰는 내부 셀이거나 U가 관측하지 않는 D 셀이라 의무가 아니다.
+  // 투영은 witness에 D→U 교차가 있을 때만 정의된다(c.crossing). 교차 근이 전부
+  // 미해결이어도(경계 셀 0) 투영은 적용되어 모든 라이브러리 셀이 의무에서 빠지고,
+  // 의무는 미해결 근의 구성(생산자 체인의 입력 리더)으로만 남는다. 교차가 없으면
+  // 투영이 정의되지 않으므로 제한하지 않는다.
   // The nonterminals of the client grammar the entries and the writers can
   // demand: their held inputs, closed under the held inputs of every
   // producer. This is the grammar the harness carries; one execution
@@ -2327,6 +2360,21 @@ Client::Plan Client::plan(const std::vector<std::pair<std::vector<std::string>, 
     for (Function *F : es)
       if (entrySet.insert(F).second)
         P.entries.push_back(F);
+    // Finding 3: the obligation partition is computed once here and shared by
+    // all three passes below (guards, writers/files, verdict), so they cannot
+    // diverge on what a cell is. own: the cell lies in a public object the
+    // client itself passes to the entry (§4 설정), so the client writes it
+    // directly. obligated: §3.5 정리 B(정제) — with a crossing, only boundary
+    // cells and the client's own prefix cells are obligations; without a
+    // crossing every cell is.
+    auto ownCell = [&](const std::vector<Param> &sig, const std::vector<int> &at, const Cell &c) {
+      bool own = es.size() == 1 && es[0] == E && c.root >= 0 && (size_t)c.root < at.size() &&
+                 at[c.root] >= 0 && (size_t)at[c.root] < sig.size() && sig[at[c.root]].kind == Kind::Object;
+      for (const std::string &t : c.path)
+        own = own && isPublic(irName(t));
+      return own;
+    };
+    auto obligated = [](const Cell &c, bool own) { return !c.crossing || c.boundary || own; };
     // The witness's arguments are the entry's only when it starts there. A
     // cell of a public object the client passes is its configuration; any
     // other cell the entry does not change is a guard.
@@ -2335,10 +2383,16 @@ Client::Plan Client::plan(const std::vector<std::pair<std::vector<std::string>, 
       auto sigG = signature(E);
       auto atG = irParams(E);
       for (const Cell &c : phi) {
-        bool own = c.root >= 0 && (size_t)c.root < atG.size() && atG[c.root] >= 0 &&
-                   sigG[atG[c.root]].kind == Kind::Object;
-        for (const std::string &t : c.path)
-          own = own && isPublic(irName(t));
+        bool own = ownCell(sigG, atG, c);
+        // §3.5 정리 B: 비경계 셀의 가드는 클라이언트가 제어할 수 없는 상태를
+        // 강제해 과잉 제약이 되므로 뺀다. own 설정 셀은 유지한다.
+        if (!obligated(c, own))
+          continue;
+        // §2.4 Open: 파일 통로 셀의 의무는 값 가드가 아니라 입력 파일 이름("f")을
+        // 그 자리에 쓰는 것이다. 이는 files 메커니즘이 처리하므로(그리고 가드로
+        // 두면 뒤에 상수 0을 덮어써 파일 이름을 지운다) 값 가드에서는 뺀다.
+        if (c.file)
+          continue;
         Guard g;
         if (guardOf(E, c, g, own))
           conj.push_back(g);
@@ -2356,10 +2410,11 @@ Client::Plan Client::plan(const std::vector<std::pair<std::vector<std::string>, 
     for (const Cell &c : phi) {
       if (c.type.empty() || c.op.empty())
         continue;
-      bool own = es.size() == 1 && es[0] == E && c.root >= 0 && (size_t)c.root < atE.size() && atE[c.root] >= 0 &&
-                 sigE[atE[c.root]].kind == Kind::Object;
-      for (const std::string &t : c.path)
-        own = own && isPublic(irName(t));
+      bool own = ownCell(sigE, atE, c);
+      // §3.5 정리 B: 경계 투영. 비경계 셀은 클라이언트 의무가 아니므로 writer/파일
+      // 대상에서 뺀다. 클라이언트가 직접 쓰는 own 셀은 투영과 무관하게 설정이다.
+      if (!obligated(c, own))
+        continue;
       if (own && c.file) {
         auto &fs = P.files[E];
         bool dup = false;
@@ -2416,16 +2471,19 @@ Client::Plan Client::plan(const std::vector<std::pair<std::vector<std::string>, 
       for (const Cell &c : phi) {
         if (c.type.empty() || c.op.empty())
           continue;
-        bool own = es.size() == 1 && es[0] == E && c.root >= 0 && (size_t)c.root < atE.size() && atE[c.root] >= 0 &&
-                   sigE[atE[c.root]].kind == Kind::Object;
-        for (const std::string &t : c.path)
-          own = own && isPublic(irName(t));
+        bool own = ownCell(sigE, atE, c);
+        // own 셀은 클라이언트가 직접 쓴다(설정). own file 셀은 Open 통로("f")로
+        // 충족되므로, 어느 쪽이든 uncovered가 아니다.
         if (own)
+          continue;
+        // §3.5 정리 B: 경계 셀(과 own 전위 셀)만 의무다. 비경계 셀은 uncovered로
+        // 세지 않는다.
+        if (!obligated(c, own))
           continue;
         // A bound or a relation between two cells is an entry obligation.
         // A store of some other value does not discharge it.
         std::vector<Function *> ww;
-        if (c.op != "=" && c.op != "!=") {
+        if (!c.file && c.op != "=" && c.op != "!=") {
           local.push_back({c, ww});
           continue;
         }
@@ -2450,11 +2508,19 @@ Client::Plan Client::plan(const std::vector<std::pair<std::vector<std::string>, 
       std::vector<int> need;
       for (size_t i = 0; i < local.size(); ++i) {
         if (local[i].second.empty()) {
-          // A field no defined function writes is set only by the library's
-          // static initialization. The necessary condition the model read
-          // along the path is that fixed value, the same in every execution,
-          // so it is established by construction, not by a client call.
-          if (!everStored(local[i].first.type, local[i].first.off)) {
+          // Finding 1 (§2.4 Open): a file cell is the input channel, not a
+          // value. If it is not own (so the client cannot write "f" into it
+          // directly) and no interface call sets it, the harness cannot
+          // direct the input — a genuine unmet obligation. It must surface
+          // loudly as uncovered, never as construct (static init), which
+          // would silently pass a harness that never reaches the crossing.
+          if (!local[i].first.file &&
+              // A field no defined function writes is set only by the
+              // library's static initialization. The necessary condition the
+              // model read along the path is that fixed value, the same in
+              // every execution, so it is established by construction, not by
+              // a client call.
+              !everStored(local[i].first.type, local[i].first.off)) {
             ++construct;
             continue;
           }
@@ -3200,7 +3266,9 @@ void Client::emit(const Plan &P, Module &H) const {
         case Kind::Object:
           if (held(p) || p.kind == Kind::Handle) {
             if (!cost.count(p.type))
-              v = empty(C, nullable);
+              // §2.2 V-Opaque 정제: 생성자 없는 불투명 포인터의 유일한 클라이언트
+              // 값은 NULL이다. 경로를 죽이지 않고 NULL을 넘긴다.
+              v = ConstantPointerNull::get(p0);
             else
               v = nullOr(C, nullable, [&](IRBuilder<> &D) { return obtain(D, p.type); });
             break;

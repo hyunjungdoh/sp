@@ -1453,10 +1453,8 @@
         if (flen)
           out << " " << *flen;
       }
-      if (isBoundary(c)) {
-        out << " boundary";
+      if (isBoundary(c))
         ++boundaryCells;
-      }
       out << "\n";
       // The same path with each dereference marked, which the cell line's
       // spelling leaves implicit.
@@ -1490,6 +1488,16 @@
     }
     out << "boundary cells " << boundaryCells << " of " << cells.size()
         << " roots " << boundaryRoots.size() << " unresolved " << boundaryUnresolved << "\n";
+    // §3.5 정의 3.5.2: 경계 근 집합 R(π). 각 근은 export 인자 기준 접근 경로다.
+    // 클라이언트 의무(정의 6의 "제약된 셀")는 이 근 중 하나를 접두로 갖는 셀, 즉
+    // 경계 투영 Φ_∂뿐이다(정의 3.5.3). must 층은 이 선들로 각 셀의 경계 여부를
+    // 판정한다. 접미가 비면 인자 전체가 교차하므로 그 인자의 모든 셀이 경계다.
+    for (const auto &r : boundaryRoots) {
+      out << "boundaryroot arg" << r.first;
+      for (const Step &s : r.second)
+        out << " " << s.type << "+" << s.off;
+      out << "\n";
+    }
     Transition tr;
     using Cell = std::pair<int, Suffix>;
     std::map<Cell, SlotVal> mem;
