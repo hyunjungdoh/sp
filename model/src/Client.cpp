@@ -2524,6 +2524,66 @@ Client::Plan Client::plan(const std::vector<std::pair<std::vector<std::string>, 
             return true;
       return false;
     };
+    // §7 닫힌 세계의 두 번째 클라이언트 레버: 입력 파일 내용. 파일 내용은 read()류가
+    // 메모리 버퍼에 채우고 파서가 그 메모리를 다시 읽어 필드에 넣으므로 SSA taint로는
+    // 추적되지 않는다. 대신 닫힌 세계(심볼릭 파일이 유일 입력, §7)를 근거로 한다:
+    // entry 클로저가 열린 파일을 읽고(아래 I/O 프리미티브) 그 클로저가 경계 셀을
+    // 비상수(abstractValue "*") 값으로 쓰면, 그 값은 상수(정적 초기화)도 인자도 아니므로
+    // 유일한 입력인 파일 내용에서 온 것이다 → 심볼릭 파일 + entry가 그 칸을 realize한다
+    // (추가 호출 불필요: entry가 파일을 파싱하면서 채운다). 라이브러리 무관 일반 규칙.
+    auto ioPrimitive = [](StringRef n) {
+      static const std::set<StringRef> io{"read",   "pread",   "pread64",        "readv",   "preadv",
+                                          "recv",   "recvfrom", "recvmsg",       "fread",   "fread_unlocked",
+                                          "fgetc",  "getc",     "getc_unlocked", "getchar", "fgets",
+                                          "fgetws", "getline",  "getdelim",      "mmap",    "mmap64"};
+      return io.count(n) > 0;
+    };
+    auto readsFile = [&](Function *F) {
+      for (Function *G : innerClosure(F))
+        for (Instruction &I : instructions(*G))
+          if (auto *CB = dyn_cast<CallBase>(&I))
+            if (Function *C = CB->getCalledFunction())
+              if (ioPrimitive(C->getName()))
+                return true;
+      return false;
+    };
+    // entry가 전이적으로 실행하는 코드 전체(인터페이스 경계에서 멈추지 않음). 파일은
+    // 라이브러리 깊숙이(예: libjpeg의 jpeg_read_header 아래)에서 파싱되므로, 파일 내용
+    // 레버는 이 깊은 도달 집합으로 본다.
+    std::map<Function *, std::shared_ptr<FnSet>> deepCache;
+    auto deepClosure = [&](Function *F) -> const FnSet & {
+      auto it = deepCache.find(F);
+      if (it != deepCache.end())
+        return *it->second;
+      auto set = std::make_shared<FnSet>();
+      set->insert(F);
+      std::vector<Function *> work{F};
+      while (!work.empty()) {
+        Function *G = work.back();
+        work.pop_back();
+        auto c = calls.find(G);
+        if (c == calls.end())
+          continue;
+        for (Function *C : c->second)
+          if (set->insert(C).second)
+            work.push_back(C);
+      }
+      deepCache[F] = set;
+      return *set;
+    };
+    // entry가 실행하는 코드 어딘가에서 (타입,오프셋)에 비상수(파일 유래) 값을 쓰는가.
+    auto fileStored = [&](Function *F, const std::string &type, int64_t off) {
+      std::pair<std::string, int64_t> key{type, off};
+      for (Function *G : deepClosure(F)) {
+        auto it = stores.find(G);
+        if (it == stores.end())
+          continue;
+        for (auto s = it->second.lower_bound({key, ""}); s != it->second.end() && s->first == key; ++s)
+          if (s->second == "*")
+            return true;
+      }
+      return false;
+    };
     // §3.5 정리 B(a): 교차 후 U가 스스로 할당·기록하는 내부 셀은 클라이언트 의무가
     // 아니다. 신호는 그 필드를 쓰는 정의된 함수가 전부 U(up 모듈)에 있다는 것 —
     // 포인터 너머 U가 할당한 하위 객체(예: libjpeg의 my_main_controller). D 함수가
@@ -2699,9 +2759,11 @@ Client::Plan Client::plan(const std::vector<std::pair<std::vector<std::string>, 
       }
       int uncovered = 0;
       int construct = 0;
+      int fileCov = 0;
       std::string openCells;
       std::vector<Function *> cand;
       std::vector<int> need;
+      bool entryReadsFile = entry && readsFile(entry);
       for (size_t i = 0; i < local.size(); ++i) {
         if (local[i].second.empty()) {
           // Finding 1 (§2.4 Open): a file cell is the input channel, not a
@@ -2721,6 +2783,53 @@ Client::Plan Client::plan(const std::vector<std::pair<std::vector<std::string>, 
                uInternal(local[i].first.type, local[i].first.off))) {
             ++construct;
             continue;
+          }
+          // §7 파일 내용 레버: 경계 셀을 entry가 열린 파일을 파싱하며 비상수로 채우면,
+          // 그 값은 상수도 인자도 아닌 유일 입력(파일)에서 온 것이므로 심볼릭 파일 +
+          // entry가 그 칸을 realize한다(추가 호출 불필요).
+          const Cell &fc = local[i].first;
+          if (fc.boundary && entryReadsFile) {
+            bool byFile = fileStored(entry, fc.type, fc.off);
+            if (!byFile) {
+              const auto &cm = copyMap(entry);
+              auto it = cm.find({fc.type, fc.off});
+              if (it != cm.end())
+                for (const FieldKey &d : it->second)
+                  byFile = byFile || fileStored(entry, d.first, d.second);
+            }
+            if (byFile) {
+              ++fileCov;
+              continue;
+            }
+          }
+          // 상수-확립: 경계 셀을 라이브러리가 제약을 만족하는 상수로 결정적으로 세우면
+          // (abstractValue가 상수이고 satisfies), 그 값은 모든 실행에서 같으므로
+          // construction으로 확립된 것이다(클라이언트 호출 불필요).
+          if (fc.boundary && entry) {
+            auto satConst = [&](const std::string &ty, int64_t of) {
+              std::pair<std::string, int64_t> key{ty, of};
+              for (Function *G : deepClosure(entry)) {
+                auto it = stores.find(G);
+                if (it == stores.end())
+                  continue;
+                for (auto s = it->second.lower_bound({key, ""}); s != it->second.end() && s->first == key; ++s)
+                  if (s->second != "*" && satisfies(s->second, fc))
+                    return true;
+              }
+              return false;
+            };
+            bool est = satConst(fc.type, fc.off);
+            if (!est) {
+              const auto &cm = copyMap(entry);
+              auto it = cm.find({fc.type, fc.off});
+              if (it != cm.end())
+                for (const FieldKey &d : it->second)
+                  est = est || satConst(d.first, d.second);
+            }
+            if (est) {
+              ++construct;
+              continue;
+            }
           }
           ++uncovered;
           openCells += " " + local[i].first.type + "+" + std::to_string(local[i].first.off);
@@ -2772,6 +2881,7 @@ Client::Plan Client::plan(const std::vector<std::pair<std::vector<std::string>, 
       line += " lib " + std::to_string(local.size());
       line += " uncovered " + std::to_string(uncovered);
       line += " construct " + std::to_string(construct);
+      line += " file " + std::to_string(fileCov);
       line += " calls " + std::to_string(calls);
       for (Function *W : word)
         line += " " + W->getName().str();
