@@ -27,8 +27,41 @@
 // several. A cell with no such fact stays unknown. Two constants forced on
 // one cell at one state make the sequence unsatisfiable, and the next
 // sequence is tried. The harness writes the entry of the residual. The
-// residual runs once. The sink instruction stays there. Its overflow is not
-// a clause.
+// residual runs once.
+//
+// An operand of a required comparison is the load when that load is a cell.
+// Otherwise it is the value of the store that dominates the branch, and a
+// call that returns one of its arguments is that argument. A call that does
+// not reduce this way stays the call: the formula is that its result stands
+// in the same relation to the constant. An argument the call can return
+// unchanged is its fallback, the value of a missing key. The witness is a
+// constant that satisfies every predicate on that call. The fallback is the
+// witness when it already satisfies them. A witness the fallback does not
+// meet is the input that selects the branch. A call that stores only into
+// its own locals is a lookup. The harness returns its integer witness, and
+// returns null when a pointer result may be null, when no later call on the
+// path reads that object except through a lookup. A later call that is not
+// a lookup and receives the same cell, or a cell inside it, reads the bytes
+// the witness would have hidden, so the call stays, the harness assumes the
+// result, and those bytes stay the entry. A pointer is not that
+// integer. Non-null means an object, so the integer 1 is never a pointer
+// result. A call that writes an argument, or whose body returns the pointer,
+// stays the call, and the harness assumes the comparison. A comparison of a
+// pointer is with null. A declaration has no body and cannot allocate. When
+// its result must be a non-null pointer, that result is a fresh object whose
+// size is the constant-offset extent of the bytes the continuation reads or
+// writes through it, including a negative displacement from an interior
+// pointer. The returned pointer addresses the zero point of that extent.
+// Unnamed bytes of the object are symbolic. A pointer and an integer the
+// callee reads as a count are that buffer. The count, when it is a constant,
+// is the size. When the count is an entry cell and no constant access gives
+// a size, the buffer is 2^16 bytes and the count is that size: a count the
+// formula does not pin, inside the bound on an object. An extent of zero names no
+// bytes, and an extent above 2^20 bytes is not materialized; the call stays
+// and the comparison is assumed. An integer argument may be a size the call
+// computes, so a declaration that has one stays as well. A cell used as
+// a callee holds one of the functions stored there. When none remains, the
+// slot keeps the zero the object was cleared to.
 //
 // Sequence 0 is the best simple path from an interface function of D to
 // the sink: fewer indirect edges, then fewer calls, then earlier call sites
@@ -40,6 +73,7 @@
 
 #include "Source.h"
 
+#include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
 #include "llvm/IR/CFG.h"
@@ -49,6 +83,7 @@
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
@@ -500,6 +535,8 @@ class Model {
     unsigned width = 8;
     bool file = false;
     bool pathPtr = false;
+    // The load of this cell is a callee. It is not a symbolic address.
+    bool code = false;
     FunctionType *fty = nullptr;
     std::optional<uint64_t> len;
     // The constant address a constructor stored into this slot.
@@ -569,6 +606,13 @@ class Model {
   };
   std::vector<PtrSpan> ptrSpan;
   std::map<std::pair<int, Suffix>, uint64_t> readBytes;
+  // A count an upstream call reads that many bytes by: the entry cell that
+  // holds it, the most the materialized buffer admits, and its width.
+  struct CountCap {
+    uint64_t most = 0;
+    unsigned bytes = 8;
+  };
+  std::map<std::pair<int, Suffix>, CountCap> countCap;
   std::map<std::pair<int, Suffix>, uint64_t> fileLen;
   std::map<int, uint64_t> argFileLen;
   std::vector<Function *> starts;
@@ -582,6 +626,16 @@ class Model {
   mutable bool accessReady = false;
 
   Function *define(StringRef name) const;
+
+  // The callee reads up to n bytes through p: some access to the object p
+  // points into is bounded by a value that depends on n. Dependence follows
+  // SSA and local reloads, not heap fields, and is context-sensitive: a
+  // callee's return reaches only the call that passed the dependent actual,
+  // through its summary.
+  bool pairRead(Function *D, unsigned p, unsigned n) const;
+  struct FlowIndex;
+  mutable std::shared_ptr<FlowIndex> flowIdx;
+  mutable std::map<std::tuple<const Function *, unsigned, unsigned>, bool> pairMemo;
 
 
   // A call whose callee is not a function in the module. Its body is not
@@ -892,3 +946,486 @@ class Model {
   // enter the residual. Bytes no equation names stay symbolic.
   void emit(Module &H) const;
 };
+
+// An argument a function can return unchanged. The miss path of a lookup
+// returns this argument; the call's constant for it is the fallback value.
+inline std::optional<unsigned> fallbackArg(const Function *F) {
+  if (!F || F->isDeclaration())
+    return std::nullopt;
+  std::unordered_map<const Value *, unsigned> exact;
+  for (const Argument &A : F->args())
+    exact[&A] = A.getArgNo();
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (const Instruction &I : instructions(*F)) {
+      if (exact.count(&I))
+        continue;
+      if (auto *C = dyn_cast<CastInst>(&I)) {
+        auto it = exact.find(C->getOperand(0));
+        if (it == exact.end())
+          continue;
+        exact[&I] = it->second;
+        changed = true;
+        continue;
+      }
+      auto *L = dyn_cast<LoadInst>(&I);
+      if (!L)
+        continue;
+      auto *A = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts());
+      if (!A)
+        continue;
+      std::optional<unsigned> arg;
+      bool ok = false;
+      for (const User *U : A->users()) {
+        auto *S = dyn_cast<StoreInst>(U);
+        if (!S || S->getPointerOperand()->stripPointerCasts() != A)
+          continue;
+        auto it = exact.find(S->getValueOperand()->stripPointerCasts());
+        if (it == exact.end())
+          it = exact.find(S->getValueOperand());
+        if (it == exact.end() || (arg && *arg != it->second)) {
+          ok = false;
+          arg.reset();
+          break;
+        }
+        arg = it->second;
+        ok = true;
+      }
+      if (!ok || !arg)
+        continue;
+      exact[&I] = *arg;
+      changed = true;
+    }
+  }
+  std::optional<unsigned> found;
+  auto take = [&](unsigned arg) {
+    if (found && *found != arg)
+      found = std::nullopt;
+    else
+      found = arg;
+  };
+  for (const BasicBlock &BB : *F) {
+    auto *R = dyn_cast<ReturnInst>(BB.getTerminator());
+    if (!R || !R->getReturnValue())
+      continue;
+    const Value *V = R->getReturnValue();
+    if (auto it = exact.find(V); it != exact.end()) {
+      take(it->second);
+      if (!found)
+        return std::nullopt;
+      continue;
+    }
+    auto *P = dyn_cast<PHINode>(V);
+    if (!P)
+      continue;
+    std::optional<unsigned> one;
+    for (unsigned i = 0; i < P->getNumIncomingValues(); ++i) {
+      auto it = exact.find(P->getIncomingValue(i));
+      if (it == exact.end())
+        continue;
+      if (one && *one != it->second) {
+        one.reset();
+        break;
+      }
+      one = it->second;
+    }
+    if (!one)
+      continue;
+    take(*one);
+    if (!found)
+      return std::nullopt;
+  }
+  return found;
+}
+
+inline bool cmpHolds(unsigned pred, int64_t v, int64_t k) {
+  switch (pred) {
+  case ICmpInst::ICMP_EQ:
+    return v == k;
+  case ICmpInst::ICMP_NE:
+    return v != k;
+  case ICmpInst::ICMP_UGT:
+    return (uint64_t)v > (uint64_t)k;
+  case ICmpInst::ICMP_UGE:
+    return (uint64_t)v >= (uint64_t)k;
+  case ICmpInst::ICMP_ULT:
+    return (uint64_t)v < (uint64_t)k;
+  case ICmpInst::ICMP_ULE:
+    return (uint64_t)v <= (uint64_t)k;
+  case ICmpInst::ICMP_SGT:
+    return v > k;
+  case ICmpInst::ICMP_SGE:
+    return v >= k;
+  case ICmpInst::ICMP_SLT:
+    return v < k;
+  case ICmpInst::ICMP_SLE:
+    return v <= k;
+  default:
+    return false;
+  }
+}
+
+// A constant that meets every predicate. The fallback is chosen when it does.
+inline std::optional<int64_t> satisfyingValue(const std::vector<std::pair<unsigned, int64_t>> &cs, std::optional<int64_t> fallback) {
+  auto ok = [&](int64_t v) {
+    for (const auto &c : cs)
+      if (!cmpHolds(c.first, v, c.second))
+        return false;
+    return !cs.empty();
+  };
+  std::vector<int64_t> cand;
+  if (fallback)
+    cand.push_back(*fallback);
+  for (const auto &c : cs) {
+    cand.push_back(c.second);
+    if (c.first == ICmpInst::ICMP_NE)
+      cand.push_back(c.second == 0 ? 1 : 0);
+    if (c.first == ICmpInst::ICMP_SGT || c.first == ICmpInst::ICMP_UGT)
+      cand.push_back(c.second + 1);
+    if (c.first == ICmpInst::ICMP_SLT || c.first == ICmpInst::ICMP_ULT)
+      cand.push_back(c.second - 1);
+  }
+  cand.push_back(0);
+  cand.push_back(1);
+  cand.push_back(-1);
+  for (int64_t v : cand)
+    if (ok(v))
+      return v;
+  for (int64_t v = -8; v <= 16; ++v)
+    if (ok(v))
+      return v;
+  return std::nullopt;
+}
+
+// IR drops the cv-qualifier of the implicit object parameter. The Itanium
+// mangling keeps it in a nested name: _ZN <CV-qualifiers> ... with
+// <CV-qualifiers> ::= [r] [V] [K]. K makes this a pointer to const, so the
+// method does not write its receiver.
+inline bool constReceiver(const Function *F) {
+  StringRef n = F->getName();
+  if (!n.consume_front("_ZN"))
+    return false;
+  n.consume_front("r");
+  n.consume_front("V");
+  return n.starts_with("K");
+}
+
+// The arguments a declaration cannot write through, by their declared type.
+// IR erases pointee qualifiers. The mangled parameter types keep them: a
+// pointer or reference whose pointee is const (T const*, T const&) names
+// memory the callee only reads. The receiver is the first argument when the
+// nested name is const-qualified; a sret slot comes before it.
+inline uint64_t constPointees(const Function *F) {
+  static std::unordered_map<const Function *, uint64_t> memo;
+  if (auto it = memo.find(F); it != memo.end())
+    return it->second;
+  uint64_t mask = 0;
+  std::string name = F->getName().str();
+  ItaniumPartialDemangler dm;
+  if (!dm.partialDemangle(name.c_str()) && dm.isFunction()) {
+    size_t len = 0;
+    if (char *buf = dm.getFunctionParameters(nullptr, &len)) {
+      std::string ps(buf);
+      std::free(buf);
+      if (ps.size() >= 2 && ps.front() == '(' && ps.back() == ')')
+        ps = ps.substr(1, ps.size() - 2);
+      std::vector<std::string> params;
+      int depth = 0;
+      std::string cur;
+      for (char c : ps) {
+        if (c == '<' || c == '(' || c == '[')
+          ++depth;
+        else if (c == '>' || c == ')' || c == ']')
+          --depth;
+        if (c == ',' && depth == 0) {
+          params.push_back(cur);
+          cur.clear();
+          continue;
+        }
+        cur.push_back(c);
+      }
+      if (!cur.empty())
+        params.push_back(cur);
+      for (auto &p : params) {
+        size_t b = p.find_first_not_of(' '), e = p.find_last_not_of(' ');
+        p = b == std::string::npos ? "" : p.substr(b, e - b + 1);
+      }
+      params.erase(std::remove_if(params.begin(), params.end(), [](const std::string &p) { return p.empty() || p == "..."; }),
+                   params.end());
+      // The qualifier binds the pointee when it precedes the outermost * or &.
+      auto pointeeConst = [](const std::string &p) {
+        int d = 0;
+        long last = -1;
+        for (size_t i = 0; i < p.size(); ++i) {
+          char c = p[i];
+          if (c == '<' || c == '(' || c == '[')
+            ++d;
+          else if (c == '>' || c == ')' || c == ']')
+            --d;
+          else if (d == 0 && (c == '*' || c == '&'))
+            last = (long)i;
+        }
+        if (last < 0)
+          return false;
+        size_t s = (size_t)last;
+        while (s > 0 && p[s - 1] == '&')
+          --s;
+        std::string before = p.substr(0, s);
+        while (!before.empty() && before.back() == ' ')
+          before.pop_back();
+        return before.size() >= 5 && before.compare(before.size() - 5, 5, "const") == 0;
+      };
+      unsigned A = F->arg_size(), P = (unsigned)params.size();
+      if (P <= A) {
+        unsigned off = A - P;
+        for (unsigned i = 0; i < P; ++i)
+          if (off + i < 64 && pointeeConst(params[i]))
+            mask |= 1ull << (off + i);
+        if (constReceiver(F)) {
+          unsigned r = A > 0 && F->hasParamAttribute(0, Attribute::StructRet) ? 1 : 0;
+          if (r < off)
+            mask |= 1ull << r;
+        }
+      }
+    }
+  }
+  memo[F] = mask;
+  return mask;
+}
+
+// The function writes only memory that does not outlive the call: its own
+// allocas, and the arguments in localMask, which are bound to a caller's
+// stack local. A write through any other argument is a change the caller
+// observes, so the call is not a lookup. A key under evaluation reads as
+// false, so a recursive cycle keeps its real calls; every (F, localMask) key is
+// evaluated once, which bounds the recursion.
+inline bool lookupOnlyRec(const Function *F, std::map<std::pair<const Function *, uint64_t>, std::optional<bool>> &memo,
+                          uint64_t localMask) {
+  if (!F || F->isDeclaration())
+    return false;
+  std::pair<const Function *, uint64_t> key{F, localMask};
+  if (auto it = memo.find(key); it != memo.end())
+    return it->second && *it->second;
+  auto isLocalArg = [&](unsigned i) { return i < 64 && (localMask >> i & 1); };
+  memo[key] = std::nullopt;
+  std::unordered_set<const AllocaInst *> boxes;
+  for (const Instruction &I : instructions(*F))
+    if (auto *A = dyn_cast<AllocaInst>(&I))
+      boxes.insert(A);
+  auto baseAlloca = [&](const Value *P) -> const AllocaInst * {
+    const Value *V = P->stripPointerCasts();
+    std::unordered_set<const Value *> seen;
+    while (V && seen.insert(V).second) {
+      if (auto *G = dyn_cast<GEPOperator>(V)) {
+        V = G->getPointerOperand()->stripPointerCasts();
+        continue;
+      }
+      if (auto *C = dyn_cast<CastInst>(V)) {
+        V = C->getOperand(0)->stripPointerCasts();
+        continue;
+      }
+      break;
+    }
+    return dyn_cast<AllocaInst>(V);
+  };
+  // A local that holds an argument is that argument. -O0 spills this into an
+  // alloca and passes the reload, and that reload still names the object.
+  std::unordered_set<const AllocaInst *> spill;
+  std::unordered_set<const Value *> outside;
+  for (const Argument &A : F->args())
+    if (A.getType()->isPointerTy() && !isLocalArg(A.getArgNo()))
+      outside.insert(&A);
+  bool grew = true;
+  while (grew) {
+    grew = false;
+    for (const Instruction &I : instructions(*F)) {
+      if (auto *S = dyn_cast<StoreInst>(&I)) {
+        auto *A = baseAlloca(S->getPointerOperand());
+        if (!A || spill.count(A))
+          continue;
+        const Value *V = S->getValueOperand()->stripPointerCasts();
+        if (outside.count(V) || isa<GlobalValue>(V)) {
+          spill.insert(A);
+          grew = true;
+        }
+        continue;
+      }
+      auto *L = dyn_cast<LoadInst>(&I);
+      if (!L || !L->getType()->isPointerTy() || outside.count(L))
+        continue;
+      auto *A = baseAlloca(L->getPointerOperand());
+      if (A && spill.count(A)) {
+        outside.insert(L);
+        grew = true;
+      }
+    }
+  }
+  // A local address is one of this frame's allocas or a caller's local, and
+  // stays one when -O0 stores it into a slot and loads it back. A slot that
+  // also holds an outside pointer names no single region, so its reload is
+  // not local.
+  std::unordered_set<const AllocaInst *> holds;
+  std::unordered_set<const Value *> held;
+  for (const Argument &A : F->args())
+    if (isLocalArg(A.getArgNo()))
+      held.insert(&A);
+  for (const AllocaInst *A : boxes)
+    if (!spill.count(A))
+      held.insert(A);
+  grew = true;
+  while (grew) {
+    grew = false;
+    for (const Instruction &I : instructions(*F)) {
+      if (auto *S = dyn_cast<StoreInst>(&I)) {
+        auto *A = baseAlloca(S->getPointerOperand());
+        if (!A || holds.count(A))
+          continue;
+        if (held.count(S->getValueOperand()->stripPointerCasts())) {
+          holds.insert(A);
+          grew = true;
+        }
+        continue;
+      }
+      auto *L = dyn_cast<LoadInst>(&I);
+      if (!L || !L->getType()->isPointerTy() || held.count(L))
+        continue;
+      auto *Slot = baseAlloca(L->getPointerOperand());
+      if (Slot && holds.count(Slot) && !spill.count(Slot)) {
+        held.insert(L);
+        grew = true;
+      }
+    }
+  }
+  auto fromArg = [&](const Value *P) {
+    std::vector<const Value *> st{P->stripPointerCasts()};
+    std::unordered_set<const Value *> seen;
+    while (!st.empty()) {
+      const Value *X = st.back();
+      st.pop_back();
+      if (!X || !seen.insert(X).second)
+        continue;
+      if (outside.count(X) || isa<Argument>(X) || isa<GlobalValue>(X))
+        return true;
+      if (auto *G = dyn_cast<GEPOperator>(X))
+        st.push_back(G->getPointerOperand());
+      else if (auto *C = dyn_cast<CastInst>(X))
+        st.push_back(C->getOperand(0));
+      else       if (auto *L = dyn_cast<LoadInst>(X)) {
+        if (outside.count(L))
+          return true;
+        st.push_back(L->getPointerOperand());
+      }
+    }
+    return false;
+  };
+  auto throughLocal = [&](const Value *P) {
+    const Value *V = P->stripPointerCasts();
+    std::unordered_set<const Value *> seen;
+    while (V && seen.insert(V).second) {
+      if (held.count(V))
+        return true;
+      if (auto *G = dyn_cast<GEPOperator>(V)) {
+        V = G->getPointerOperand()->stripPointerCasts();
+        continue;
+      }
+      if (auto *C = dyn_cast<CastInst>(V)) {
+        V = C->getOperand(0)->stripPointerCasts();
+        continue;
+      }
+      if (auto *L = dyn_cast<LoadInst>(V)) {
+        auto *Slot = baseAlloca(L->getPointerOperand());
+        if (Slot && holds.count(Slot) && !spill.count(Slot))
+          return true;
+        break;
+      }
+      break;
+    }
+    return false;
+  };
+  for (const Instruction &I : instructions(*F)) {
+    if (auto *S = dyn_cast<StoreInst>(&I)) {
+      if (throughLocal(S->getPointerOperand()))
+        continue;
+      auto *A = baseAlloca(S->getPointerOperand());
+      if (!A || !boxes.count(A)) {
+        memo[key] = false;
+        return false;
+      }
+      continue;
+    }
+    auto *CB = dyn_cast<CallBase>(&I);
+    if (!CB || CB->isDebugOrPseudoInst())
+      continue;
+    if (auto *II = dyn_cast<IntrinsicInst>(CB)) {
+      if (II->getIntrinsicID() == Intrinsic::memcpy || II->getIntrinsicID() == Intrinsic::memmove || II->getIntrinsicID() == Intrinsic::memset ||
+          II->getIntrinsicID() == Intrinsic::memcpy_inline) {
+        if (!throughLocal(II->getArgOperand(0)) && !boxes.count(baseAlloca(II->getArgOperand(0)))) {
+          memo[key] = false;
+          return false;
+        }
+      }
+      continue;
+    }
+    bool passesOut = false;
+    for (const Value *Op : CB->args()) {
+      if (!Op->getType()->isPointerTy())
+        continue;
+      auto *A = baseAlloca(Op);
+      if (A && boxes.count(A) && !spill.count(A))
+        continue;
+      if (fromArg(Op))
+        passesOut = true;
+    }
+    if (!passesOut)
+      continue;
+    if (CB->onlyReadsMemory())
+      continue;
+    const Function *Cal = CB->getCalledFunction();
+    if (!Cal) {
+      memo[key] = false;
+      return false;
+    }
+    // An argument bound to a local of this frame, or to a caller's local,
+    // is local in the callee wherever it sits in the argument list.
+    uint64_t childMask = 0;
+    for (unsigned k = 0; k < CB->arg_size() && k < 64; ++k) {
+      const Value *Op = CB->getArgOperand(k);
+      if (!Op->getType()->isPointerTy())
+        continue;
+      auto *A = baseAlloca(Op);
+      if ((A && boxes.count(A) && !spill.count(A)) || throughLocal(Op))
+        childMask |= 1ull << k;
+    }
+    if (Cal->isDeclaration()) {
+      // Without a body the callee may write any pointer it is given that its
+      // type does not make read-only. It is a lookup only when every such
+      // pointer is local.
+      const uint64_t ro = constPointees(Cal);
+      bool writesOut = false;
+      for (unsigned k = 0; k < CB->arg_size(); ++k) {
+        const Value *Op = CB->getArgOperand(k);
+        if (!Op->getType()->isPointerTy() || (k < 64 && (childMask >> k & 1)))
+          continue;
+        bool readOnly = CB->onlyReadsMemory(k) || (k < 64 && (ro >> k & 1));
+        if (fromArg(Op) && !readOnly)
+          writesOut = true;
+      }
+      if (!writesOut)
+        continue;
+      memo[key] = false;
+      return false;
+    }
+    if (!lookupOnlyRec(Cal, memo, childMask)) {
+      memo[key] = false;
+      return false;
+    }
+  }
+  memo[key] = true;
+  return true;
+}
+
+inline bool lookupOnly(const Function *F) {
+  static std::map<std::pair<const Function *, uint64_t>, std::optional<bool>> memo;
+  return lookupOnlyRec(F, memo, 0);
+}

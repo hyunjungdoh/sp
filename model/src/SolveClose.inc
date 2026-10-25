@@ -805,6 +805,24 @@
           }
         }
       }
+      // A store replaces a cell's entry value only when every execution of
+      // the sequence runs it before the goal: in a sequence function it
+      // precedes that step's goal, and in a callee it precedes every return
+      // of a call that is itself always run. A store on another branch, or
+      // after the goal, leaves the entry value the one the goal reads.
+      constexpr size_t inCallee = std::numeric_limits<size_t>::max();
+      auto always = [&](size_t si, Instruction *I) {
+        if (si == inCallee)
+          return dominatesReturns(I);
+        if (si >= seq.size())
+          return false;
+        if (si < stepGoal.size() && stepGoal[si])
+          return dominatesBefore(I, stepGoal[si]);
+        for (Instruction &G : instructions(*seq[si]))
+          if (sinkHere(G, sinkFile, sinkLine) && dominatesBefore(I, &G))
+            return true;
+        return false;
+      };
       std::vector<std::pair<int, Suffix>> drop;
       for (const auto &c : cells) {
         if (!indexed.count(c))
@@ -839,11 +857,15 @@
           }
           return s;
         };
-        std::function<bool(Function *, std::unordered_set<Function *> &)> written;
-        written = [&](Function *F, std::unordered_set<Function *> &seen) {
-          if (!F || F->isDeclaration() || !seen.insert(F).second)
+        std::function<bool(Function *, size_t, std::unordered_set<Function *> &)> written;
+        written = [&](Function *F, size_t si, std::unordered_set<Function *> &seen) {
+          if (!F || F->isDeclaration())
+            return false;
+          if (si == inCallee && !seen.insert(F).second)
             return false;
           for (Instruction &I : instructions(*F)) {
+            if (!always(si, &I))
+              continue;
             if (auto *S = dyn_cast<StoreInst>(&I)) {
               if (isa<Constant>(S->getValueOperand()))
                 continue;
@@ -866,7 +888,7 @@
                   continue;
                 for (Instruction &SI : instructions(*Callee)) {
                   auto *St = dyn_cast<StoreInst>(&SI);
-                  if (!St || isa<Constant>(St->getValueOperand()))
+                  if (!St || isa<Constant>(St->getValueOperand()) || !dominatesReturns(St))
                     continue;
                   Value *P = St->getPointerOperand();
                   std::unordered_set<const Value *> local;
@@ -905,15 +927,15 @@
               continue;
             Function *Cal = CB->getCalledFunction();
             Function *D = Cal ? define(Cal->getName()) : nullptr;
-            if (written(D, seen))
+            if (written(D, inCallee, seen))
               return true;
           }
           return false;
         };
         bool hit = false;
         std::unordered_set<Function *> seenFn;
-        for (Function *F : seq)
-          if (written(F, seenFn)) {
+        for (size_t si = 0; si < seq.size(); ++si)
+          if (written(seq[si], si, seenFn)) {
             hit = true;
             break;
           }
@@ -1022,7 +1044,7 @@
         bool deeper = false;
         for (Instruction &SI : instructions(*Callee)) {
           if (auto *St = dyn_cast<StoreInst>(&SI)) {
-            if (!isa<Constant>(St->getValueOperand()) &&
+            if (!isa<Constant>(St->getValueOperand()) && dominatesReturns(St) &&
                 fromArg(Callee, St->getValueOperand(), freshArg) &&
                 fromArg(Callee, St->getPointerOperand(), slotArg))
               storesFresh = true;
@@ -1051,7 +1073,7 @@
             if (fromArg(Callee, Op, freshArg))
               made2 = (int)a;
           }
-          if (slot2 >= 0 && made2 >= 0 && slot2 != made2 && replaced(Inner, slot2, made2, seen))
+          if (slot2 >= 0 && made2 >= 0 && slot2 != made2 && dominatesReturns(Call) && replaced(Inner, slot2, made2, seen))
             deeper = true;
         }
         return !copies && (storesFresh || deeper);
@@ -1074,14 +1096,15 @@
         if (parent)
           continue;
         bool hit = false;
-        for (Function *F : seq) {
+        for (size_t si = 0; si < seq.size(); ++si) {
+          Function *F = seq[si];
           if (hit)
             break;
           if (!F || F->isDeclaration())
             continue;
           for (Instruction &I : instructions(*F)) {
             auto *CB = dyn_cast<CallBase>(&I);
-            if (!CB)
+            if (!CB || !always(si, CB))
               continue;
             Function *Cal = CB->getCalledFunction();
             Function *Callee = Cal ? define(Cal->getName()) : nullptr;
@@ -1417,6 +1440,7 @@
       auto w = wide.find(c);
       if (w != wide.end() && w->second)
         s.width = w->second;
+      s.code = calleeAt.count(c) != 0;
       solvedCells.push_back(std::move(s));
     }
     Transition tr;
@@ -1764,49 +1788,9 @@
         continue;
       std::unordered_set<Instruction *> gset(goals.begin(), goals.end());
       auto blocks = chosenPath(SF, gset);
-      // The shortest path is one witness, not the only one. A demanded store
-      // whose call can reach the goal lies on another path from the entry to
-      // the same goal. That path is the witness for the cell the store writes.
-      std::unordered_set<const BasicBlock *> fromEntry;
-      if (!SF->isDeclaration()) {
-        std::vector<const BasicBlock *> walk{&SF->getEntryBlock()};
-        while (!walk.empty()) {
-          const BasicBlock *BB = walk.back();
-          walk.pop_back();
-          if (!BB || !fromEntry.insert(BB).second)
-            continue;
-          for (const BasicBlock *S : successors(BB))
-            walk.push_back(S);
-        }
-      }
-      auto reachesGoal = [&](Instruction *I, Instruction *G) {
-        if (!I || !G || I->getFunction() != G->getFunction())
-          return false;
-        if (!fromEntry.count(I->getParent()))
-          return false;
-        if (I->getParent() == G->getParent()) {
-          for (Instruction &J : *I->getParent()) {
-            if (&J == G)
-              return false;
-            if (&J == I)
-              return true;
-          }
-          return false;
-        }
-        std::unordered_set<const BasicBlock *> seen;
-        std::vector<const BasicBlock *> st{G->getParent()};
-        while (!st.empty()) {
-          const BasicBlock *BB = st.back();
-          st.pop_back();
-          if (!BB || !seen.insert(BB).second)
-            continue;
-          if (BB == I->getParent())
-            return true;
-          for (const BasicBlock *P : predecessors(BB))
-            st.push_back(P);
-        }
-        return false;
-      };
+      if (auto sp = stepPath.find(si); sp != stepPath.end() &&
+          std::all_of(goals.begin(), goals.end(), [&](Instruction *g) { return sp->second.count(g->getParent()); }))
+        blocks = sp->second;
       // An event is on the witness when its instruction lies on the chosen
       // path and executes before the goal. Domination would keep only the
       // facts common to every path, which is how a store on this path was
@@ -1856,10 +1840,7 @@
           if (seqEv) {
             if (!beforeGoal(e.at, goal))
               all = false;
-          } else if (!(e.callMust && e.anchor &&
-                       (beforeGoal(e.anchor, goal) ||
-                        ((e.kind == 's' || e.kind == 'e' || e.kind == 'n' || e.kind == 'r') &&
-                         reachesGoal(e.anchor, goal)))))
+          } else if (!(e.callMust && e.anchor && beforeGoal(e.anchor, goal)))
             all = false;
           if (!all)
             break;
@@ -1867,7 +1848,21 @@
         if (all)
           kept.push_back(&e);
       }
-      std::sort(kept.begin(), kept.end(), [&](const Ev *a, const Ev *b) {
+      // Dominator rank alone leaves ties between blocks of one depth; the
+      // position in the function's block list makes the order total. Events
+      // at one instruction keep the order the walk made them; return facts
+      // change no cell, so they go after the rest, ordered by content.
+      std::map<const BasicBlock *, unsigned> blockNo;
+      auto posOf = [&](Instruction *I) {
+        BasicBlock *BB = I->getParent();
+        if (!blockNo.count(BB)) {
+          unsigned n = 0;
+          for (BasicBlock &B : *BB->getParent())
+            blockNo[&B] = n++;
+        }
+        return std::make_tuple(I->getFunction()->getName(), blockNo[BB], rankOf(I).second);
+      };
+      std::stable_sort(kept.begin(), kept.end(), [&](const Ev *a, const Ev *b) {
         auto left = a->anchor ? rankOf(a->anchor) : rankOf(a->at);
         auto right = b->anchor ? rankOf(b->anchor) : rankOf(b->at);
         if (left != right)
@@ -1876,10 +1871,75 @@
         int nestB = b->anchor ? 1 : 0;
         if (nestA != nestB)
           return nestA < nestB;
-        return rankOf(a->at) < rankOf(b->at);
+        if (rankOf(a->at) != rankOf(b->at))
+          return rankOf(a->at) < rankOf(b->at);
+        Instruction *outA = a->anchor ? a->anchor : a->at, *outB = b->anchor ? b->anchor : b->at;
+        if (posOf(outA) != posOf(outB))
+          return posOf(outA) < posOf(outB);
+        if (posOf(a->at) != posOf(b->at))
+          return posOf(a->at) < posOf(b->at);
+        if ((a->kind == 'q') != (b->kind == 'q'))
+          return b->kind == 'q';
+        if (a->kind == 'q')
+          return std::tie(a->pred, a->vals, a->words) < std::tie(b->pred, b->vals, b->words);
+        return false;
       });
+      struct CallFact {
+        std::vector<std::pair<unsigned, int64_t>> cs;
+        std::optional<int64_t> fallback;
+        std::optional<int64_t> witness;
+        bool lookup = false;
+        bool live = false;
+      };
+      std::map<const Instruction *, CallFact> callFact;
       for (const Ev *e : kept) {
-        if (e->kind == 'c') {
+        if (e->kind != 'q' || e->vals.empty() || !e->at)
+          continue;
+        int64_t k = 0;
+        const std::string &text = *e->vals.begin();
+        auto parsed = std::from_chars(text.data(), text.data() + text.size(), k);
+        if (parsed.ec != std::errc())
+          continue;
+        callFact[e->at].cs.push_back({(unsigned)e->pred, k});
+        callFact[e->at].live = callFact[e->at].live || e->live;
+      }
+      for (auto &kv : callFact) {
+        auto *CB = dyn_cast<CallBase>(kv.first);
+        if (!CB)
+          continue;
+        Function *Cal = CB->getCalledFunction();
+        Function *D = Cal ? define(Cal->getName()) : nullptr;
+        if (!D)
+          D = Cal;
+        if (auto arg = fallbackArg(D))
+          if (*arg < CB->arg_size())
+            if (auto *C = dyn_cast<ConstantInt>(CB->getArgOperand(*arg)))
+              kv.second.fallback = C->getSExtValue();
+        kv.second.lookup = lookupOnly(D) && !kv.second.live;
+        kv.second.witness = satisfyingValue(kv.second.cs, kv.second.fallback);
+      }
+      for (const Ev *e : kept) {
+        if (e->kind == 'q') {
+          if (!e->words.empty() && !e->vals.empty() && e->fn) {
+            out << "model return " << e->words[0] << " " << icmpName((unsigned)e->pred) << " " << *e->vals.begin();
+            out << " at " << e->fn->getName();
+            if (const DebugLoc &DL = e->at->getDebugLoc())
+              out << " line " << DL.getLine() << " col " << DL.getCol();
+            for (size_t w = 1; w < e->words.size(); ++w)
+              out << " \"" << e->words[w] << "\"";
+            if (auto it = callFact.find(e->at); it != callFact.end()) {
+              if (it->second.fallback)
+                out << " fallback " << *it->second.fallback;
+              if (it->second.witness)
+                out << " witness " << *it->second.witness;
+              if (it->second.lookup)
+                out << " lookup";
+              if (it->second.live)
+                out << " live";
+            }
+            out << "\n";
+          }
+        } else if (e->kind == 'c') {
           out << "copy " << si;
           writeCell(e->src);
           out << " ->";
@@ -2028,6 +2088,23 @@
       out << " " << icmpName(L.pred);
       writeCell(L.b);
       out << "\n";
+    }
+    // A count an upstream call reads that many bytes by is at most the bytes
+    // the harness holds behind the paired pointer. It is a bound on the
+    // count at entry, like any comparison the path makes with a constant.
+    for (const auto &[c, cap] : countCap) {
+      int id;
+      if (auto it = entry.find(c); it != entry.end()) {
+        id = it->second;
+      } else {
+        id = make();
+        entry[c] = id;
+        if (!cur.count(c))
+          cur[c] = id;
+      }
+      if (!nodes[find(id)].ordBytes)
+        nodes[find(id)].ordBytes = cap.bytes;
+      hiU(id, cap.most);
     }
     for (const auto &kv : entry)
       mem[kv.first] = readNode(nodes, find, kv.second);

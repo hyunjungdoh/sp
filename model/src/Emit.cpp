@@ -155,7 +155,7 @@ void Model::emit(Module &H) const {
         } else if (!s.vals.empty()) {
           p->word[acc] = s.vals;
           p->width[acc] = s.width ? s.width : 8;
-        } else if (!p->child.count(acc)) {
+        } else if (!p->child.count(acc) && !s.code) {
           p->symAt[acc] = span;
           if (!s.ban.empty()) {
             p->ban[acc] = s.ban;
@@ -179,7 +179,7 @@ void Model::emit(Module &H) const {
             wd = 8;
           if (!p->width.count(acc))
             p->width[acc] = wd;
-          if (!p->word.count(acc) && !p->child.count(acc) && !p->symAt.count(acc) && !p->text.count(acc) &&
+          if (!s.code && !p->word.count(acc) && !p->child.count(acc) && !p->symAt.count(acc) && !p->text.count(acc) &&
               !p->globAt.count(acc) && !p->fileAt.count(acc) && !p->pathPtrAt.count(acc))
             p->symAt[acc] = std::max<uint64_t>(span, wd);
         }
@@ -254,24 +254,6 @@ void Model::emit(Module &H) const {
         continue;
       b.first->boundAt[e.second] = b.second;
     }
-    std::function<void(Piece &)> tieLen = [&](Piece &p) {
-      for (auto &ch : p.child) {
-        bool bytes = ch.second.child.empty() && ch.second.symAt.count(0) && ch.second.symAt.at(0) > dl.getPointerSize(0);
-        int64_t lenOff = ch.first + (int64_t)dl.getPointerSize(0);
-        auto sm = p.symAt.find(lenOff);
-        if (bytes && sm != p.symAt.end() && !p.word.count(lenOff) && !p.child.count(lenOff)) {
-          unsigned wd = (unsigned)sm->second;
-          if (wd == 4 || wd == 8) {
-            p.word[lenOff] = {std::to_string(ch.second.size)};
-            p.width[lenOff] = wd;
-            p.symAt.erase(sm);
-          }
-        }
-        tieLen(ch.second);
-      }
-    };
-    for (auto &kv : args)
-      tieLen(kv.second);
     std::map<int, uint64_t> tiedCount;
     auto namesArg = [&](Value *V, unsigned argNo) {
       std::unordered_set<const Value *> seen;
@@ -847,6 +829,7 @@ void Model::emit(Module &H) const {
       return define(T->getName());
     };
     std::unordered_map<Function *, Sum> sum;
+    std::vector<Function *> sumOrder;
     std::unordered_set<Function *> summarized;
     std::deque<Function *> fq;
     struct Item {
@@ -1053,6 +1036,8 @@ void Model::emit(Module &H) const {
         if (compose(root, e.suf, e.pointee, nb))
           remember(e.to, e.toArg, nb);
       }
+      if (!sum.count(F))
+        sumOrder.push_back(F);
       sum[F] = std::move(s);
       summarized.insert(F);
     };
@@ -1187,7 +1172,8 @@ void Model::emit(Module &H) const {
     bool grew = true;
     while (grew) {
       grew = false;
-      for (auto &sk : sum) {
+      for (Function *SF : sumOrder) {
+        auto &sk = *sum.find(SF);
         Function *caller = sk.first;
         for (const Use &u : sk.second.uses) {
           if (u.formal == -1)
@@ -1226,7 +1212,8 @@ void Model::emit(Module &H) const {
       drainBinds();
     }
     if (const char *tr = getenv("MODEL_TRACE")) {
-      for (auto &sk : sum) {
+      for (Function *SF : sumOrder) {
+        auto &sk = *sum.find(SF);
         if (sk.first->getName().find(tr) == StringRef::npos)
           continue;
         errs() << "TRACE " << sk.first->getName() << "\n";
@@ -1275,7 +1262,8 @@ void Model::emit(Module &H) const {
       else
         a.fns.swap(both);
     };
-    for (auto &sk : sum) {
+    for (Function *SF : sumOrder) {
+      auto &sk = *sum.find(SF);
       Function *F = sk.first;
       for (const Use &u : sk.second.uses) {
         for (const Bind &b : bindsOf(F, u.formal)) {
@@ -1323,7 +1311,8 @@ void Model::emit(Module &H) const {
       }
       p->size = std::max(p->size, (uint64_t)(acc < 0 ? 0 : acc) + width);
     };
-    for (auto &sk : sum) {
+    for (Function *SF : sumOrder) {
+      auto &sk = *sum.find(SF);
       Function *F = sk.first;
       for (const Need &n : sk.second.needs) {
         for (const Bind &b : bindsOf(F, n.formal)) {
@@ -1558,7 +1547,8 @@ void Model::emit(Module &H) const {
         p->size = std::max(p->size, (uint64_t)off + dl.getPointerSize(0));
       }
     }
-    for (auto &sk : sum) {
+    for (Function *SF : sumOrder) {
+      auto &sk = *sum.find(SF);
       for (const Need &n : sk.second.nulls) {
         for (const Bind &b : bindsOf(sk.first, n.formal)) {
           Bind cell;
@@ -1626,23 +1616,30 @@ void Model::emit(Module &H) const {
     // 2^bits of the widest.
     auto actualBits = [&](Function *F, unsigned j) -> unsigned {
       unsigned full = F->getArg(j)->getType()->getIntegerBitWidth();
-      // Bits of one value; a local slot holds what is stored into it.
-      std::function<unsigned(Value *, int)> bits = [&](Value *V, int depth) -> unsigned {
+      // Bits of one value; a local slot holds what is stored into it. A slot
+      // reached again through its own stores has no bound.
+      std::set<const AllocaInst *> open;
+      std::function<unsigned(Value *)> bits = [&](Value *V) -> unsigned {
         if (auto *Z = dyn_cast<ZExtInst>(V))
           return Z->getSrcTy()->getIntegerBitWidth();
         if (auto *C = dyn_cast<ConstantInt>(V))
           return C->getValue().getActiveBits();
         if (auto *Sel = dyn_cast<SelectInst>(V))
-          return std::max(bits(Sel->getTrueValue(), depth), bits(Sel->getFalseValue(), depth));
+          return std::max(bits(Sel->getTrueValue()), bits(Sel->getFalseValue()));
         auto *L = dyn_cast<LoadInst>(V);
         auto *Al = L ? dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts()) : nullptr;
-        if (!Al || depth > 0)
+        if (!Al || !open.insert(Al).second)
           return full;
+        struct Close {
+          std::set<const AllocaInst *> &s;
+          const AllocaInst *a;
+          ~Close() { s.erase(a); }
+        } close{open, Al};
         unsigned w = 0;
         for (User *U : Al->users()) {
           if (auto *S = dyn_cast<StoreInst>(U)) {
             if (S->getPointerOperand()->stripPointerCasts() == Al)
-              w = std::max(w, bits(S->getValueOperand(), depth + 1));
+              w = std::max(w, bits(S->getValueOperand()));
           } else if (auto *CB = dyn_cast<CallBase>(U)) {
             // A callee given the slot stores into it through that formal.
             Function *C = CB->getCalledFunction();
@@ -1667,7 +1664,7 @@ void Model::emit(Module &H) const {
                         if (auto *A = dyn_cast<Argument>(PS->getValueOperand()->stripPointerCasts()))
                           viaK = viaK || (A->getArgNo() == k && PS->getPointerOperand()->stripPointerCasts() == PA);
                 if (viaK)
-                  w = std::max(w, bits(S->getValueOperand(), depth + 1));
+                  w = std::max(w, bits(S->getValueOperand()));
               }
             }
           } else if (!isa<LoadInst>(U) && !isa<DbgInfoIntrinsic>(U)) {
@@ -1683,7 +1680,7 @@ void Model::emit(Module &H) const {
         if (!CB || CB->getCalledFunction() != F || j >= CB->arg_size())
           continue;
         any = true;
-        w = std::max(w, bits(CB->getArgOperand(j), 0));
+        w = std::max(w, bits(CB->getArgOperand(j)));
       }
       return any ? std::min(w, full) : full;
     };

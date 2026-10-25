@@ -167,12 +167,42 @@ std::string Client::irName(const std::string &t) {
   return key;
 }
 
+// The Itanium typeinfo name of a record whose scopes are named namespaces
+// and records, or "" for any other scope (templates, anonymous, local).
+static std::string typeinfoName(const DICompositeType *C) {
+  std::vector<std::string> parts;
+  for (const DIScope *S = C; S && !isa<DICompileUnit>(S) && !isa<DIFile>(S); S = S->getScope()) {
+    StringRef n = S->getName();
+    if (n.empty() || n.contains('<') || (!isa<DINamespace>(S) && !isa<DICompositeType>(S)))
+      return "";
+    parts.push_back(n.str());
+  }
+  std::reverse(parts.begin(), parts.end());
+  std::string body;
+  size_t from = 0;
+  bool inStd = parts.size() > 1 && parts[0] == "std";
+  if (inStd)
+    from = 1;
+  for (size_t i = from; i < parts.size(); ++i)
+    body += std::to_string(parts[i].size()) + parts[i];
+  if (parts.size() - from == 1)
+    return "_ZTS" + std::string(inStd ? "St" : "") + body;
+  return "_ZTSN" + std::string(inStd ? "St" : "") + body + "E";
+}
+
+// A record's identity is its ODR identifier, the typeinfo name. Clang omits
+// it from the definition of a class whose vtable has external linkage,
+// while declarations of the same class carry it; the definition is that
+// class when its typeinfo name is an identifier the modules carry.
 std::string Client::typeKey(const DIType *T) const {
   auto *C = dyn_cast_or_null<DICompositeType>(T);
   if (!C)
     return "";
   if (!C->getIdentifier().empty())
     return C->getIdentifier().str();
+  if (C->getVTableHolder())
+    if (std::string id = typeinfoName(C); !id.empty() && identifiers.count(id))
+      return id;
   return C->getName().str();
 }
 
@@ -430,10 +460,15 @@ Client::Client(Module &down, Module &up, const fs::path &dir) : down(down), up(u
         continue;
       bodies.emplace(F.getName().str(), &F);
     }
+  std::vector<DebugInfoFinder> finders(2);
+  finders[0].processModule(down);
+  finders[1].processModule(up);
+  for (const DebugInfoFinder &fin : finders)
+    for (DIType *T : fin.types())
+      if (auto *C = dyn_cast<DICompositeType>(T); C && !C->getIdentifier().empty())
+        identifiers.insert(C->getIdentifier().str());
   // Which composite types an installed header defines.
-  for (Module *M : {&down, &up}) {
-    DebugInfoFinder fin;
-    fin.processModule(*M);
+  for (const DebugInfoFinder &fin : finders) {
     for (DIType *T : fin.types()) {
       auto *C = dyn_cast<DICompositeType>(T);
       if (!C)
@@ -1486,7 +1521,7 @@ const Client::LocalFormals &Client::localFormalsOf(Function *F) const {
   // one derived from j, or passes both to a callee in which the same holds
   // (the transfer through calls is closed in formalsOf).
   auto intFormal = [](Value *V) -> int {
-    for (unsigned steps = 0; steps < 8; ++steps) {
+    for (;;) {
       if (auto *A = dyn_cast<Argument>(V))
         return A->getType()->isIntegerTy() ? (int)A->getArgNo() : -1;
       auto *I = dyn_cast<Instruction>(V);
@@ -1502,10 +1537,9 @@ const Client::LocalFormals &Client::localFormalsOf(Function *F) const {
       } else
         return -1;
     }
-    return -1;
   };
   auto ptrFormal = [](Value *V) -> int {
-    for (unsigned steps = 0; steps < 8; ++steps) {
+    for (;;) {
       V = V->stripPointerCasts();
       if (auto *A = dyn_cast<Argument>(V))
         return A->getType()->isPointerTy() ? (int)A->getArgNo() : -1;
@@ -1514,7 +1548,6 @@ const Client::LocalFormals &Client::localFormalsOf(Function *F) const {
         return -1;
       V = G->getPointerOperand();
     }
-    return -1;
   };
   auto bound = [&](int i, int j) {
     if (i >= 0 && j >= 0)

@@ -2,6 +2,7 @@
     solvedCells.clear();
     rels.clear();
     readBytes.clear();
+    countCap.clear();
     fileLen.clear();
     argFileLen.clear();
     argExtent.clear();
@@ -33,10 +34,16 @@
       std::pair<int, Suffix> cell;
       std::pair<int, Suffix> src;
       std::set<std::string> vals;
+      std::vector<std::string> words;
       int pred = 0;
       unsigned bits = 0;
+      // A later call that is not a lookup reads this object, so the result
+      // is not a substitute for those bytes.
+      bool live = false;
     };
     std::map<size_t, std::vector<Ev>> stepEv;
+    // The witness path of a step whose shortest path contradicts itself.
+    std::map<size_t, std::unordered_set<const BasicBlock *>> stepPath;
     std::unordered_map<const Function *, std::unique_ptr<DominatorTree>> dts;
     Instruction *evAnchor = nullptr;
     bool evCallMust = true;
@@ -302,6 +309,16 @@
     std::set<std::pair<int, Suffix>> pathPtr;
     std::map<std::pair<int, Suffix>, unsigned> wide;
     std::map<std::pair<int, Suffix>, FunctionType *> fileCell;
+    // A file callback is a pointer field that is called. A struct field at
+    // the same offset is the object itself, such as a path string.
+    auto pointerSlot = [&](const Loc &cell) {
+      if (cell.suf.empty())
+        return false;
+      const Step &st = cell.suf.back();
+      if (st.type.empty())
+        return true;
+      return fieldIsPointer(st.type, st.off);
+    };
     std::map<std::pair<int, Suffix>, std::set<std::string>> cmps;
     std::map<std::pair<int, Suffix>, std::set<std::string>> neq;
     std::map<std::pair<int, Suffix>, std::set<std::string>> seqStore;
@@ -372,7 +389,7 @@
           Read rd = asRead(*CB);
           if (rd.ok && noBody(CB) && !CB->getCalledFunction()) {
             Loc cell;
-            if (locOf(m, CB->getCalledOperand(), cell) && !cell.suf.empty() && cells.count({cell.arg, cell.suf})) {
+            if (locOf(m, CB->getCalledOperand(), cell) && !cell.suf.empty() && cells.count({cell.arg, cell.suf}) && pointerSlot(cell)) {
               fileCell[{cell.arg, cell.suf}] = CB->getFunctionType();
               if (rd.len)
                 fileLen[{cell.arg, cell.suf}] = *rd.len;
@@ -441,12 +458,28 @@
         return;
       }
       if (auto *L = dyn_cast<LoadInst>(V)) {
+        // A scalar local holds what was stored into it: the sink's index or
+        // length is computed into a local before the sink reads it.
+        if (auto *Al = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts());
+            Al && !L->getType()->isPointerTy()) {
+          for (User *U : Al->users())
+            if (auto *S = dyn_cast<StoreInst>(U); S && S->getPointerOperand()->stripPointerCasts() == Al)
+              trace(si, S->getValueOperand());
+          return;
+        }
         trace(si, L->getPointerOperand());
         return;
       }
       if (auto *P = dyn_cast<PHINode>(V)) {
         for (Value *in : P->incoming_values())
           trace(si, in);
+        return;
+      }
+      // An offset or a length computed from cells reads those cells.
+      if (isa<BinaryOperator>(V) || isa<UnaryOperator>(V) || isa<CmpInst>(V) || isa<SelectInst>(V)) {
+        for (Value *Op : cast<Instruction>(V)->operands())
+          if (!isa<Constant>(Op))
+            trace(si, Op);
         return;
       }
       if (auto *A = dyn_cast<Argument>(V)) {
@@ -689,7 +722,7 @@
         };
         if (!CB->getCalledFunction()) {
           Loc cell;
-          if (!cellLoc(memAt(si), CB->getCalledOperand(), cell) || cell.suf.empty())
+          if (!cellLoc(memAt(si), CB->getCalledOperand(), cell) || cell.suf.empty() || !pointerSlot(cell))
             continue;
           cells.insert({cell.arg, cell.suf});
           fileCell[{cell.arg, cell.suf}] = CB->getFunctionType();
@@ -719,6 +752,331 @@
     // path dereferences is a cell; its pointee stays symbolic.
     {
       std::unordered_set<const Function *> didCallee;
+      // A bool object holds 0 or 1, so a test of its value is the equation
+      // of its cell with 1, or with 0 on the false side.
+      auto boolLoad = [&](Value *V) -> LoadInst * {
+        auto *L = dyn_cast<LoadInst>(V);
+        if (!L)
+          return nullptr;
+        const DIType *T = source::pointee(L->getPointerOperand());
+        while (auto *D = dyn_cast_or_null<DIDerivedType>(T))
+          if (D->getTag() == dwarf::DW_TAG_typedef || D->getTag() == dwarf::DW_TAG_const_type ||
+              D->getTag() == dwarf::DW_TAG_volatile_type)
+            T = D->getBaseType();
+          else
+            break;
+        auto *B = dyn_cast_or_null<DIBasicType>(T);
+        return B && B->getEncoding() == dwarf::DW_ATE_boolean ? L : nullptr;
+      };
+      // The witness of a step is a path from its entry to its goal. Its
+      // branch conditions are equations and disequations of cells, and its
+      // stores give cells values. The shortest path is the witness when
+      // these agree along it. Otherwise the witness is the shortest path on
+      // which they agree, a search over pairs of a block and the cell state
+      // reaching it (ESP, Das et al. PLDI'02). A call that may write an
+      // object makes its cells unknown, so the search admits every path on
+      // which the conditions can agree. When none can, no execution of the
+      // step reaches the goal, and the shortest path stands for the
+      // contradiction.
+      auto feasiblePath = [&](Function *F, const std::unordered_set<Instruction *> &goals, Mem &m,
+                              const std::unordered_set<const BasicBlock *> &shortest)
+          -> std::unordered_set<const BasicBlock *> {
+        auto spellLoc = [](const Loc &c) {
+          std::string k = std::to_string(c.arg);
+          for (const Step &s : c.suf)
+            k += "|" + s.type + "@" + std::to_string(s.off) + (s.deref ? "*" : "");
+          return k;
+        };
+        auto keyOf = [&](Value *P, std::string &k) {
+          Loc c;
+          if (!objectLoc(m, P, c))
+            return false;
+          k = spellLoc(c);
+          return true;
+        };
+        struct Atom {
+          std::string key;
+          bool eq;
+          std::string v;
+        };
+        auto loadKey = [&](Value *V, std::string &k) {
+          while (auto *C = dyn_cast<CastInst>(V))
+            V = C->getOperand(0);
+          auto *L = dyn_cast<LoadInst>(V);
+          return L && keyOf(L->getPointerOperand(), k) && k.find('|') != std::string::npos;
+        };
+        std::function<void(Value *, bool, std::vector<Atom> &)> atoms = [&](Value *V, bool need, std::vector<Atom> &out) {
+          while (auto *C = dyn_cast<CastInst>(V))
+            V = C->getOperand(0);
+          std::string k;
+          if (boolLoad(V)) {
+            if (loadKey(V, k))
+              out.push_back({k, true, need ? "1" : "0"});
+            return;
+          }
+          if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+            auto *One = dyn_cast<ConstantInt>(BO->getOperand(1));
+            if (BO->getOpcode() == Instruction::Xor && One && One->isOne())
+              atoms(BO->getOperand(0), !need, out);
+            else if ((need && BO->getOpcode() == Instruction::And) || (!need && BO->getOpcode() == Instruction::Or)) {
+              atoms(BO->getOperand(0), need, out);
+              atoms(BO->getOperand(1), need, out);
+            }
+            return;
+          }
+          auto *Cmp = dyn_cast<ICmpInst>(V);
+          if (!Cmp)
+            return;
+          auto pred = need ? Cmp->getPredicate() : Cmp->getInversePredicate();
+          if (pred != ICmpInst::ICMP_EQ && pred != ICmpInst::ICMP_NE)
+            return;
+          for (int side = 0; side < 2; ++side) {
+            Value *C = Cmp->getOperand(1 - side);
+            while (auto *X = dyn_cast<CastInst>(C))
+              C = X->getOperand(0);
+            std::string v;
+            if (isa<ConstantPointerNull>(C))
+              v = "0";
+            else if (auto *CI = dyn_cast<ConstantInt>(C))
+              v = dec(CI);
+            else
+              continue;
+            if (loadKey(Cmp->getOperand(side), k)) {
+              out.push_back({k, pred == ICmpInst::ICMP_EQ, v});
+              return;
+            }
+          }
+        };
+        // The atoms that hold when the terminator of B passes to S.
+        auto edge = [&](const BasicBlock *B, const BasicBlock *S, std::vector<Atom> &out) {
+          const Instruction *T = B->getTerminator();
+          if (auto *BR = dyn_cast<BranchInst>(T)) {
+            if (BR->isConditional() && BR->getSuccessor(0) != BR->getSuccessor(1))
+              atoms(BR->getCondition(), S == BR->getSuccessor(0), out);
+            return;
+          }
+          auto *SW = dyn_cast<SwitchInst>(T);
+          std::string k;
+          if (!SW || !loadKey(SW->getCondition(), k))
+            return;
+          std::vector<std::string> to;
+          for (auto &C : SW->cases())
+            if (C.getCaseSuccessor() == S)
+              to.push_back(dec(C.getCaseValue()));
+          if (S == SW->getDefaultDest()) {
+            if (!to.empty())
+              return;
+            for (auto &C : SW->cases())
+              out.push_back({k, false, dec(C.getCaseValue())});
+          } else if (to.size() == 1)
+            out.push_back({k, true, to[0]});
+        };
+        std::unordered_set<const BasicBlock *> goalB, back;
+        std::vector<const BasicBlock *> work;
+        for (Instruction *g : goals)
+          if (g && g->getFunction() == F) {
+            goalB.insert(g->getParent());
+            work.push_back(g->getParent());
+          }
+        while (!work.empty()) {
+          const BasicBlock *B = work.back();
+          work.pop_back();
+          if (!back.insert(B).second)
+            continue;
+          for (const BasicBlock *P : predecessors(B))
+            work.push_back(P);
+        }
+        // The cells some branch tests; only their state decides a path.
+        std::set<std::string> tested;
+        for (const BasicBlock *B : back)
+          for (const BasicBlock *S : successors(B)) {
+            std::vector<Atom> as;
+            edge(B, S, as);
+            for (const Atom &a : as)
+              tested.insert(a.key);
+          }
+        if (tested.empty())
+          return shortest;
+        // A cell is the entry value under equations and disequations, a
+        // known value, or unknown.
+        struct Val {
+          char kind = 'e';
+          std::string v;
+          std::set<std::string> ne;
+        };
+        using State = std::map<std::string, Val>;
+        auto under = [](const std::string &k, const std::string &p) {
+          return k == p || (k.size() > p.size() && k.compare(0, p.size(), p) == 0 && k[p.size()] == '|');
+        };
+        // The cells a call may write: those its body and the bodies it
+        // calls store to, and everything under an object it passes to a
+        // function without a body that may write memory.
+        std::map<std::string, std::set<std::string>> modMemo;
+        std::set<std::string> modActive;
+        std::function<void(CallBase *, Mem &, std::set<std::string> &)> callMods;
+        std::function<void(Function *, const std::vector<std::optional<Loc>> &, std::set<std::string> &)> bodyMods =
+            [&](Function *D, const std::vector<std::optional<Loc>> &in, std::set<std::string> &out) {
+              std::string key = D->getName().str();
+              for (const auto &L : in)
+                key += "/" + (L ? spellLoc(*L) : std::string("-"));
+              if (auto it = modMemo.find(key); it != modMemo.end()) {
+                out.insert(it->second.begin(), it->second.end());
+                return;
+              }
+              if (!modActive.insert(key).second)
+                return;
+              std::set<std::string> got;
+              Mem dm;
+              bindFormals(dm, D, in);
+              propagateObject(dm, D);
+              for (Instruction &I : instructions(*D)) {
+                Loc c;
+                if (auto *S = dyn_cast<StoreInst>(&I)) {
+                  if (objectLoc(dm, S->getPointerOperand(), c))
+                    got.insert(spellLoc(c));
+                } else if (auto *CB = dyn_cast<CallBase>(&I))
+                  callMods(CB, dm, got);
+              }
+              modActive.erase(key);
+              modMemo[key] = got;
+              out.insert(got.begin(), got.end());
+            };
+        callMods = [&](CallBase *CB, Mem &cm, std::set<std::string> &out) {
+          if (ignorable(CB->getCalledFunction()) && !isa<MemIntrinsic>(CB))
+            return;
+          if (CB->onlyReadsMemory())
+            return;
+          std::vector<std::optional<Loc>> in;
+          bool touch = false;
+          for (unsigned a = 0; a < CB->arg_size(); ++a) {
+            Loc L;
+            if (CB->getArgOperand(a)->getType()->isPointerTy() && objectLoc(cm, CB->getArgOperand(a), L)) {
+              in.push_back(L);
+              touch = true;
+            } else
+              in.push_back(std::nullopt);
+          }
+          if (!touch)
+            return;
+          auto ts = targetsOf(CB);
+          bool body = false;
+          for (Function *T : ts)
+            if (T && !T->isDeclaration()) {
+              body = true;
+              bodyMods(T, in, out);
+            }
+          if (body)
+            return;
+          for (unsigned a = 0; a < in.size(); ++a)
+            if (in[a] && !CB->onlyReadsMemory(a))
+              out.insert(spellLoc(*in[a]));
+        };
+        auto effects = [&](const BasicBlock *B, State &st) {
+          for (Instruction &I : *const_cast<BasicBlock *>(B)) {
+            if (auto *S = dyn_cast<StoreInst>(&I)) {
+              std::string k;
+              if (!keyOf(S->getPointerOperand(), k))
+                continue;
+              for (const std::string &t : tested)
+                if (under(t, k) && t != k)
+                  st[t] = Val{'a', "", {}};
+              if (tested.count(k)) {
+                auto *CI = dyn_cast<ConstantInt>(S->getValueOperand());
+                auto *CN = dyn_cast<ConstantPointerNull>(S->getValueOperand());
+                st[k] = CI ? Val{'k', dec(CI), {}} : CN ? Val{'k', "0", {}} : Val{'a', "", {}};
+              }
+              continue;
+            }
+            auto *CB = dyn_cast<CallBase>(&I);
+            if (!CB)
+              continue;
+            std::set<std::string> ks;
+            callMods(CB, m, ks);
+            for (const std::string &k : ks)
+              for (const std::string &t : tested)
+                if (under(t, k))
+                  st[t] = Val{'a', "", {}};
+          }
+        };
+        auto apply = [](State &st, const Atom &a) {
+          Val &x = st[a.key];
+          if (x.kind == 'k')
+            return (x.v == a.v) == a.eq;
+          if (x.kind == 'a') {
+            if (a.eq)
+              x = Val{'k', a.v, {}};
+            return true;
+          }
+          if (a.eq) {
+            if ((!x.v.empty() && x.v != a.v) || x.ne.count(a.v))
+              return false;
+            x.v = a.v;
+            return true;
+          }
+          if (x.v == a.v)
+            return false;
+          x.ne.insert(a.v);
+          return true;
+        };
+        auto spell = [](const State &st) {
+          std::string s;
+          for (const auto &kv : st) {
+            s += kv.first + "=" + kv.second.kind + kv.second.v;
+            for (const std::string &n : kv.second.ne)
+              s += "!" + n;
+            s += ";";
+          }
+          return s;
+        };
+        auto search = [&](const std::unordered_set<const BasicBlock *> &allowed) {
+          std::unordered_set<const BasicBlock *> path;
+          const BasicBlock *entry = &F->getEntryBlock();
+          if (!allowed.count(entry))
+            return path;
+          struct Node {
+            const BasicBlock *bb;
+            State st;
+            int prev;
+          };
+          std::vector<Node> nodes{{entry, State{}, -1}};
+          std::set<std::pair<const BasicBlock *, std::string>> seen{{entry, ""}};
+          std::deque<int> q{0};
+          while (!q.empty()) {
+            int n = q.front();
+            q.pop_front();
+            if (goalB.count(nodes[n].bb)) {
+              for (int i = n; i >= 0; i = nodes[i].prev)
+                path.insert(nodes[i].bb);
+              return path;
+            }
+            State st = nodes[n].st;
+            effects(nodes[n].bb, st);
+            std::vector<const BasicBlock *> succs;
+            for (const BasicBlock *S : successors(nodes[n].bb))
+              if (allowed.count(S))
+                succs.push_back(S);
+            std::sort(succs.begin(), succs.end(),
+                      [](const BasicBlock *A, const BasicBlock *B) { return A->getName() < B->getName(); });
+            for (const BasicBlock *S : succs) {
+              std::vector<Atom> as;
+              edge(nodes[n].bb, S, as);
+              State next = st;
+              bool ok = true;
+              for (const Atom &a : as)
+                ok = ok && apply(next, a);
+              if (!ok || !seen.insert({S, spell(next)}).second)
+                continue;
+              nodes.push_back(Node{S, std::move(next), n});
+              q.push_back((int)nodes.size() - 1);
+            }
+          }
+          return path;
+        };
+        if (!search(shortest).empty())
+          return shortest;
+        auto found = search(back);
+        return found.empty() ? shortest : found;
+      };
       std::function<void(Function *, const std::vector<std::optional<Loc>> &, const std::unordered_set<Instruction *> &, bool, Function *)>
           pathFacts;
       pathFacts = [&](Function *F, const std::vector<std::optional<Loc>> &args, const std::unordered_set<Instruction *> &goals,
@@ -728,9 +1086,42 @@
         // The branch condition of one path, not the intersection of every
         // path that can still reach the goal.
         auto reach = chosenPath(F, goals);
+        // Inside a callee the goal is any return. A branch there constrains
+        // the entry only when one successor alone can still return; where
+        // both can, the shortest path's choice is not a condition of the
+        // sequence, and taking it would exclude the other outcome.
+        std::unordered_set<const BasicBlock *> canReturn;
+        if (F != seq[curStep]) {
+          std::vector<const BasicBlock *> work;
+          for (Instruction *G : goals)
+            if (G && G->getFunction() == F)
+              work.push_back(G->getParent());
+          while (!work.empty()) {
+            const BasicBlock *B = work.back();
+            work.pop_back();
+            if (!canReturn.insert(B).second)
+              continue;
+            for (const BasicBlock *P : predecessors(B))
+              work.push_back(P);
+          }
+        }
+        const auto &decides = F == seq[curStep] ? reach : canReturn;
         Mem m;
         bindFormals(m, F, args);
         propagateObject(m, F);
+        if (F == seq[curStep]) {
+          auto witness = feasiblePath(F, goals, m, reach);
+          if (witness != reach) {
+            reach = std::move(witness);
+            stepPath[curStep] = reach;
+          }
+        }
+        // The first call site met enters a callee, so the walk goes in
+        // program order.
+        std::vector<const BasicBlock *> reachOrd;
+        for (const BasicBlock &RB : *F)
+          if (reach.count(&RB))
+            reachOrd.push_back(&RB);
         auto locate = [&](Value *V, Loc &cell) -> bool {
           while (auto *C = dyn_cast<CastInst>(V))
             V = C->getOperand(0);
@@ -772,13 +1163,147 @@
           child.suf.push_back(Step{"", 0, true});
           keep(child);
         };
+        // The value a required comparison actually tests. A cell load stays
+        // that load. A local is the store that dominates the branch. A call
+        // that returns one argument is that argument. Any other call stays
+        // the call, so the comparison is a constraint on its result.
+        auto mustVal = [&](Value *V) -> Value * {
+          std::unordered_set<Value *> seen;
+          std::function<Value *(Value *)> go = [&](Value *V) -> Value * {
+            if (!V || !seen.insert(V).second)
+              return V;
+            while (auto *C = dyn_cast<CastInst>(V))
+              V = C->getOperand(0);
+            if (auto *L = dyn_cast<LoadInst>(V)) {
+              Loc cell;
+              if (locate(L, cell))
+                return L;
+              auto *A = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts());
+              if (!A || !factAt)
+                return L;
+              // The definition is the last writer that dominates the branch.
+              // A call that receives the slot overwrites an earlier store, so
+              // that store is not the value.
+              Instruction *best = nullptr;
+              bool wrote = false;
+              auto take = [&](Instruction *I, bool asCall) {
+                if (!dominatesBefore(I, factAt))
+                  return;
+                if (best && !dominatesBefore(best, I))
+                  return;
+                best = I;
+                wrote = asCall;
+              };
+              for (User *U : A->users()) {
+                auto *S = dyn_cast<StoreInst>(U);
+                if (S && S->getPointerOperand()->stripPointerCasts() == A)
+                  take(S, false);
+                auto *CB = dyn_cast<CallBase>(U);
+                if (!CB)
+                  continue;
+                for (Value *Op : CB->args())
+                  if (Op->stripPointerCasts() == A)
+                    take(CB, true);
+              }
+              if (!best || wrote)
+                return L;
+              return go(cast<StoreInst>(best)->getValueOperand());
+            }
+            if (auto *CB = dyn_cast<CallBase>(V)) {
+              Function *C = CB->getCalledFunction();
+              Function *D = C ? define(C->getName()) : nullptr;
+              if (D && !D->isDeclaration()) {
+                auto arg = carryArg(D);
+                if (arg && *arg >= 0 && *arg < (int)CB->arg_size())
+                  return go(CB->getArgOperand((unsigned)*arg));
+              }
+              return CB;
+            }
+            return V;
+          };
+          return go(V);
+        };
+        auto noteReturn = [&](CallBase *CB, ICmpInst::Predicate pred, Constant *C) {
+          if (!factAt || !CB)
+            return;
+          Function *Cal = CB->getCalledFunction();
+          if (!Cal)
+            return;
+          std::string k;
+          if (isa<ConstantPointerNull>(C))
+            k = "0";
+          else if (auto *CI = dyn_cast<ConstantInt>(C))
+            k = dec(CI);
+          else
+            return;
+          Ev ev;
+          ev.at = CB;
+          ev.fn = F;
+          ev.anchor = F == seq[curStep] ? nullptr : myAnchor;
+          ev.callMust = myMust;
+          ev.mustExit = F == seq[curStep] || dominatesReturns(CB);
+          ev.kind = 'q';
+          ev.pred = (int)pred;
+          ev.vals.insert(std::move(k));
+          ev.words.push_back(Cal->getName().str());
+          auto cstr = [](Value *V) -> std::string {
+            auto *G = dyn_cast<GlobalVariable>(V->stripPointerCasts());
+            if (!G || !G->hasInitializer())
+              return {};
+            auto *A = dyn_cast<ConstantDataArray>(G->getInitializer());
+            if (!A || !A->isCString())
+              return {};
+            return A->getAsCString().str();
+          };
+          // An argument built by an earlier call is the constant string that
+          // call passes in, when that call is the last one dominating this one.
+          for (Value *Op : CB->args()) {
+            if (std::string s = cstr(Op); !s.empty()) {
+              ev.words.push_back(std::move(s));
+              continue;
+            }
+            auto *Slot = dyn_cast<AllocaInst>(Op->stripPointerCasts());
+            if (!Slot)
+              continue;
+            Instruction *best = nullptr;
+            std::string text;
+            for (User *U : Slot->users()) {
+              auto *W = dyn_cast<CallBase>(U);
+              if (!W || W == CB || !dominatesBefore(W, CB))
+                continue;
+              std::string got;
+              for (Value *Arg : W->args())
+                if (std::string s = cstr(Arg); !s.empty())
+                  got = std::move(s);
+              if (got.empty())
+                continue;
+              if (best && !dominatesBefore(best, W))
+                continue;
+              best = W;
+              text = std::move(got);
+            }
+            if (!text.empty())
+              ev.words.push_back(std::move(text));
+          }
+          stepEv[curStep].push_back(std::move(ev));
+        };
         auto onCmp = [&](ICmpInst *Cmp, ICmpInst::Predicate pred) {
-          Value *lhs = Cmp->getOperand(0);
-          Value *rhs = Cmp->getOperand(1);
-          while (auto *C = dyn_cast<CastInst>(lhs))
-            lhs = C->getOperand(0);
-          while (auto *C = dyn_cast<CastInst>(rhs))
-            rhs = C->getOperand(0);
+          Value *lhs = mustVal(Cmp->getOperand(0));
+          Value *rhs = mustVal(Cmp->getOperand(1));
+          if (auto *CB = dyn_cast<CallBase>(lhs)) {
+            if (auto *C = dyn_cast<Constant>(rhs))
+              if (isa<ConstantInt>(C) || isa<ConstantPointerNull>(C)) {
+                noteReturn(CB, pred, C);
+                return;
+              }
+          }
+          if (auto *CB = dyn_cast<CallBase>(rhs)) {
+            if (auto *C = dyn_cast<Constant>(lhs))
+              if (isa<ConstantInt>(C) || isa<ConstantPointerNull>(C)) {
+                noteReturn(CB, ICmpInst::getSwappedPredicate(pred), C);
+                return;
+              }
+          }
           Loc L, R;
           bool lc = locate(lhs, L);
           bool rc = locate(rhs, R);
@@ -849,7 +1374,7 @@
           } else
             push(cell, 'r', use, k, nullptr);
         };
-        for (const BasicBlock *CBB : reach) {
+        for (const BasicBlock *CBB : reachOrd) {
           BasicBlock *BB = const_cast<BasicBlock *>(CBB);
           Instruction *Term = BB->getTerminator();
           auto *BR = dyn_cast<BranchInst>(Term);
@@ -857,16 +1382,22 @@
             BasicBlock *only = nullptr;
             int n = 0;
             for (BasicBlock *S : successors(BR))
-              if (reach.count(S)) {
+              if (decides.count(S)) {
                 ++n;
                 only = S;
               }
-            if (n == 1) {
+            if (n == 1 && reach.count(only)) {
               factAt = BR;
               bool takenTrue = only == BR->getSuccessor(0);
               std::function<void(Value *, bool)> req = [&](Value *V, bool need) {
                 while (auto *C = dyn_cast<CastInst>(V))
                   V = C->getOperand(0);
+                if (LoadInst *L = boolLoad(V)) {
+                  Loc cell;
+                  if (locate(L, cell))
+                    equation(cell, need ? "1" : "0");
+                  return;
+                }
                 if (auto *BO = dyn_cast<BinaryOperator>(V)) {
                   if (BO->getOpcode() == Instruction::Xor)
                     if (auto *One = dyn_cast<ConstantInt>(BO->getOperand(1)))
@@ -898,11 +1429,11 @@
           if (auto *SW = dyn_cast<SwitchInst>(Term)) {
             ConstantInt *onlyV = nullptr;
             int n = 0;
-            bool def = reach.count(SW->getDefaultDest());
+            bool def = decides.count(SW->getDefaultDest());
             if (def)
               ++n;
             for (auto &Case : SW->cases())
-              if (reach.count(Case.getCaseSuccessor())) {
+              if (decides.count(Case.getCaseSuccessor())) {
                 ++n;
                 onlyV = Case.getCaseValue();
               }
@@ -916,7 +1447,7 @@
         // An indirect call on the slice reads one cell. The value is the one
         // function that call can reach the next sequence function through.
         // A vtable call is the vtable, recorded where the object is loaded.
-        for (const BasicBlock *CBB : reach)
+        for (const BasicBlock *CBB : reachOrd)
           for (Instruction &I : *const_cast<BasicBlock *>(CBB)) {
             auto *CB = dyn_cast<CallBase>(&I);
             if (!CB || CB->getCalledFunction() || !vtableTargets(CB).empty())
@@ -957,7 +1488,7 @@
               stepEv[curStep].push_back(std::move(ev));
             }
           }
-        for (const BasicBlock *CBB : reach)
+        for (const BasicBlock *CBB : reachOrd)
           for (Instruction &I : *const_cast<BasicBlock *>(CBB)) {
             auto *L = dyn_cast<LoadInst>(&I);
             if (!L || !L->getType()->isPointerTy())
@@ -1007,7 +1538,7 @@
           }
         if (!enterCallee)
           return;
-        for (const BasicBlock *CBB : reach)
+        for (const BasicBlock *CBB : reachOrd)
           for (Instruction &I : *const_cast<BasicBlock *>(CBB)) {
             auto *CB = dyn_cast<CallBase>(&I);
             if (!CB)
@@ -1517,7 +2048,9 @@
                     downArgs.push_back(std::nullopt);
                 }
                   if (touch) {
-                  std::string sg = C->getName().str();
+                  // A callee's events belong to the step whose call runs it,
+                  // so one visited under another step is not yet visited.
+                  std::string sg = std::to_string(curStep) + "#" + C->getName().str();
                   for (const auto &a : downArgs) {
                     sg.push_back('|');
                     if (!a) {
@@ -1559,7 +2092,7 @@
                   }
                   if (!touch)
                     continue;
-                  std::string sg = T->getName().str();
+                  std::string sg = std::to_string(curStep) + "#" + T->getName().str();
                   for (const auto &a : downArgs) {
                     sg.push_back('|');
                     if (!a) {
@@ -1578,7 +2111,7 @@
                 }
                 Read rd = asRead(*CB);
                 Loc cell;
-                if (rd.ok && noBody(CB) && located(CB->getCalledOperand(), cell) && cells.count({cell.arg, cell.suf})) {
+                if (rd.ok && noBody(CB) && located(CB->getCalledOperand(), cell) && cells.count({cell.arg, cell.suf}) && pointerSlot(cell)) {
                   fileCell[{cell.arg, cell.suf}] = CB->getFunctionType();
                   if (rd.len)
                     fileLen[{cell.arg, cell.suf}] = *rd.len;
@@ -1605,12 +2138,14 @@
         frameOf[seq[i]] = &frames[i];
       std::vector<std::pair<Function *, int>> q;
       std::unordered_set<Function *> seenFn;
+      std::vector<Function *> fnOrder;
       for (size_t i = 0; i < mapped && i < seq.size(); ++i)
         q.push_back({seq[i], 0});
       for (size_t qi = 0; qi < q.size(); ++qi) {
         Function *F = q[qi].first;
         if (!F || !seenFn.insert(F).second)
           continue;
+        fnOrder.push_back(F);
         for (Instruction &I : instructions(*F)) {
           auto *CB = dyn_cast<CallBase>(&I);
           if (!CB)
@@ -1759,10 +2294,32 @@
           }
         }
         if (auto *CB = dyn_cast<CallBase>(base)) {
-          if (Function *D = CB->getCalledFunction())
-            if (Function *B = define(D->getName()))
-              if (auto L = fieldIn(B, off, CB, depth + 1))
+          Function *D = CB->getCalledFunction();
+          Function *B = D ? define(D->getName()) : nullptr;
+          if (B)
+            if (auto L = fieldIn(B, off, CB, depth + 1))
+              return L;
+          // A call that returns the pointer held at the start of an argument
+          // yields that argument. The opener then reads the path it holds.
+          if (B && off == 0 && CB->getType()->isPointerTy()) {
+            for (BasicBlock &BB : *B) {
+              auto *R = dyn_cast<ReturnInst>(BB.getTerminator());
+              if (!R || !R->getReturnValue() || !R->getReturnValue()->getType()->isPointerTy())
+                continue;
+              Value *rb = nullptr;
+              int64_t ro = 0;
+              baseOff(R->getReturnValue(), rb, ro);
+              if (auto *Ld = dyn_cast<LoadInst>(rb))
+                baseOff(Ld->getPointerOperand(), rb, ro);
+              auto *Arg = dyn_cast<Argument>(rb);
+              if (!Arg || Arg->getParent() != B || ro != 0 || Arg->getArgNo() >= CB->arg_size())
+                continue;
+              if (auto L = find(F, CB->getArgOperand(Arg->getArgNo()), depth + 1)) {
+                pathPtr.insert({L->arg, L->suf});
                 return L;
+              }
+            }
+          }
           // A call with no body that returns a pointer yields the bytes of
           // the object it was given. That pointer is the cell.
           if (noBody(CB) && CB->getType()->isPointerTy()) {
@@ -1869,7 +2426,7 @@
         return std::nullopt;
       };
       std::vector<std::pair<CallBase *, CallBase *>> opens;
-      for (Function *F : seenFn) {
+      for (Function *F : fnOrder) {
         for (Instruction &I : instructions(*F)) {
           auto *CB = dyn_cast<CallBase>(&I);
           if (!CB || !noBody(CB))
@@ -1907,7 +2464,7 @@
           Suffix hs = suffix(H);
           if (hs.empty())
             continue;
-          for (Function *G : seenFn) {
+          for (Function *G : fnOrder) {
             for (Instruction &S : instructions(*G)) {
               auto *St = dyn_cast<StoreInst>(&S);
               if (!St || suffix(St->getPointerOperand()) != hs)
@@ -2083,7 +2640,8 @@
         }
         std::unordered_set<const Value *> th{F->getArg(0)};
         std::unordered_set<const AllocaInst *> boxes;
-        for (int pass = 0; pass < 3; ++pass)
+        for (size_t before = SIZE_MAX; before != th.size() + boxes.size();) {
+          before = th.size() + boxes.size();
           for (Instruction &I : instructions(*F)) {
             if (auto *C = dyn_cast<CastInst>(&I))
               if (th.count(C->getOperand(0)))
@@ -2097,6 +2655,7 @@
                 if (boxes.count(Al))
                   th.insert(&I);
           }
+        }
         auto fieldOf = [&](Value *V) -> Suffix {
           auto *L = dyn_cast<LoadInst>(V->stripPointerCasts());
           if (!L)
@@ -2346,6 +2905,714 @@
                 cells.insert({hold.first, ln});
               }
             }
+        }
+      }
+    }
+    // A pointer and the integer that follows it are a buffer when the callee
+    // reads that many bytes through the pointer. The bytes are the cell the
+    // pointer locates to. A lookup stays a witness only when no later call
+    // that is not a lookup reads that cell or a cell inside it.
+    {
+      // The one materialization bound. An object no access bounds and whose
+      // count is a free input is this large; nothing above it is built.
+      const uint64_t kExtentCap = 1ull << 20;
+      auto rootOf = [&](size_t si, Value *V, Loc &cell) -> bool {
+        std::unordered_set<const Value *> seen;
+        while (V && seen.insert(V).second) {
+          while (auto *C = dyn_cast<CastInst>(V))
+            V = C->getOperand(0);
+          if (cellLoc(memAt(si), V, cell) && !cell.suf.empty())
+            return true;
+          auto *L = dyn_cast<LoadInst>(V);
+          if (!L)
+            return false;
+          auto *A = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts());
+          if (!A)
+            return false;
+          Value *st = nullptr;
+          for (User *U : A->users()) {
+            auto *S = dyn_cast<StoreInst>(U);
+            if (S && S->getPointerOperand()->stripPointerCasts() == A)
+              st = S->getValueOperand();
+          }
+          V = st;
+        }
+        return false;
+      };
+      // The entry cells a value may be, across calls. A term is the address
+      // of a cell, the value a cell holds, or the address of a local of some
+      // frame. A formal is what its caller bound. A load of a local is every
+      // store into it, including the stores a callee makes through the
+      // address it was passed. A call is every return of every target,
+      // evaluated with its actuals bound to its formals. Constants, fresh
+      // objects and arithmetic are no entry cell and contribute nothing.
+      //
+      // The evaluation is a function of the value, its environment, and the
+      // functions on the call string: a call to a function already on the
+      // call string contributes nothing, so call strings are acyclic. The
+      // equations a loop makes cyclic are solved as their least fixpoint, by
+      // rounds in which a value under evaluation reads the previous round's
+      // approximation, until a round changes nothing. A path that repeats a
+      // field step is a position inside a recursive structure, not a fixed
+      // cell, and contributes nothing. Paths without a repeated step over the
+      // finite set of field steps are finite, so the fixpoint exists and the
+      // rounds end, and its value does not depend on the order of evaluation.
+      struct Term {
+        int arg = -1;
+        Suffix suf;
+        bool val = false;
+        const AllocaInst *local = nullptr;
+        std::string lname;
+        bool operator<(const Term &o) const {
+          return std::tie(arg, suf, val, lname) < std::tie(o.arg, o.suf, o.val, o.lname);
+        }
+        bool operator==(const Term &o) const {
+          return std::tie(arg, suf, val, lname) == std::tie(o.arg, o.suf, o.val, o.lname);
+        }
+      };
+      using Terms = std::set<Term>;
+      std::map<std::string, Terms> evDone, evRound, evPrev;
+      std::set<std::string> evBusy;
+      std::unordered_set<const Function *> active;
+      std::set<std::string> activeNames;
+      std::map<const AllocaInst *, std::string> localName;
+      auto nameOf = [&](const AllocaInst *A) -> const std::string & {
+        auto it = localName.find(A);
+        if (it != localName.end())
+          return it->second;
+        unsigned pos = 0;
+        for (const Instruction &I : instructions(*A->getFunction())) {
+          if (&I == A)
+            break;
+          ++pos;
+        }
+        return localName[A] = A->getFunction()->getName().str() + "#" + std::to_string(pos);
+      };
+      auto repeats = [](const Suffix &suf, const Step &s) {
+        for (const Step &x : suf)
+          if (x.type == s.type && x.off == s.off && x.deref == s.deref)
+            return true;
+        return false;
+      };
+      auto envKey = [&](const Function *F, const Value *V, const std::vector<Terms> &env) {
+        std::string k = std::to_string(reinterpret_cast<uintptr_t>(F)) + "/" + std::to_string(reinterpret_cast<uintptr_t>(V));
+        for (const Terms &ts : env) {
+          k += "|";
+          for (const Term &t : ts) {
+            k += "{" + std::to_string(t.arg) + (t.val ? "v" : "a") + t.lname;
+            for (const Step &s : t.suf)
+              k += ";" + s.type + "@" + std::to_string(s.off) + (s.deref ? "*" : "");
+            k += "}";
+          }
+        }
+        k += "#";
+        for (const std::string &a : activeNames)
+          k += a + ",";
+        return k;
+      };
+      auto enter = [&](Function *T) {
+        active.insert(T);
+        activeNames.insert(T->getName().str());
+      };
+      auto leave = [&](Function *T) {
+        active.erase(T);
+        activeNames.erase(T->getName().str());
+      };
+      std::function<Terms(Function *, Value *, const std::vector<Terms> &)> ev;
+      std::function<Terms(Function *, const std::vector<Terms> &, const AllocaInst *)> storesTo;
+      auto bind = [&](Function *F, CallBase *CB, const std::vector<Terms> &env, Function *T) {
+        std::vector<Terms> g(T->arg_size());
+        for (unsigned a = 0; a < T->arg_size() && a < CB->arg_size(); ++a)
+          g[a] = ev(F, CB->getArgOperand(a), env);
+        return g;
+      };
+      auto bodies = [&](CallBase *CB) {
+        std::vector<Function *> out;
+        if (Function *C = CB->getCalledFunction())
+          if (C->isIntrinsic())
+            return out;
+        for (Function *T : targetsOf(CB))
+          if (T && !T->isDeclaration() && !active.count(T))
+            out.push_back(T);
+        return out;
+      };
+      auto holdsLocal = [](const Terms &ts, const AllocaInst *A) {
+        for (const Term &t : ts)
+          if (t.local == A && t.suf.empty())
+            return true;
+        return false;
+      };
+      storesTo = [&](Function *T, const std::vector<Terms> &env, const AllocaInst *A) -> Terms {
+        Terms r;
+        for (Instruction &I : instructions(*T)) {
+          if (auto *S = dyn_cast<StoreInst>(&I)) {
+            if (holdsLocal(ev(T, S->getPointerOperand(), env), A)) {
+              Terms v = ev(T, S->getValueOperand(), env);
+              r.insert(v.begin(), v.end());
+            }
+            continue;
+          }
+          auto *CB = dyn_cast<CallBase>(&I);
+          if (!CB)
+            continue;
+          bool passes = false;
+          for (Value *Op : CB->args())
+            if (Op->getType()->isPointerTy() && holdsLocal(ev(T, Op, env), A))
+              passes = true;
+          if (!passes)
+            continue;
+          for (Function *T2 : bodies(CB)) {
+            std::vector<Terms> g = bind(T, CB, env, T2);
+            enter(T2);
+            Terms v = storesTo(T2, g, A);
+            leave(T2);
+            r.insert(v.begin(), v.end());
+          }
+        }
+        return r;
+      };
+      ev = [&](Function *F, Value *V, const std::vector<Terms> &env) -> Terms {
+        if (!V)
+          return {};
+        std::string k = envKey(F, V, env);
+        if (auto it = evDone.find(k); it != evDone.end())
+          return it->second;
+        if (auto it = evRound.find(k); it != evRound.end())
+          return it->second;
+        if (!evBusy.insert(k).second) {
+          auto it = evPrev.find(k);
+          return it == evPrev.end() ? Terms{} : it->second;
+        }
+        Terms r;
+        auto add = [&](const Terms &ts) { r.insert(ts.begin(), ts.end()); };
+        if (auto *A = dyn_cast<Argument>(V)) {
+          if (A->getParent() == F && A->getArgNo() < env.size())
+            add(env[A->getArgNo()]);
+        } else if (auto *C = dyn_cast<CastInst>(V)) {
+          add(ev(F, C->getOperand(0), env));
+        } else if (auto *Fr = dyn_cast<FreezeInst>(V)) {
+          add(ev(F, Fr->getOperand(0), env));
+        } else if (auto *G = dyn_cast<GEPOperator>(V)) {
+          Step st;
+          bool constant = constStep(dl, G, st);
+          bool structVar = !G->hasAllConstantIndices() && isa<StructType>(G->getSourceElementType());
+          for (Term t : ev(F, G->getPointerOperand(), env)) {
+            if (t.local) {
+              if (constant && st.off == 0)
+                r.insert(t);
+              continue;
+            }
+            if (structVar)
+              continue;
+            if (!G->hasAllConstantIndices()) {
+              r.insert(t);
+              continue;
+            }
+            if (!constant)
+              continue;
+            Step s = st;
+            s.deref = t.val;
+            if (movesAddress(s)) {
+              if (repeats(t.suf, s))
+                continue;
+              t.suf.push_back(s);
+              t.val = false;
+            }
+            r.insert(t);
+          }
+        } else if (auto *CE = dyn_cast<ConstantExpr>(V)) {
+          if (CE->isCast())
+            add(ev(F, CE->getOperand(0), env));
+        } else if (auto *L = dyn_cast<LoadInst>(V)) {
+          Value *Ptr = L->getPointerOperand()->stripPointerCasts();
+          auto *Al = dyn_cast<AllocaInst>(Ptr);
+          if (Al && Al->getFunction() == F) {
+            for (User *U : Al->users()) {
+              if (auto *S = dyn_cast<StoreInst>(U)) {
+                if (S->getPointerOperand()->stripPointerCasts() == Al)
+                  add(ev(F, S->getValueOperand(), env));
+                continue;
+              }
+              auto *CB = dyn_cast<CallBase>(U);
+              if (!CB)
+                continue;
+              for (Function *T : bodies(CB)) {
+                std::vector<Terms> g = bind(F, CB, env, T);
+                enter(T);
+                add(storesTo(T, g, Al));
+                leave(T);
+              }
+            }
+          } else {
+            for (Term t : ev(F, Ptr, env)) {
+              if (t.local)
+                continue;
+              if (t.val) {
+                Step s{"", 0, true};
+                if (repeats(t.suf, s))
+                  continue;
+                t.suf.push_back(s);
+              }
+              t.val = true;
+              r.insert(t);
+            }
+          }
+        } else if (auto *CB = dyn_cast<CallBase>(V)) {
+          for (Function *T : bodies(CB)) {
+            std::vector<Terms> g = bind(F, CB, env, T);
+            enter(T);
+            for (BasicBlock &BB : *T)
+              if (auto *R = dyn_cast<ReturnInst>(BB.getTerminator()))
+                if (R->getReturnValue())
+                  add(ev(T, R->getReturnValue(), g));
+            leave(T);
+          }
+        } else if (auto *Phi = dyn_cast<PHINode>(V)) {
+          for (Value *In : Phi->incoming_values())
+            if (!isa<UndefValue>(In) && !isa<ConstantPointerNull>(In))
+              add(ev(F, In, env));
+        } else if (auto *Sel = dyn_cast<SelectInst>(V)) {
+          add(ev(F, Sel->getTrueValue(), env));
+          add(ev(F, Sel->getFalseValue(), env));
+        } else if (auto *Al = dyn_cast<AllocaInst>(V)) {
+          Term t;
+          t.local = Al;
+          t.lname = nameOf(Al);
+          r.insert(t);
+        }
+        evBusy.erase(k);
+        evRound[k] = r;
+        return r;
+      };
+      // The least fixpoint of the equations V reaches.
+      auto solveAt = [&](Function *F, Value *V, const std::vector<Terms> &env) {
+        evPrev.clear();
+        for (;;) {
+          evRound.clear();
+          Terms r = ev(F, V, env);
+          if (evRound == evPrev) {
+            evDone.insert(evRound.begin(), evRound.end());
+            evRound.clear();
+            return r;
+          }
+          evPrev = std::move(evRound);
+        }
+      };
+      std::vector<std::optional<std::vector<Terms>>> envAt(seq.size());
+      // The entry cells whose value V may be, at a step of the sequence.
+      auto valuesOf = [&](size_t si, Value *V) {
+        std::vector<Loc> out;
+        Loc L;
+        if (cellLoc(memAt(si), V, L) && !L.suf.empty()) {
+          out.push_back(L);
+          return out;
+        }
+        if (!envAt[si]) {
+          std::vector<Terms> env(seq[si]->arg_size());
+          Mem &m = memAt(si);
+          for (Argument &A : seq[si]->args())
+            if (auto it = m.loc.find(&A); it != m.loc.end()) {
+              Term t;
+              t.arg = it->second.arg;
+              t.suf = it->second.suf;
+              t.val = it->second.pointee;
+              env[A.getArgNo()].insert(t);
+            }
+          envAt[si] = std::move(env);
+        }
+        for (const Term &t : solveAt(seq[si], V, *envAt[si]))
+          if (t.arg >= 0 && !t.local && t.val && !t.suf.empty())
+            out.push_back(Loc{t.arg, t.suf, true});
+        return out;
+      };
+      auto writeSuf = [&](int arg, const Suffix &suf) {
+        out << " arg" << arg;
+        for (const Step &st : suf)
+          out << " " << st.type << "+" << st.off;
+      };
+      auto growCell = [&](const Loc &cell, uint64_t n) {
+        cells.insert({cell.arg, cell.suf});
+        Suffix child = cell.suf;
+        child.push_back(Step{"", 0, true});
+        cells.insert({cell.arg, child});
+        auto key = std::make_pair(cell.arg, child);
+        auto it = readBytes.find(key);
+        if (it == readBytes.end() || it->second < n)
+          readBytes[key] = n;
+      };
+      // Returns whether some entry cell now holds the n bytes.
+      auto grow = [&](size_t si, Value *Buf, uint64_t n) -> bool {
+        if (!n || n > kExtentCap)
+          return false;
+        Loc cell;
+        if (rootOf(si, Buf, cell)) {
+          growCell(cell, n);
+          return true;
+        }
+        std::vector<Loc> held = valuesOf(si, Buf);
+        for (const Loc &c : held) {
+          growCell(c, n);
+          out << "bytes";
+          writeSuf(c.arg, c.suf);
+          out << " " << n << "\n";
+        }
+        return !held.empty();
+      };
+      std::map<std::tuple<const Function *, unsigned, unsigned>, bool> lenMemo;
+      std::function<bool(Function *, unsigned, unsigned)> usedAsLen =
+          [&](Function *F, unsigned p, unsigned n) -> bool {
+        if (!F || F->isDeclaration() || p >= F->arg_size() || n >= F->arg_size())
+          return false;
+        auto key = std::make_tuple(F, p, n);
+        if (auto it = lenMemo.find(key); it != lenMemo.end())
+          return it->second;
+        lenMemo[key] = false;
+        auto derivesArg = [&](Value *V, unsigned arg) {
+          std::unordered_set<const Value *> seen;
+          while (V && seen.insert(V).second) {
+            if (auto *A = dyn_cast<Argument>(V->stripPointerCasts()))
+              return A->getArgNo() == arg;
+            if (auto *C = dyn_cast<CastInst>(V)) {
+              V = C->getOperand(0);
+              continue;
+            }
+            if (auto *G = dyn_cast<GEPOperator>(V)) {
+              V = G->getPointerOperand();
+              continue;
+            }
+            if (auto *L = dyn_cast<LoadInst>(V)) {
+              auto *Al = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts());
+              if (!Al)
+                return false;
+              Value *st = nullptr;
+              for (User *U : Al->users())
+                if (auto *S = dyn_cast<StoreInst>(U))
+                  if (S->getPointerOperand()->stripPointerCasts() == Al)
+                    st = S->getValueOperand();
+              V = st;
+              continue;
+            }
+            return false;
+          }
+          return false;
+        };
+        // An index names the same storage across -O0 reloads: the local it is
+        // loaded from, else the value itself.
+        auto indexRoot = [](Value *V) -> const Value * {
+          while (auto *C = dyn_cast<CastInst>(V))
+            V = C->getOperand(0);
+          if (auto *L = dyn_cast<LoadInst>(V))
+            if (auto *A = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts()))
+              return A;
+          return V;
+        };
+        bool yes = false;
+        std::unordered_set<const Value *> indices;
+        for (Instruction &I : instructions(*F))
+          if (auto *G = dyn_cast<GetElementPtrInst>(&I))
+            if (!G->hasAllConstantIndices() && derivesArg(G->getPointerOperand(), p))
+              for (Value *Ix : G->indices())
+                if (!isa<Constant>(Ix))
+                  indices.insert(indexRoot(Ix));
+        for (Instruction &I : instructions(*F)) {
+          // The pointer is indexed by a value compared with the count.
+          if (auto *C = dyn_cast<ICmpInst>(&I))
+            for (unsigned s = 0; s < 2; ++s)
+              if (derivesArg(C->getOperand(s), n) && indices.count(indexRoot(C->getOperand(1 - s))))
+                yes = true;
+          auto *CB = dyn_cast<CallBase>(&I);
+          if (!CB)
+            continue;
+          Function *Cal = CB->getCalledFunction();
+          if (Cal && (Cal->getName().starts_with("llvm.memcpy") || Cal->getName().starts_with("llvm.memmove"))) {
+            if (CB->arg_size() >= 3 &&
+                (derivesArg(CB->getArgOperand(0), p) || derivesArg(CB->getArgOperand(1), p)) &&
+                derivesArg(CB->getArgOperand(2), n))
+              yes = true;
+          }
+          if (!Cal)
+            continue;
+          Function *D = define(Cal->getName());
+          if (!D)
+            D = Cal;
+          for (unsigned i = 0; i + 1 < CB->arg_size() && i < D->arg_size(); ++i) {
+            if (!derivesArg(CB->getArgOperand(i), p) || !CB->getArgOperand(i)->getType()->isPointerTy())
+              continue;
+            if (!derivesArg(CB->getArgOperand(i + 1), n) || !CB->getArgOperand(i + 1)->getType()->isIntegerTy())
+              continue;
+            if (D->isDeclaration()) {
+              if (CB->onlyReadsMemory(i) || D->onlyReadsMemory())
+                yes = true;
+            } else if (i + 1 < D->arg_size() && usedAsLen(D, i, i + 1))
+              yes = true;
+          }
+        }
+        lenMemo[key] = yes;
+        return yes;
+      };
+      // A pointer stored into a field of a local is the value a callee loads
+      // back from that field. The bytes read are the uses of the reloaded
+      // pointer.
+      std::function<uint64_t(Function *, unsigned)> carried =
+          [&](Function *F, unsigned arg) -> uint64_t {
+        if (!F || F->isDeclaration() || arg >= F->arg_size())
+          return 0;
+        std::unordered_set<const Function *> seen;
+        uint64_t n = pointedExtent(F, F->getArg(arg), seen, 0);
+        auto derivesArg = [&](Value *V) {
+          std::unordered_set<const Value *> seenV;
+          while (V && seenV.insert(V).second) {
+            if (auto *A = dyn_cast<Argument>(V->stripPointerCasts()))
+              return A->getArgNo() == arg;
+            if (auto *C = dyn_cast<CastInst>(V)) {
+              V = C->getOperand(0);
+              continue;
+            }
+            if (auto *G = dyn_cast<GEPOperator>(V)) {
+              V = G->getPointerOperand();
+              continue;
+            }
+            if (auto *L = dyn_cast<LoadInst>(V)) {
+              auto *Al = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts());
+              if (!Al)
+                return false;
+              Value *st = nullptr;
+              for (User *U : Al->users())
+                if (auto *S = dyn_cast<StoreInst>(U))
+                  if (S->getPointerOperand()->stripPointerCasts() == Al)
+                    st = S->getValueOperand();
+              V = st;
+              continue;
+            }
+            return false;
+          }
+          return false;
+        };
+        struct Put {
+          const AllocaInst *A;
+          int64_t off;
+        };
+        std::vector<Put> puts;
+        for (Instruction &I : instructions(*F)) {
+          auto *S = dyn_cast<StoreInst>(&I);
+          if (!S || !S->getValueOperand()->getType()->isPointerTy() || !derivesArg(S->getValueOperand()))
+            continue;
+          auto *G = dyn_cast<GEPOperator>(S->getPointerOperand()->stripPointerCasts());
+          auto *A = dyn_cast<AllocaInst>(G ? G->getPointerOperand()->stripPointerCasts() : S->getPointerOperand()->stripPointerCasts());
+          if (!A)
+            continue;
+          int64_t off = 0;
+          if (G) {
+            APInt delta(dl.getIndexSizeInBits(G->getPointerAddressSpace()), 0);
+            if (!G->hasAllConstantIndices() || !G->accumulateConstantOffset(dl, delta))
+              continue;
+            off = delta.getSExtValue();
+          }
+          puts.push_back({A, off});
+        }
+        for (const Put &put : puts) {
+          for (Instruction &I : instructions(*F)) {
+            auto *CB = dyn_cast<CallBase>(&I);
+            if (!CB)
+              continue;
+            Function *Cal = CB->getCalledFunction();
+            Function *D = Cal ? define(Cal->getName()) : nullptr;
+            if (!D || D->isDeclaration())
+              continue;
+            for (unsigned k = 0; k < CB->arg_size() && k < D->arg_size(); ++k) {
+              if (CB->getArgOperand(k)->stripPointerCasts() != put.A)
+                continue;
+              for (Instruction &J : instructions(*D)) {
+                auto *L = dyn_cast<LoadInst>(&J);
+                if (!L || !L->getType()->isPointerTy())
+                  continue;
+                auto *G = dyn_cast<GEPOperator>(L->getPointerOperand()->stripPointerCasts());
+                if (!G)
+                  continue;
+                Value *base = G->getPointerOperand()->stripPointerCasts();
+                bool from = false;
+                if (auto *A = dyn_cast<Argument>(base))
+                  from = A->getArgNo() == k;
+                else if (auto *Ld = dyn_cast<LoadInst>(base)) {
+                  auto *Al = dyn_cast<AllocaInst>(Ld->getPointerOperand()->stripPointerCasts());
+                  if (Al)
+                    for (User *U : Al->users())
+                      if (auto *St = dyn_cast<StoreInst>(U))
+                        if (St->getPointerOperand()->stripPointerCasts() == Al)
+                          if (auto *Ag = dyn_cast<Argument>(St->getValueOperand()->stripPointerCasts()))
+                            from = Ag->getArgNo() == k;
+                }
+                if (!from)
+                  continue;
+                APInt delta(dl.getIndexSizeInBits(G->getPointerAddressSpace()), 0);
+                if (!G->hasAllConstantIndices() || !G->accumulateConstantOffset(dl, delta))
+                  continue;
+                if (delta.getSExtValue() != put.off)
+                  continue;
+                std::unordered_set<const Function *> seenL;
+                n = std::max(n, pointedExtent(D, L, seenL, 0));
+              }
+            }
+          }
+        }
+        return n;
+      };
+      struct Site {
+        size_t si = 0;
+        Instruction *at = nullptr;
+        const Function *callee = nullptr;
+        std::vector<std::pair<int, Suffix>> roots;
+      };
+      std::vector<Site> sites;
+      for (size_t si = 0; si < seq.size(); ++si) {
+        if (!seq[si] || seq[si]->isDeclaration())
+          continue;
+        for (Instruction &I : instructions(*seq[si])) {
+          auto *CB = dyn_cast<CallBase>(&I);
+          if (!CB || CB->isDebugOrPseudoInst())
+            continue;
+          Function *Cal = CB->getCalledFunction();
+          if (Cal && ignorable(Cal))
+            continue;
+          Copy copied = fixedCopy(*CB);
+          if (copied.ok)
+            grow(si, CB->getArgOperand(copied.src), copied.len);
+          Function *D = Cal ? define(Cal->getName()) : nullptr;
+          if (!D)
+            D = Cal;
+          for (unsigned i = 0; i + 1 < CB->arg_size(); ++i) {
+            Value *Buf = CB->getArgOperand(i);
+            Value *Cnt = CB->getArgOperand(i + 1);
+            if (!Buf->getType()->isPointerTy() || !Cnt->getType()->isIntegerTy())
+              continue;
+            bool input = false;
+            if (!D || D->isDeclaration())
+              input = CB->onlyReadsMemory(i) || (D && D->onlyReadsMemory());
+            else if (i + 1 < D->arg_size())
+              input = usedAsLen(D, i, i + 1) || pairRead(D, i, i + 1);
+            if (!input)
+              continue;
+            uint64_t n = 0;
+            if (auto *C = dyn_cast<ConstantInt>(Cnt)) {
+              if (!C->isNegative() && C->getBitWidth() <= 64)
+                n = C->getZExtValue();
+            }
+            if (!n) {
+              std::unordered_set<const Function *> seenF;
+              n = pointedExtent(seq[si], Buf, seenF, 0);
+            }
+            if (!n && D && !D->isDeclaration() && i < D->arg_size())
+              n = carried(D, i);
+            // The count is itself an entry cell, a free input, and no access
+            // bounds it. The bytes number that free count, so the only limit
+            // is the materialization cap.
+            std::vector<Loc> counts;
+            if (!isa<ConstantInt>(Cnt)) {
+              Loc lenCell;
+              if (rootOf(si, Cnt, lenCell))
+                counts.push_back(lenCell);
+              else
+                counts = valuesOf(si, Cnt);
+            }
+            if (!n && !counts.empty())
+              n = kExtentCap;
+            if (!grow(si, Buf, n))
+              continue;
+            // The callee reads Cnt bytes through Buf, and the harness holds n
+            // bytes there, so every entry cell the count may be is at most n.
+            // A sign extension reads the cell as signed.
+            Value *raw = Cnt;
+            bool sext = false;
+            while (auto *C = dyn_cast<CastInst>(raw)) {
+              sext = sext || isa<SExtInst>(C);
+              raw = C->getOperand(0);
+            }
+            unsigned bits = raw->getType()->isIntegerTy() ? raw->getType()->getIntegerBitWidth() : 64;
+            uint64_t most = n;
+            if (bits < 64)
+              most = std::min<uint64_t>(most, sext ? (1ull << (bits - 1)) - 1 : (1ull << bits) - 1);
+            for (const Loc &c : counts) {
+              cells.insert({c.arg, c.suf});
+              CountCap &cap = countCap[{c.arg, c.suf}];
+              if (!cap.most || most < cap.most)
+                cap.most = most;
+              cap.bytes = std::max(1u, bits / 8);
+              out << "count";
+              writeSuf(c.arg, c.suf);
+              out << " ule " << cap.most << "\n";
+            }
+          }
+          Site s;
+          s.si = si;
+          s.at = CB;
+          s.callee = D;
+          for (Value *Op : CB->args()) {
+            if (!Op->getType()->isPointerTy())
+              continue;
+            Loc L;
+            if (rootOf(si, Op, L))
+              s.roots.push_back({L.arg, L.suf});
+          }
+          if (!s.roots.empty())
+            sites.push_back(std::move(s));
+        }
+      }
+      auto under = [](const Suffix &inner, const Suffix &outer) {
+        if (outer.size() > inner.size())
+          return false;
+        for (size_t i = 0; i < outer.size(); ++i)
+          if (inner[i].type != outer[i].type || inner[i].off != outer[i].off || inner[i].deref != outer[i].deref)
+            return false;
+        return true;
+      };
+      for (auto &kv : stepEv) {
+        for (Ev &e : kv.second) {
+          if (e.kind != 'q' || !e.at)
+            continue;
+          const Site *here = nullptr;
+          for (const Site &s : sites)
+            if (s.at == e.at) {
+              here = &s;
+              break;
+            }
+          if (!here)
+            continue;
+          for (const Site &s : sites) {
+            if (s.at == here->at)
+              continue;
+            bool after = s.si > here->si || (s.si == here->si && dominatesBefore(here->at, s.at));
+            if (!after)
+              continue;
+            if (s.callee && lookupOnly(s.callee))
+              continue;
+            bool hit = false;
+            for (const auto &a : here->roots)
+              for (const auto &b : s.roots)
+                if (a.first == b.first && under(b.second, a.second))
+                  hit = true;
+            if (!hit)
+              continue;
+            e.live = true;
+            for (const auto &a : here->roots) {
+              cells.insert(a);
+              std::unordered_set<const Function *> seenF;
+              uint64_t n = 0;
+              for (Value *Op : cast<CallBase>(here->at)->args()) {
+                Loc L;
+                if (rootOf(here->si, Op, L) && L.arg == a.first && L.suf == a.second)
+                  n = std::max(n, pointedExtent(seq[here->si], Op, seenF, 0));
+              }
+              if (n && n <= kExtentCap) {
+                Suffix child = a.second;
+                child.push_back(Step{"", 0, true});
+                cells.insert({a.first, child});
+                auto it = readBytes.find({a.first, child});
+                if (it == readBytes.end() || it->second < n)
+                  readBytes[{a.first, child}] = n;
+              }
+            }
+            break;
+          }
         }
       }
     }

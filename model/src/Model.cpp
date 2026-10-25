@@ -3,12 +3,26 @@
 
 #include <sstream>
 
+#include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/TargetParser/Triple.h"
+#include "llvm/Transforms/Utils/BuildLibCalls.h"
 
 #include <dlfcn.h>
 #include <execinfo.h>
 #include <signal.h>
 #include <unistd.h>
+
+// A library function's memory effects are part of its specification. LLVM
+// records them for the functions whose prototype it recognizes; -O0 bitcode
+// leaves the declarations bare.
+static void annotateLibcalls(Module &M) {
+  TargetLibraryInfoImpl impl{Triple(M.getTargetTriple())};
+  TargetLibraryInfo tli(impl);
+  for (Function &F : M)
+    if (F.isDeclaration())
+      inferNonMandatoryLibFuncAttrs(F, tli);
+}
 
 static bool loadSink(const fs::path &yaml, std::string &file, unsigned &line) {
   std::ifstream in(yaml);
@@ -292,6 +306,12 @@ struct Witness {
   int index = -1;
   std::vector<std::string> seq;
   std::vector<Client::Cell> phi;
+  struct Ret {
+    std::string callee, pred, k, caller;
+    unsigned line = 0, col = 0;
+    bool live = false;
+  };
+  std::vector<Ret> rets;
 };
 
 // A run prints every sequence it tries and stops at the first satisfiable
@@ -372,8 +392,26 @@ Witness parseWitness(std::istream &st) {
     } else if (head == "cell") {
       take(s, may);
     } else if (head == "model") {
-      sawModel = true;
-      take(s, facts);
+      std::string second;
+      in >> second;
+      if (second == "return") {
+        Witness::Ret r;
+        std::string at, linek, lines, colk, cols;
+        in >> r.callee >> r.pred >> r.k >> at >> r.caller >> linek >> lines >> colk >> cols;
+        if (linek == "line")
+          r.line = (unsigned)std::atoi(lines.c_str());
+        if (colk == "col")
+          r.col = (unsigned)std::atoi(cols.c_str());
+        std::string extra;
+        while (in >> extra)
+          if (extra == "live")
+            r.live = true;
+        if (!r.callee.empty() && !r.caller.empty() && !r.pred.empty())
+          w.rets.push_back(std::move(r));
+      } else {
+        sawModel = true;
+        take(s, facts);
+      }
     }
   }
   w.phi = sawModel ? facts : may;
@@ -383,6 +421,402 @@ Witness parseWitness(std::istream &st) {
 }
 
 // The client the witnesses direct, linked with D and U into client.bc.
+// A required branch compared a call's result with a constant. An integer
+// lookup returns the witness. A pointer lookup that may be null returns
+// null. Every other integer result is assumed. Pointer results are applied
+// after the link, when a declaration is distinct from a body.
+void plantReturns(Module &M, const std::vector<Witness::Ret> &rets) {
+  if (rets.empty())
+    return;
+  LLVMContext &ctx = M.getContext();
+  auto *i64 = Type::getInt64Ty(ctx);
+  FunctionType *assumeTy = FunctionType::get(Type::getVoidTy(ctx), {i64}, false);
+  Function *assume = M.getFunction("klee_assume");
+  if (!assume)
+    assume = Function::Create(assumeTy, Function::ExternalLinkage, "klee_assume", &M);
+  auto predOf = [](const std::string &p) -> std::optional<ICmpInst::Predicate> {
+    if (p == "==")
+      return ICmpInst::ICMP_EQ;
+    if (p == "!=")
+      return ICmpInst::ICMP_NE;
+    if (p == "ugt")
+      return ICmpInst::ICMP_UGT;
+    if (p == "uge")
+      return ICmpInst::ICMP_UGE;
+    if (p == "ult")
+      return ICmpInst::ICMP_ULT;
+    if (p == "ule")
+      return ICmpInst::ICMP_ULE;
+    if (p == "sgt")
+      return ICmpInst::ICMP_SGT;
+    if (p == "sge")
+      return ICmpInst::ICMP_SGE;
+    if (p == "slt")
+      return ICmpInst::ICMP_SLT;
+    if (p == "sle")
+      return ICmpInst::ICMP_SLE;
+    return std::nullopt;
+  };
+  struct SiteKey {
+    std::string callee, caller;
+    unsigned line = 0, col = 0;
+    bool operator<(const SiteKey &o) const {
+      if (callee != o.callee)
+        return callee < o.callee;
+      if (caller != o.caller)
+        return caller < o.caller;
+      if (line != o.line)
+        return line < o.line;
+      return col < o.col;
+    }
+  };
+  struct SiteFact {
+    std::vector<std::pair<unsigned, int64_t>> cs;
+    bool live = false;
+  };
+  std::map<SiteKey, SiteFact> grouped;
+  for (const Witness::Ret &r : rets) {
+    auto pred = predOf(r.pred);
+    if (!pred || !r.line)
+      continue;
+    int64_t k = 0;
+    auto parsed = std::from_chars(r.k.data(), r.k.data() + r.k.size(), k);
+    if (parsed.ec != std::errc())
+      continue;
+    SiteFact &fact = grouped[{r.callee, r.caller, r.line, r.col}];
+    fact.cs.push_back({(unsigned)*pred, k});
+    fact.live = fact.live || r.live;
+  }
+  auto supply = [](CallBase *CB, Value *W) {
+    if (auto *II = dyn_cast<InvokeInst>(CB)) {
+      BasicBlock *From = II->getParent();
+      BasicBlock *Unw = II->getUnwindDest();
+      II->replaceAllUsesWith(W);
+      for (PHINode &Phi : Unw->phis())
+        Phi.removeIncomingValue(From, false);
+      BranchInst::Create(II->getNormalDest(), II);
+      II->eraseFromParent();
+      return;
+    }
+    CB->replaceAllUsesWith(W);
+    CB->eraseFromParent();
+  };
+  for (const auto &gv : grouped) {
+    Function *caller = M.getFunction(gv.first.caller);
+    if (!caller || caller->isDeclaration())
+      continue;
+    std::vector<CallBase *> sites;
+    for (Instruction &I : instructions(*caller)) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB)
+        continue;
+      Function *Cal = CB->getCalledFunction();
+      if (!Cal || Cal->getName() != gv.first.callee)
+        continue;
+      const DebugLoc &DL = CB->getDebugLoc();
+      if (!DL || DL.getLine() != gv.first.line || (gv.first.col && DL.getCol() != gv.first.col))
+        continue;
+      sites.push_back(CB);
+    }
+    for (CallBase *CB : sites) {
+      Function *D = CB->getCalledFunction();
+      std::optional<int64_t> fallback;
+      if (auto arg = fallbackArg(D))
+        if (*arg < CB->arg_size())
+          if (auto *C = dyn_cast<ConstantInt>(CB->getArgOperand(*arg)))
+            fallback = C->getSExtValue();
+      std::optional<int64_t> witness = satisfyingValue(gv.second.cs, fallback);
+      bool asLookup = lookupOnly(D) && witness && !gv.second.live;
+      Value *W = nullptr;
+      if (asLookup && CB->getType()->isIntegerTy())
+        W = ConstantInt::get(CB->getType(), (uint64_t)*witness, true);
+      else if (asLookup && CB->getType()->isPointerTy() && *witness == 0)
+        W = ConstantPointerNull::get(cast<PointerType>(CB->getType()));
+      if (W) {
+        supply(CB, W);
+        continue;
+      }
+      if (!CB->getType()->isIntegerTy())
+        continue;
+      Instruction *ip = nullptr;
+      if (auto *II = dyn_cast<InvokeInst>(CB))
+        ip = II->getNormalDest()->getFirstNonPHI();
+      else
+        ip = CB->getNextNode();
+      if (!ip)
+        continue;
+      IRBuilder<> B(ip);
+      for (const auto &c : gv.second.cs) {
+        Value *cmp = B.CreateICmp((ICmpInst::Predicate)c.first, CB, ConstantInt::get(CB->getType(), c.second, true));
+        B.CreateCall(assume, {B.CreateZExt(cmp, i64)});
+      }
+    }
+  }
+}
+
+// Bytes read or written through a pointer at constant offsets. base is the
+// displacement of the pointer from the start of that region.
+struct PtrExtent {
+  int64_t base = 0;
+  uint64_t n = 0;
+};
+
+static PtrExtent resultExtent(const CallBase *Root) {
+  PtrExtent out;
+  if (!Root || !Root->getFunction())
+    return out;
+  const DataLayout &dl = Root->getFunction()->getParent()->getDataLayout();
+  struct Item {
+    const Function *F;
+    const Value *V;
+    int64_t off;
+  };
+  std::vector<Item> q{{Root->getFunction(), Root, 0}};
+  std::set<std::tuple<const Function *, const Value *, int64_t>> seen;
+  int64_t lo = 0, hi = 0;
+  bool any = false;
+  auto cover = [&](int64_t o, uint64_t n) {
+    if (!n || n > (1ull << 20))
+      return;
+    int64_t b = o + (int64_t)n;
+    if (b < o)
+      return;
+    if (!any) {
+      lo = o;
+      hi = b;
+      any = true;
+    } else {
+      lo = std::min(lo, o);
+      hi = std::max(hi, b);
+    }
+  };
+  auto sized = [&](Type *T) -> uint64_t {
+    if (!T || !T->isSized())
+      return 0;
+    TypeSize ts = dl.getTypeStoreSize(T);
+    if (ts.isScalable())
+      return 0;
+    return ts.getFixedValue();
+  };
+  for (size_t i = 0; i < q.size() && i < 8192; ++i) {
+    const Function *F = q[i].F;
+    const Value *V = q[i].V;
+    int64_t o = q[i].off;
+    if (!F || !V || !seen.insert({F, V, o}).second)
+      continue;
+    for (const User *U : V->users()) {
+      if (q.size() >= 8192)
+        break;
+      if (auto *C = dyn_cast<CastInst>(U)) {
+        q.push_back({C->getFunction(), C, o});
+        continue;
+      }
+      if (auto *G = dyn_cast<GetElementPtrInst>(U)) {
+        if (G->getPointerOperand() != V)
+          continue;
+        APInt delta(dl.getIndexSizeInBits(G->getPointerAddressSpace()), 0);
+        if (!G->hasAllConstantIndices() || !G->accumulateConstantOffset(dl, delta))
+          continue;
+        q.push_back({G->getFunction(), G, o + (int64_t)delta.getSExtValue()});
+        continue;
+      }
+      if (auto *L = dyn_cast<LoadInst>(U)) {
+        if (L->getPointerOperand() == V)
+          cover(o, sized(L->getType()));
+        continue;
+      }
+      if (auto *S = dyn_cast<StoreInst>(U)) {
+        if (S->getPointerOperand() == V)
+          cover(o, sized(S->getValueOperand()->getType()));
+        else if (S->getValueOperand() == V)
+          for (const User *PU : S->getPointerOperand()->users())
+            if (auto *RL = dyn_cast<LoadInst>(PU))
+              if (RL->getPointerOperand() == S->getPointerOperand())
+                q.push_back({RL->getFunction(), RL, o});
+        continue;
+      }
+      auto *CB = dyn_cast<CallBase>(U);
+      if (!CB || CB->isDebugOrPseudoInst() || CB->getCalledOperand() == V)
+        continue;
+      Function *Cal = CB->getCalledFunction();
+      if (Cal && (Cal->getName().starts_with("llvm.memcpy") || Cal->getName().starts_with("llvm.memmove"))) {
+        if (CB->arg_size() >= 3 && (CB->getArgOperand(0) == V || CB->getArgOperand(1) == V))
+          if (auto *N = dyn_cast<ConstantInt>(CB->getArgOperand(2)))
+            if (N->getBitWidth() <= 64)
+              cover(o, N->getZExtValue());
+        continue;
+      }
+      if (!Cal || Cal->isDeclaration())
+        continue;
+      for (unsigned a = 0; a < CB->arg_size() && a < Cal->arg_size(); ++a)
+        if (CB->getArgOperand(a) == V)
+          q.push_back({Cal, Cal->getArg(a), o});
+    }
+  }
+  if (!any)
+    return out;
+  if (hi < 0)
+    hi = 0;
+  if (lo > 0)
+    lo = 0;
+  if (hi < lo)
+    return out;
+  out.base = -lo;
+  out.n = (uint64_t)(hi - lo);
+  return out;
+}
+
+// A pointer result still present after linking. A body stays and the
+// comparison is assumed. A declaration with no integer argument cannot
+// allocate, so a non-null result is the object the continuation accesses.
+static void plantExternal(Module &M, const std::vector<Witness::Ret> &rets) {
+  if (rets.empty())
+    return;
+  LLVMContext &ctx = M.getContext();
+  auto *i64 = Type::getInt64Ty(ctx);
+  auto *i8 = Type::getInt8Ty(ctx);
+  auto *ptrTy = PointerType::getUnqual(ctx);
+  FunctionType *assumeTy = FunctionType::get(Type::getVoidTy(ctx), {i64}, false);
+  Function *assume = M.getFunction("klee_assume");
+  if (!assume)
+    assume = Function::Create(assumeTy, Function::ExternalLinkage, "klee_assume", &M);
+  FunctionType *symTy = FunctionType::get(Type::getVoidTy(ctx), {ptrTy, i64, ptrTy}, false);
+  Function *sym = M.getFunction("klee_make_symbolic");
+  if (!sym)
+    sym = Function::Create(symTy, Function::ExternalLinkage, "klee_make_symbolic", &M);
+  Function *mallocFn = M.getFunction("malloc");
+  if (!mallocFn)
+    mallocFn = Function::Create(FunctionType::get(ptrTy, {i64}, false), Function::ExternalLinkage, "malloc", &M);
+  auto predOf = [](const std::string &p) -> std::optional<ICmpInst::Predicate> {
+    if (p == "==")
+      return ICmpInst::ICMP_EQ;
+    if (p == "!=")
+      return ICmpInst::ICMP_NE;
+    if (p == "ugt")
+      return ICmpInst::ICMP_UGT;
+    if (p == "uge")
+      return ICmpInst::ICMP_UGE;
+    if (p == "ult")
+      return ICmpInst::ICMP_ULT;
+    if (p == "ule")
+      return ICmpInst::ICMP_ULE;
+    if (p == "sgt")
+      return ICmpInst::ICMP_SGT;
+    if (p == "sge")
+      return ICmpInst::ICMP_SGE;
+    if (p == "slt")
+      return ICmpInst::ICMP_SLT;
+    if (p == "sle")
+      return ICmpInst::ICMP_SLE;
+    return std::nullopt;
+  };
+  struct SiteKey {
+    std::string callee, caller;
+    unsigned line = 0, col = 0;
+    bool operator<(const SiteKey &o) const {
+      if (callee != o.callee)
+        return callee < o.callee;
+      if (caller != o.caller)
+        return caller < o.caller;
+      if (line != o.line)
+        return line < o.line;
+      return col < o.col;
+    }
+  };
+  struct SiteFact {
+    std::vector<std::pair<unsigned, int64_t>> cs;
+    bool live = false;
+  };
+  std::map<SiteKey, SiteFact> grouped;
+  for (const Witness::Ret &r : rets) {
+    auto pred = predOf(r.pred);
+    if (!pred || !r.line)
+      continue;
+    int64_t k = 0;
+    auto parsed = std::from_chars(r.k.data(), r.k.data() + r.k.size(), k);
+    if (parsed.ec != std::errc())
+      continue;
+    SiteFact &fact = grouped[{r.callee, r.caller, r.line, r.col}];
+    fact.cs.push_back({(unsigned)*pred, k});
+    fact.live = fact.live || r.live;
+  }
+  auto supply = [](CallBase *CB, Value *W) {
+    if (auto *II = dyn_cast<InvokeInst>(CB)) {
+      BasicBlock *From = II->getParent();
+      BasicBlock *Unw = II->getUnwindDest();
+      II->replaceAllUsesWith(W);
+      for (PHINode &Phi : Unw->phis())
+        Phi.removeIncomingValue(From, false);
+      BranchInst::Create(II->getNormalDest(), II);
+      II->eraseFromParent();
+      return;
+    }
+    CB->replaceAllUsesWith(W);
+    CB->eraseFromParent();
+  };
+  unsigned nameN = 0;
+  for (const auto &gv : grouped) {
+    Function *caller = M.getFunction(gv.first.caller);
+    if (!caller || caller->isDeclaration())
+      continue;
+    std::vector<CallBase *> sites;
+    for (Instruction &I : instructions(*caller)) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB || !CB->getType()->isPointerTy())
+        continue;
+      Function *Cal = CB->getCalledFunction();
+      if (!Cal || Cal->getName() != gv.first.callee)
+        continue;
+      const DebugLoc &DL = CB->getDebugLoc();
+      if (!DL || DL.getLine() != gv.first.line || (gv.first.col && DL.getCol() != gv.first.col))
+        continue;
+      sites.push_back(CB);
+    }
+    for (CallBase *CB : sites) {
+      bool onlyNull = true, wantObj = true;
+      for (const auto &c : gv.second.cs) {
+        auto pred = (ICmpInst::Predicate)c.first;
+        if (c.second != 0 || (pred != ICmpInst::ICMP_EQ && pred != ICmpInst::ICMP_NE))
+          onlyNull = false;
+        if (!cmpHolds(pred, 1, c.second))
+          wantObj = false;
+      }
+      Function *Cal = CB->getCalledFunction();
+      bool integerArg = false;
+      for (Value *A : CB->args())
+        integerArg = integerArg || A->getType()->isIntegerTy();
+      PtrExtent ext = resultExtent(CB);
+      bool material = onlyNull && wantObj && Cal && Cal->isDeclaration() && !Cal->isIntrinsic() && !integerArg && ext.n > 0 &&
+                      ext.n <= (1ull << 20) && (uint64_t)ext.base <= ext.n;
+      if (material) {
+        IRBuilder<> B(CB);
+        Value *block = B.CreateCall(mallocFn, {ConstantInt::get(i64, ext.n)});
+        B.CreateCall(sym, {block, ConstantInt::get(i64, ext.n), B.CreateGlobalString("o" + std::to_string(nameN++))});
+        Value *ptr = block;
+        if (ext.base)
+          ptr = B.CreateGEP(i8, block, {ConstantInt::get(i64, ext.base)});
+        supply(CB, ptr);
+        continue;
+      }
+      Instruction *ip = nullptr;
+      if (auto *II = dyn_cast<InvokeInst>(CB))
+        ip = II->getNormalDest()->getFirstNonPHI();
+      else
+        ip = CB->getNextNode();
+      if (!ip)
+        continue;
+      IRBuilder<> B(ip);
+      for (const auto &c : gv.second.cs) {
+        auto pred = (ICmpInst::Predicate)c.first;
+        if (c.second != 0 || (pred != ICmpInst::ICMP_EQ && pred != ICmpInst::ICMP_NE))
+          continue;
+        Value *cmp = B.CreateICmp(pred, CB, ConstantPointerNull::get(cast<PointerType>(CB->getType())));
+        B.CreateCall(assume, {B.CreateZExt(cmp, i64)});
+      }
+    }
+  }
+}
+
 int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, const std::vector<Witness> &witnesses,
              const std::string &file, unsigned line, int rc) {
   SMDiagnostic e2;
@@ -390,6 +824,8 @@ int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, cons
   auto down2 = parseIRFile((dir / "se_lib" / "downstream.closure.bc").string(), e2, ctx);
   if (!up2 || !down2)
     return 1;
+  annotateLibcalls(*up2);
+  annotateLibcalls(*down2);
   source::reset();
   source::index(*down2);
   source::index(*up2);
@@ -410,6 +846,10 @@ int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, cons
   }
   if (plan.entries.empty())
     return rc;
+  if (!witnesses.empty()) {
+    plantReturns(*down2, witnesses[0].rets);
+    plantReturns(*up2, witnesses[0].rets);
+  }
   Module ch("client", ctx);
   client.emit(plan, ch);
   if (verifyModule(ch, &errs()))
@@ -419,6 +859,10 @@ int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, cons
     errs() << "link failed\n";
     return 1;
   }
+  if (!witnesses.empty())
+    plantExternal(ch, witnesses[0].rets);
+  if (verifyModule(ch, &errs()))
+    return 1;
   int r2 = finish(ch, ctx, outDir, "client", file, line);
   return rc ? rc : r2;
 }
@@ -483,6 +927,8 @@ int main(int argc, char **argv) {
     derr.print("model", errs());
     return 1;
   }
+  annotateLibcalls(*up);
+  annotateLibcalls(*down);
   std::error_code ec;
   fs::create_directories(outDir);
   raw_fd_ostream out((outDir / "state.txt").string(), ec);
@@ -530,6 +976,10 @@ int main(int argc, char **argv) {
   }
   int rc = 0;
   if (model.exportFn()) {
+  if (!witnesses.empty()) {
+    plantReturns(*down, witnesses[0].rets);
+    plantReturns(*up, witnesses[0].rets);
+  }
   Module harness("harness", ctx);
   model.emit(harness);
   if (verifyModule(harness, &errs()))
@@ -539,6 +989,10 @@ int main(int argc, char **argv) {
     errs() << "link failed\n";
     return 1;
   }
+  if (!witnesses.empty())
+    plantExternal(harness, witnesses[0].rets);
+  if (verifyModule(harness, &errs()))
+    return 1;
   rc = finish(harness, ctx, outDir, "run", file, line);
   }
   return mustSide(dir, outDir, ctx, witnesses, file, line, rc);

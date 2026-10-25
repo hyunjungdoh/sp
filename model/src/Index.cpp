@@ -1100,7 +1100,8 @@ void Model::indexVtables() const {
         return;
       std::unordered_set<const Value *> th{F.getArg(0)};
       std::unordered_set<const AllocaInst *> boxes;
-      for (int pass = 0; pass < 3; ++pass) {
+      for (size_t before = SIZE_MAX; before != th.size() + boxes.size();) {
+        before = th.size() + boxes.size();
         for (Instruction &I : instructions(F)) {
           if (auto *C = dyn_cast<CastInst>(&I))
             if (th.count(C->getOperand(0)))

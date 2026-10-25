@@ -137,6 +137,8 @@ private:
   std::set<std::string> dsyms, usyms, headers, declared;
   std::map<std::string, bool> defined;
   std::map<std::string, const DICompositeType *> composite;
+  // The ODR identifiers (typeinfo names) the debug info of D and U carries.
+  std::set<std::string> identifiers;
   std::map<std::string, Function *> bodies;
   FnSet ifaceD, ifaceU;
   FnMap<FnSet> calls;

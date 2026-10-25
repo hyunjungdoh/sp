@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(LLVM REQUIRED CONFIG)
-llvm_map_components_to_libnames(MODEL_LLVM support core irreader bitwriter linker demangle)
+llvm_map_components_to_libnames(MODEL_LLVM support core irreader bitwriter linker demangle analysis transformutils targetparser)
 
 add_executable(model
   src/Model.cpp
@@ -14,6 +14,7 @@ add_executable(model
   src/Solve.cpp
   src/Emit.cpp
   src/Origin.cpp
+  src/Flow.cpp
   src/Client.cpp
   src/Source.cpp
 )
