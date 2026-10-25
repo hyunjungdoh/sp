@@ -6,12 +6,19 @@ void Model::run(int seqPick, raw_ostream &out) {
       out << "sink none\n";
       return;
     }
+    // Experiment gate: when set, resolve local-held pointers eagerly during the
+    // index passes too, so one binary can show the index output is identical
+    // with or without the staging. Off by default.
+    if (const char *e = std::getenv("SP_EAGER_HELD"); e && *e)
+      resolveHeld = true;
     indexFunctions();
     exports = findExports();
     buildCallers();
     cone = reachSink();
     starts = findStarts();
     out << "starts " << starts.size() << "\n";
+    // Indexing is done. Resolve local-held pointers precisely from here on.
+    resolveHeld = true;
     for (int n = seqPick;; ++n) {
       auto paths = sequences(n);
       if ((int)paths.size() <= n) {

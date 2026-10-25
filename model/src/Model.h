@@ -275,11 +275,13 @@ struct Transition {
   }
 };
 
+// A value in terms of the entry arguments. addr(arg, []) is the argument
+// itself; addr(s . st) is addr(s) + st.off, or *addr(s) + st.off when st
+// is a dereference. The value is addr(arg, suf), or *addr(arg, suf) when
+// pointee is set.
 struct Loc {
   int arg = -1;
   Suffix suf;
-  // The value is a pointer loaded from suf. The next field is that pointee,
-  // so the pointer sits at suf and is not the pointee's first bytes.
   bool pointee = false;
   bool operator==(const Loc &o) const {
     return arg == o.arg && suf == o.suf && pointee == o.pointee;
@@ -469,6 +471,12 @@ class Model {
   mutable std::map<std::pair<std::string, std::set<int64_t>>, std::vector<InitSite>> initMemo;
   mutable std::map<Suffix, std::vector<Function *>> slotAt;
   mutable bool slotReady = false;
+  // The reaching-definition resolution of a pointer a local holds (slotHeld)
+  // is a property the harness needs at sequence-solving time, not in the
+  // eager index passes that only map operands to formals. It is off during
+  // indexing and on once solving begins, so a large module is indexed by the
+  // cheap reload path and resolved precisely only on the sequence cone.
+  mutable bool resolveHeld = false;
   struct VTab {
     GlobalVariable *g = nullptr;
     uint64_t base = 0;
@@ -512,14 +520,36 @@ class Model {
     Suffix srcSuf;
     int64_t srcBytes = 0;
     bool srcLoad = false;
+    // Set when the stored pointer is a cast result: the vptr the witness
+    // dynamic type requires, and the IR type it names.
+    std::string vtable;
+    uint64_t vbyte = 0;
+    std::string vtype;
   };
   struct FnMove {
     bool retOk = false;
     ArgRef ret;
     std::vector<PtrPut> puts;
+    // One edge per call that passes an address. The callee's transfers are
+    // applied from this edge when a field is queried, not copied in here.
+    struct Edge {
+      Function *callee = nullptr;
+      std::vector<const Value *> op;
+      std::vector<ArgRef> actual;
+    };
+    std::vector<Edge> edges;
   };
-  mutable std::unordered_map<const Function *, FnMove> moveCache;
+  // A map, not a hash map: a reference to one summary stays valid while
+  // another function's summary is inserted.
+  mutable std::map<const Function *, FnMove> moveCache;
   mutable std::unordered_set<const Function *> moveStack;
+  // putsAt is the least fixed point of the direct transfers. The key is the
+  // field written: a root address when the root is set, otherwise formal arg
+  // at that byte. The map is the only store of a composed transfer, and only
+  // a field that is queried is entered. A key already on the stack has no
+  // name.
+  mutable std::map<std::tuple<const Function *, const Value *, int, int64_t>, std::vector<PtrPut>> putMemo;
+  mutable std::set<std::tuple<const Function *, const Value *, int, int64_t>> putStack;
   mutable std::unordered_map<std::string, std::optional<Loc>> valueCache;
   mutable std::unordered_set<std::string> valueStack;
   struct Solved {
@@ -818,8 +848,122 @@ class Model {
 
   struct Mem {
     std::unordered_map<const Value *, Loc> loc;
-    std::unordered_map<const AllocaInst *, Loc> slot;
+    // The value each store into a local wrote.
+    std::unordered_map<const StoreInst *, Loc> stored;
+    // slotHeld under these facts. A value stays one as facts grow; an
+    // unknown one holds only for the fact count it was found under. The
+    // witness is the vptr the reaching definition's cast requires.
+    // Keyed by the read the value is asked at: two reads of one local can see
+    // different definitions.
+    struct Held {
+      std::optional<Loc> loc;
+      size_t facts = 0;
+      std::string vtable;
+      uint64_t vbyte = 0;
+      std::string vtype;
+    };
+    std::map<std::tuple<const AllocaInst *, int64_t, const Instruction *>, Held> held;
+    // The definitions of a local's field, found once per fact count and
+    // shared by every read of that field. No value: one that cannot be named.
+    struct SlotDef {
+      const Instruction *at = nullptr;
+      std::optional<Loc> val;
+      std::string vtable;
+      uint64_t vbyte = 0;
+      std::string vtype;
+    };
+    struct SlotDefs {
+      bool done = false;
+      size_t facts = 0;
+      bool lost = false;
+      std::vector<SlotDef> defs;
+    };
+    std::map<std::pair<const AllocaInst *, int64_t>, SlotDefs> defs;
+    // The vptr pins locating each value produced.
+    std::unordered_map<const Value *, std::set<std::string>> pins;
+    size_t facts() const { return loc.size() + stored.size(); }
   };
+
+  // The stores into a local whose value a load of it may read: the last
+  // store on each path to the load. None when a call or an escaped address
+  // may write the local in between.
+  const std::vector<const StoreInst *> *reaching(const LoadInst *L) const;
+  mutable std::unordered_map<const LoadInst *, std::optional<std::vector<const StoreInst *>>> reachMemo;
+
+  // A reload of a local is the value every reaching store wrote.
+  bool reloadLoc(const Mem &m, const LoadInst *L, Loc &out) const;
+
+  // A getter returns a pointer loaded from a constant-offset field of one of
+  // its formals: on every return the value is load(formal[arg] + suf). The
+  // suffix composes through nested getters. None when the returns disagree or
+  // a return is not such a load.
+  // __dynamic_cast's exact-type fast path (libc++abi dyn_cast_get_derived_info
+  // and dyn_cast_to_derived), evaluated on the vtable constants: the word
+  // before the vptr is the offset to the complete object and the word before
+  // that is its typeinfo. The witness dynamic type is the destination type,
+  // so the cast returns its source pointer plus that offset precisely when
+  // the offset equals the negated hint, and the object's vptr is that table.
+  struct DynWitness {
+    int64_t delta = 0;
+    std::string vtable;
+    uint64_t vptr = 0;
+    std::string type;
+  };
+  std::optional<DynWitness> dynWitness(const CallBase *CB) const;
+  struct VptrPin {
+    int arg = -1;
+    Suffix suf;
+    std::string g;
+    uint64_t byte = 0;
+  };
+  mutable std::map<std::string, VptrPin> vptrPins;
+  mutable std::set<std::string> vptrBad;
+  void pinVptr(const Loc &obj, const DynWitness &w) const;
+  // A pin is a constraint of the witness only when the cast's result is an
+  // actual of a sequence edge: the next function then runs on that object.
+  // lastPins collects the pins one location query produced, pinsOf keeps them
+  // per located value in each memory, and framePins the ones a frame used.
+  mutable std::vector<std::string> lastPins;
+  mutable std::set<std::string> framePins;
+  void notePins(Mem &m, const Value *V) const;
+  // V equals the pointer loaded from addr: a zero-adjusting cast of a getter.
+  // wit, when passed, receives the first such cast's witness.
+  bool castAddr(Function *F, Value *V, ArgRef &addr, DynWitness *wit = nullptr) const;
+  mutable std::map<const GlobalVariable *, std::vector<DynWitness>> vtFor;
+  mutable bool vtForReady = false;
+
+  std::optional<std::pair<int, Suffix>> loadRet(Function *F) const;
+  mutable std::unordered_map<const Function *, std::optional<std::pair<int, Suffix>>> loadRetCache;
+  mutable std::unordered_set<const Function *> loadRetStack;
+
+  // Whether D may write bytes [off, off + w) of the object its formal k
+  // addresses: a store or a constant copy at a constant offset of that
+  // formal that overlaps them, the same of a callee that receives the formal
+  // moved by a constant offset, or any write whose address derives from the
+  // formal by a variable offset or through a function with no body. A store
+  // of a null pointer is not a write, as for reloads of locals. A function
+  // already on the stack may write.
+  enum class May { No, Yes, Unknown };
+  May writesAt(Function *D, int k, int64_t off, uint64_t w) const;
+  mutable std::map<std::tuple<const Function *, int, int64_t, uint64_t>, May> writesMemo;
+  mutable std::set<std::tuple<const Function *, int, int64_t, uint64_t>> writesStack;
+
+  // The pointer a local holds at byte off, at instruction `at`. Its names are
+  // the alloca, its casts, and its constant-offset GEPs; a name kept anywhere
+  // else escapes. A definition of [off, off + 8) is a store through a name, or
+  // a call that receives a name and whose fnMove puts that field, the value
+  // then being the call's source argument at the caller. A call that may write
+  // the field without such a put, or a partial overlap, is a definition with
+  // no name. A definition reaches `at` when some path from it to `at` crosses
+  // no other definition of the field, so a destructor that runs after the read
+  // does not count. The value is the one every reaching definition agrees on.
+  // No program point (`at` null) takes every definition in the function.
+  bool slotHeld(Mem &m, const AllocaInst *A, int64_t off, const Instruction *at, Loc &out) const;
+  bool slotHeldOnce(Mem &m, const AllocaInst *A, int64_t off, const Instruction *at, Loc &out, DynWitness &cast) const;
+  mutable std::set<std::pair<const AllocaInst *, int64_t>> slotStack;
+
+  // The entry cell at the address a value denotes.
+  static bool cellAt(Loc v, Loc &cell);
 
   static Value *rootOf(Value *V);
 
@@ -840,12 +984,6 @@ class Model {
   // accesses. A function already on the stack is a cycle. A variable index
   // covers one element. No other length is chosen.
   uint64_t pointedExtent(Function *F, Value *Root, std::unordered_set<const Function *> &stack, int depth) const;
-
-
-  // A load yields the pointer that was stored. That pointer was taken out of a
-  // field only when the stored value is itself a load. Reloading an argument
-  // gives the same object back, so the next field stays in it.
-  bool heldPointer(const LoadInst *L) const;
 
 
   // The export path of an address. A loaded pointer keeps the field it was
@@ -872,7 +1010,16 @@ class Model {
   ArgRef addrIn(Function *F, Value *V) const;
 
 
-  FnMove fnMove(Function *F) const;
+  // Direct transfers of F: a store, a fixed-size copy, or a cast result in F's
+  // own body. A callee is not copied into this summary.
+  const FnMove &fnMove(Function *F) const;
+
+  // The transfers that write one field of F, each source expressed as a
+  // formal of F. Direct puts of F are included. A put of a callee is included
+  // after the callee's source formal is replaced by the actual at the call.
+  // root set selects the address root; root null selects formal arg. A key
+  // re-entered while it is being solved names nothing.
+  const std::vector<PtrPut> &putsAt(Function *F, const Value *root, int arg, int64_t bytes) const;
 
 
   // The export object a pointer value names. An argument is the formal the
@@ -938,6 +1085,11 @@ class Model {
 
   // The field of this struct at this byte offset is a pointer the program loads.
   bool fieldIsPointer(StringRef type, int64_t off) const;
+
+  // The store size of the scalar that begins off bytes into an object of
+  // the named type, through nested structs and arrays. 0 when off is not
+  // the start of a scalar or the type has no layout.
+  uint64_t scalarWidth(StringRef type, int64_t off) const;
 
 
   // The harness calls the residual once. Solved cells are the initial memory

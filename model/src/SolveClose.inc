@@ -1314,6 +1314,41 @@
         }
       }
     }
+    // A cast's vptr is a constraint of the witness when the cast's result is
+    // an actual of a sequence edge. Two such casts of one object that need
+    // different tables have no common dynamic type, so neither is kept.
+    std::map<std::pair<int, Suffix>, std::set<std::pair<std::string, uint64_t>>> tablesAt;
+    for (const std::string &k : framePins) {
+      auto it = vptrPins.find(k);
+      if (it == vptrPins.end() || vptrBad.count(k) || it->second.suf.empty())
+        continue;
+      Suffix obj(it->second.suf.begin(), it->second.suf.end() - 1);
+      tablesAt[{it->second.arg, obj}].insert({it->second.g, it->second.byte});
+    }
+    for (const std::string &k : framePins) {
+      auto it = vptrPins.find(k);
+      if (it == vptrPins.end() || vptrBad.count(k) || it->second.suf.empty())
+        continue;
+      const VptrPin &p = it->second;
+      Suffix obj(p.suf.begin(), p.suf.end() - 1);
+      if (tablesAt[{p.arg, obj}].size() != 1)
+        continue;
+      auto key = std::make_pair(p.arg, p.suf);
+      cells.insert(key);
+      if (!vptrAt.count(key))
+        vptrAt[key] = {p.g, p.byte};
+    }
+    // §3.5 경계 셀: 어떤 교차 근의 접두에 놓인 셀. 근 자신(suffix 동일)도 포함.
+    auto isBoundary = [&](const std::pair<int, Suffix> &c) {
+      for (const auto &r : boundaryRoots) {
+        if (r.first != c.first || r.second.size() > c.second.size())
+          continue;
+        if (std::equal(r.second.begin(), r.second.end(), c.second.begin()))
+          return true;
+      }
+      return false;
+    };
+    size_t boundaryCells = 0;
     for (const auto &c : cells) {
       out << "cell arg" << c.first;
       for (const Step &s : c.second)
@@ -1418,6 +1453,16 @@
         if (flen)
           out << " " << *flen;
       }
+      if (isBoundary(c)) {
+        out << " boundary";
+        ++boundaryCells;
+      }
+      out << "\n";
+      // The same path with each dereference marked, which the cell line's
+      // spelling leaves implicit.
+      out << "steps arg" << c.first;
+      for (const Step &s : c.second)
+        out << " " << s.type << "+" << s.off << (s.deref ? "*" : "");
       out << "\n";
       Solved s;
       s.arg = c.first;
@@ -1443,6 +1488,8 @@
       s.code = calleeAt.count(c) != 0;
       solvedCells.push_back(std::move(s));
     }
+    out << "boundary cells " << boundaryCells << " of " << cells.size()
+        << " roots " << boundaryRoots.size() << " unresolved " << boundaryUnresolved << "\n";
     Transition tr;
     using Cell = std::pair<int, Suffix>;
     std::map<Cell, SlotVal> mem;
@@ -1765,6 +1812,34 @@
       return p == ICmpInst::ICMP_NE || p == ICmpInst::ICMP_SLT || p == ICmpInst::ICMP_SGT ||
              p == ICmpInst::ICMP_ULT || p == ICmpInst::ICMP_UGT;
     };
+    // A definition of a pointer cell replaces the object behind it. A cell
+    // reached through that pointer, c . (s, deref) . t, then names a field of
+    // the new object; its entry value is no longer what a later read sees, so
+    // the read is not upward-exposed. The cells are the ones the events name.
+    std::map<int, std::vector<Cell>> named;
+    for (const auto &kv : stepEv)
+      for (const Ev &e : kv.second) {
+        named[e.cell.first].push_back(e.cell);
+        if (e.kind == 'c')
+          named[e.src.first].push_back(e.src);
+      }
+    for (auto &kv : named) {
+      std::sort(kv.second.begin(), kv.second.end());
+      kv.second.erase(std::unique(kv.second.begin(), kv.second.end()), kv.second.end());
+    }
+    auto killBelow = [&](const Cell &c) {
+      auto it = named.find(c.first);
+      if (it == named.end())
+        return;
+      size_t n = c.second.size();
+      for (const Cell &d : it->second) {
+        if (d.second.size() <= n || !d.second[n].deref)
+          continue;
+        if (!std::equal(c.second.begin(), c.second.end(), d.second.begin()))
+          continue;
+        cur[d] = make();
+      }
+    };
     for (size_t si = 0; si < mapped && si < seq.size(); ++si) {
       Function *SF = seq[si];
       std::vector<Instruction *> goals;
@@ -1948,6 +2023,7 @@
           ensure(e->src);
           ensure(e->cell);
           cur[e->cell] = find(cur[e->src]);
+          killBelow(e->cell);
         } else if (e->kind == 's') {
           out << "store " << si;
           writeCell(e->cell);
@@ -1959,6 +2035,14 @@
           int id = make();
           cur[e->cell] = id;
           allow(id, e->vals);
+          killBelow(e->cell);
+        } else if (e->kind == 'd') {
+          out << "define " << si;
+          writeCell(e->cell);
+          out << "\n";
+          ensure(e->cell);
+          cur[e->cell] = make();
+          killBelow(e->cell);
         } else if (e->kind == 'e') {
           out << "pre " << si;
           writeCell(e->cell);

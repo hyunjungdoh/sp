@@ -25,6 +25,37 @@ bool Model::fieldIsPointer(StringRef type, int64_t off) const {
     return false;
   }
 
+uint64_t Model::scalarWidth(StringRef type, int64_t pos) const {
+    StructType *ST = structNamed(type);
+    if (!ST || ST->isOpaque() || !ST->isSized() || pos < 0)
+      return 0;
+    // An offset past the struct is an element of an array of it.
+    uint64_t p = (uint64_t)pos % dl.getTypeAllocSize(ST).getFixedValue();
+    Type *T = ST;
+    for (;;) {
+      if (auto *S = dyn_cast<StructType>(T)) {
+        if (!S->isSized() || S->getNumElements() == 0)
+          return 0;
+        const StructLayout *SL = dl.getStructLayout(S);
+        unsigned i = SL->getElementContainingOffset(p);
+        p -= SL->getElementOffset(i);
+        T = S->getElementType(i);
+        if (p >= dl.getTypeStoreSize(T).getFixedValue())
+          return 0;
+        continue;
+      }
+      if (auto *A = dyn_cast<ArrayType>(T)) {
+        uint64_t e = dl.getTypeAllocSize(A->getElementType()).getFixedValue();
+        if (!e)
+          return 0;
+        p %= e;
+        T = A->getElementType();
+        continue;
+      }
+      return p == 0 ? dl.getTypeStoreSize(T).getFixedValue() : 0;
+    }
+  }
+
 void Model::emit(Module &H) const {
     if (!entry)
       return;
@@ -116,6 +147,9 @@ void Model::emit(Module &H) const {
       Suffix walked;
       int64_t acc = 0;
       bool openPtr = false;
+      // An untyped step moves within the object the last typed step viewed.
+      std::string viewT;
+      int64_t viewAt = 0;
       for (size_t i = 0; i < s.suf.size(); ++i) {
         // A pointer field holds the next object. The step's own deref bit
         // records the same fact when the load was seen directly.
@@ -124,17 +158,31 @@ void Model::emit(Module &H) const {
           p->size = std::max(p->size, (uint64_t)acc + 8);
           p = &p->child[acc];
           acc = 0;
+          viewT.clear();
         }
         int64_t off = s.suf[i].off < 0 ? 0 : s.suf[i].off;
+        if (!s.suf[i].type.empty()) {
+          viewT = s.suf[i].type;
+          viewAt = acc;
+        }
+        // A step views the address as its type. At the start of an object
+        // that is the object's type, so the object is at least that large.
+        if (acc == 0)
+          if (StructType *VT = structNamed(s.suf[i].type); VT && !VT->isOpaque() && VT->isSized())
+            p->size = std::max(p->size, (uint64_t)dl.getTypeAllocSize(VT).getFixedValue());
+        // The cell is the scalar the step lands on, as wide as its type.
+        uint64_t typed = scalarWidth(viewT, acc + off - viewAt);
         acc += off;
         walked.push_back(s.suf[i]);
         auto rb = readBytes.find({s.arg, walked});
         bool haveLen = rb != readBytes.end() && rb->second != 0;
-        uint64_t span = 8;
+        bool lastStep = i + 1 == s.suf.size();
+        uint64_t span = typed ? typed : (lastStep && s.width ? s.width : 8);
+        unsigned cellW = typed == 1 || typed == 2 || typed == 4 || typed == 8 ? (unsigned)typed : (s.width ? s.width : 8);
         if (haveLen)
           span = std::max(span, rb->second);
         p->size = std::max(p->size, (uint64_t)acc + span);
-        openPtr = fieldIsPointer(s.suf[i].type, off) && i + 1 < s.suf.size();
+        openPtr = !viewT.empty() && fieldIsPointer(viewT, acc - viewAt) && i + 1 < s.suf.size();
         if (i + 1 != s.suf.size())
           continue;
         if (s.file && s.fty) {
@@ -154,13 +202,13 @@ void Model::emit(Module &H) const {
           p->globAt[acc] = {s.glob, s.gbyte};
         } else if (!s.vals.empty()) {
           p->word[acc] = s.vals;
-          p->width[acc] = s.width ? s.width : 8;
+          p->width[acc] = cellW;
         } else if (!p->child.count(acc) && !s.code) {
           p->symAt[acc] = span;
           if (!s.ban.empty()) {
             p->ban[acc] = s.ban;
             if (!p->width.count(acc))
-              p->width[acc] = s.width ? s.width : (unsigned)span;
+              p->width[acc] = cellW;
           }
         }
         if (s.slo || s.shi || s.ulo || s.uhi) {
@@ -174,7 +222,7 @@ void Model::emit(Module &H) const {
           o.uloV = s.uloV;
           o.uhiV = s.uhiV;
           p->ordAt[acc] = o;
-          unsigned wd = s.ordBytes ? s.ordBytes : (s.width ? s.width : 8);
+          unsigned wd = s.ordBytes ? s.ordBytes : cellW;
           if (wd != 1 && wd != 2 && wd != 4 && wd != 8)
             wd = 8;
           if (!p->width.count(acc))
@@ -2238,7 +2286,13 @@ void Model::emit(Module &H) const {
       if (!storesPointer(G))
         continue;
       if (G->hasLocalLinkage()) {
-        G->setName(G->getName() + ".root" + std::to_string(-2 - kv.first));
+        size_t at = 0;
+        for (const GlobalVariable &O : G->getParent()->globals()) {
+          if (&O == G)
+            break;
+          ++at;
+        }
+        G->setName(G->getName() + ".root" + std::to_string(at));
         G->setLinkage(GlobalValue::ExternalLinkage);
       }
       GlobalVariable *gH = H.getNamedGlobal(G->getName());
