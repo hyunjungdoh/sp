@@ -629,9 +629,8 @@ class Model {
 
   // The callee reads up to n bytes through p: some access to the object p
   // points into is bounded by a value that depends on n. Dependence follows
-  // SSA and local reloads, not heap fields, and is context-sensitive: a
-  // callee's return reaches only the call that passed the dependent actual,
-  // through its summary.
+  // SSA and local reloads context-sensitively, and memory only as a field
+  // pair: p and n stored to two fields of one object, read back together.
   bool pairRead(Function *D, unsigned p, unsigned n) const;
   struct FlowIndex;
   mutable std::shared_ptr<FlowIndex> flowIdx;
