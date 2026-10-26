@@ -1,0 +1,49 @@
+install_binary_artifact_sanitizer() {
+  if [[ -z "${SANITIZER_BUILD:-}" ]]; then
+    return 1
+  fi
+
+  source "${DIR}/common-functions"
+  local SANITIZER_LLVM_VERSION_MAJOR="${SANITIZER_LLVM_VERSION/.*/}"
+  local version="-${SANITIZER_LLVM_VERSION_MAJOR}"
+
+  # Check if package in standard repository otherwise use upstream
+  with_sudo apt-get update -y
+  if ! apt-cache show "llvm${version}"; then
+    if [[ -z "$(which wget)" ]]; then
+      # Add certificate
+      with_sudo apt-get update -y
+      dependencies=(
+        ca-certificates
+        wget
+        lsb-release
+        gnupg
+      )
+      with_sudo apt-get -y --no-install-recommends install "${dependencies[@]}"
+    fi
+
+    # Add LLVM upstream repository if available
+    codename="$(lsb_release --codename --short)"
+    if wget -q "https://apt.llvm.org/${codename}/dists/llvm-toolchain-${codename}${version}/"; then
+      apt_entry="deb http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}${version} main"
+      if ! grep -rq "${apt_entry}" /etc/apt; then
+        wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key| with_sudo apt-key add -
+        echo "${apt_entry}" | with_sudo tee -a /etc/apt/sources.list
+        with_sudo apt-get update -y
+      fi
+    fi
+  fi
+
+  dependencies=(
+    "llvm${version}"
+    "clang${version}"
+    "libclang-rt${version}-dev"
+  )
+
+  #Install essential dependencies
+  with_sudo apt-get -y --no-install-recommends install "${dependencies[@]}" || return 1
+}
+
+get_docker_config_id_sanitizer() {
+  return 0
+}

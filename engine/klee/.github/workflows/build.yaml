@@ -1,0 +1,226 @@
+---
+name: CI
+
+on:
+  pull_request:
+    branches: master
+  push:
+    branches: master
+
+# Defaults for building KLEE
+env:
+  BASE_IMAGE: ubuntu:noble-20260911
+  REPOSITORY: ghcr.io/klee
+  COVERAGE: 0
+  DISABLE_ASSERTIONS: 0
+  ENABLE_DOXYGEN: 0
+  ENABLE_OPTIMIZED: 1
+  ENABLE_DEBUG: 1
+  GTEST_VERSION: 1.16.0
+  KLEE_RUNTIME_BUILD: "Debug+Asserts"
+  LLVM_VERSION: 18
+  MINISAT_VERSION: "master"
+  REQUIRES_RTTI: 0
+  SOLVERS: STP:Z3
+  STP_VERSION: 2.3.4
+  TCMALLOC_VERSION: 2.9.1
+  UCLIBC_VERSION: klee_uclibc_v1.4
+  USE_TCMALLOC: 1
+  USE_LIBCXX: 1
+  Z3_VERSION: 4.8.15
+  SQLITE_VERSION: 3400100
+
+jobs:
+  Linux:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        name: [
+          "LLVM 19",
+          "LLVM 18, Doxygen",
+          "LLVM 17, KDAlloc disabled",
+          "LLVM 16",
+          "LLVM 15",
+          "ASan",
+          "UBSan",
+          "Z3 only",
+#          "STP master",
+          "Latest klee-uclibc",
+          "Asserts disabled",
+          "No TCMalloc, optimised runtime",
+        ]
+        include:
+          - name: "LLVM 19"
+            env:
+              LLVM_VERSION: 19
+          - name: "LLVM 18, Doxygen"
+            env:
+              LLVM_VERSION: 18
+              ENABLE_DOXYGEN: 1
+          - name: "LLVM 17, KDAlloc disabled"
+            env:
+              LLVM_VERSION: 17
+              KLEE_TEST_OPTIONS: --kdalloc=false
+          - name: "LLVM 16"
+            env:
+              LLVM_VERSION: 16
+          - name: "LLVM 15"
+            env:
+              LLVM_VERSION: 15
+          # Sanitizer builds. Do unoptimized build otherwise the optimizer
+          # might remove problematic code
+          - name: "ASan"
+            env:
+              SANITIZER_BUILD: address
+              ENABLE_OPTIMIZED: 0
+              USE_TCMALLOC: 0
+              SANITIZER_LLVM_VERSION: 18
+          - name: "UBSan"
+            env:
+              SANITIZER_BUILD: undefined
+              ENABLE_OPTIMIZED: 0
+              USE_TCMALLOC: 0
+              SANITIZER_LLVM_VERSION: 18
+          # Test just using Z3 only
+          - name: "Z3 only"
+            env:
+              SOLVERS: Z3
+          # Test we can build against STP master
+#          - name: "STP master"
+#            env:
+#              SOLVERS: STP
+#              STP_VERSION: master
+          # Check we can build latest klee-uclibc branch
+          - name: "Latest klee-uclibc"
+            env:
+              UCLIBC_VERSION: klee_0_9_29
+          # Check at least one build with Asserts disabled.
+          - name: "Asserts disabled"
+            env:
+              SOLVERS: STP
+              DISABLE_ASSERTIONS: 1
+          # Check without TCMALLOC and with an optimised runtime library
+          - name: "No TCMalloc, optimised runtime"
+            env:
+              USE_TCMALLOC: 0
+              KLEE_RUNTIME_BUILD: "Release+Debug+Asserts"
+    steps:
+      - name: Checkout KLEE source code
+        uses: actions/checkout@v6
+      - name: Build KLEE
+        env: ${{ matrix.env }}
+        run: scripts/build/build.sh klee --docker --create-final-image
+      - name: Run tests
+        run: scripts/build/run-tests.sh --run-docker --debug
+
+  macOS:
+    runs-on: macos-latest
+    env:
+      LLVM_VERSION: 18
+      BASE: /tmp
+      SOLVERS: Z3
+      UCLIBC_VERSION: 0
+      USE_TCMALLOC: 0
+      USE_LIBCXX: 0
+    steps:
+      - name: Install newer version of Bash
+        run: brew install bash
+      - name: Checkout KLEE source code
+        uses: actions/checkout@v6
+      - name: Create virtualenv for Python3 (PEP 668)
+        run:  python3 -m venv .venv
+      - name: Build KLEE
+        run:  source .venv/bin/activate && echo "$(which tabulate)" && scripts/build/build.sh klee --debug --install-system-deps
+      - name: Run tests
+        run:  source .venv/bin/activate && scripts/build/run-tests.sh /tmp/klee_build* --debug
+
+  FreeBSD:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: cpa.sh {0}
+    steps:
+      - name: Repository checkout
+        uses: actions/checkout@v6
+      - uses: cross-platform-actions/action@v1.2.0
+        with:
+          operating_system: 'freebsd'
+          version: '15.0'
+          architecture: 'x86_64'
+          run: |
+            # Use latest package set
+            sudo mkdir -p /usr/local/etc/pkg/repos/
+            sudo cp /etc/pkg/FreeBSD.conf /usr/local/etc/pkg/repos/FreeBSD.conf
+            sudo sed -i.bak -e 's|/quarterly|/latest|' /usr/local/etc/pkg/repos/FreeBSD.conf
+
+            echo "::group::Dependencies installation"
+            sudo -E pkg install -y \
+                cmake ninja gmake z3 llvm18 pkgconf google-perftools googletest \
+                sqlite3 python3
+
+            # Install SQLite3 depending on the actual Python version installed
+            python_version="$(python3 -c 'import sys; print("py%d%d" % sys.version_info[:2])')"
+            sudo -E pkg install -y "${python_version}-sqlite3"
+
+            python3 -m venv .venv
+            .venv/bin/python -c 'import sqlite3'
+            .venv/bin/python -m pip install lit==18.1.8 tabulate
+            export PATH="$PWD/.venv/bin:$PATH"
+            echo "::endgroup::"
+
+            echo "::group::CMake configuration"
+            cmake -B build -G Ninja \
+                -DLLVM_DIR=`sysctl -n user.localbase`/lib/cmake/llvm \
+                -DLIT_TOOL="$PWD/.venv/bin/lit" \
+                -DENABLE_POSIX_RUNTIME=YES -DENABLE_UNIT_TESTS=YES \
+                -DENABLE_SYSTEM_TESTS=YES -DENABLE_TCMALLOC=yes \
+                -DENABLE_SOLVER_Z3=yes
+            echo "::endgroup::"
+
+            echo "::group::Building"
+            cmake --build build
+            echo "::endgroup::"
+
+            echo "::group::Testing"
+            cmake --build build --target check
+            echo "::endgroup::"
+
+  Docker:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout KLEE Code
+        uses: actions/checkout@v6
+      - name: Build Docker image
+        run: docker build .
+
+  Coverage:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        name: [
+          "STP",
+          "Z3",
+        ]
+        include:
+          - name: "STP"
+            env:
+              SOLVERS: STP:Z3
+          - name: "Z3"
+            env:
+              SOLVERS: Z3
+    env:
+      ENABLE_OPTIMIZED: 0
+      COVERAGE: 1
+    steps:
+      - name: Checkout KLEE source code
+        uses: actions/checkout@v6
+        with:
+          # Codecov may run into "Issue detecting commit SHA. Please run
+          # actions/checkout with fetch-depth > 1 or set to 0" when uploading.
+          # See also https://github.com/codecov/codecov-action/issues/190
+          fetch-depth: 2
+      - name: Build KLEE
+        env: ${{ matrix.env }}
+        run: scripts/build/build.sh klee --docker --create-final-image
+      - name: Run tests
+        run: scripts/build/run-tests.sh --coverage --upload-coverage --run-docker --debug
