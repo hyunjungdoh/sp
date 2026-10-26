@@ -109,11 +109,17 @@ public:
     // Per entry, the public fields of its arguments that name the input
     // file; the client writes the input's name into them before the call.
     FnMap<std::vector<Cell>> files;
+    // §2.4 Key: the names the witnesses' indirect targets are registered
+    // under. The input file may carry one as its extension.
+    std::vector<std::string> keys;
     std::vector<std::pair<Cell, std::vector<Function *>>> cellWriters;
     std::vector<Function *> writers;
     // One line per witness: whether its library cells are discharged by at
     // most four interface calls that are not the entry itself.
     std::vector<std::string> verdicts;
+    // §3.7: per witness, its indirect edges and how Definition D realizes
+    // each, and the number left open.
+    std::vector<std::string> obligations;
     // Per producer of a held type, the calls that can establish the state
     // it reads before it can produce.
     std::map<std::pair<Function *, std::string>, std::vector<Function *>, FnOrder> deps;
@@ -203,6 +209,14 @@ private:
   using TextPlace = std::tuple<Function *, unsigned, std::vector<int64_t>>;
   mutable std::map<TextPlace, std::vector<std::string>> comparedOf;
   const std::vector<std::string> &compared(Function *F, unsigned i, const std::vector<int64_t> &path = {}) const;
+  std::vector<std::string> keysOf(Function *T) const;
+  // §3.7 St(t): the functions that take t's address (any use but as a
+  // callee), or read a constant record that holds it.
+  FnSet installers(Function *T) const;
+  // Whether a call of F reads the input: an input channel among its
+  // parameters, or a closure that opens a file (§7 FileEnv).
+  bool opensFile(Function *F) const;
+  mutable FnMap<bool> opensOf;
   bool needs(const std::string &U, const std::string &T, std::set<std::string> &seen) const;
   std::vector<Function *> dependences(Function *P, const std::string &T) const;
   bool guardOf(Function *E, const Cell &c, Guard &g, bool config = false) const;
@@ -255,6 +269,9 @@ private:
   // Fields (S, off) whose value some library function compares with null:
   // A1 for the pointer fields of client-built objects.
   std::set<std::pair<std::string, int64_t>> nullFields;
+  // Call_0 (§2.2): fields some function calls through without comparing
+  // the field's value with null. They are not in nullFields.
+  std::set<std::pair<std::string, int64_t>> unguardedCalls;
   void buildNullFields();
   // A3 for fields: (S, off of a pointer field) -> off of the integer field
   // that bounds it.

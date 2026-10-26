@@ -681,30 +681,52 @@ FunctionType *Client::fnTypeOf(const DIType *T) const {
   return R ? FunctionType::get(R, ps, va) : nullptr;
 }
 
-// A1 for fields: a load of field (S, off) whose value, directly or through
-// the -O0 slot it is stored to, is compared with null.
+// A1 for fields (§2.2): NullOK(S, off) = Cmp_0 and not Call_0. Cmp_0: a load
+// of the field whose value, directly or through the -O0 slot it is stored
+// to, is compared with null. Call_0: a function calls such a value and
+// compares no value of that field with null.
 void Client::buildNullFields() {
   auto isNull = [](Value *V) { return isa<ConstantPointerNull>(V); };
-  for (const auto &kv : bodies)
+  auto fieldsLoaded = [&](Value *V) {
+    std::set<std::pair<std::string, int64_t>> out;
+    auto *L = dyn_cast<LoadInst>(V->stripPointerCasts());
+    if (!L)
+      return out;
+    std::vector<LoadInst *> loads{L};
+    if (auto *Al = dyn_cast<AllocaInst>(fieldAddress(L->getPointerOperand())))
+      for (User *U : Al->users())
+        if (auto *S = dyn_cast<StoreInst>(U))
+          if (S->getPointerOperand()->stripPointerCasts() == Al)
+            if (auto *F = dyn_cast<LoadInst>(S->getValueOperand()->stripPointerCasts()))
+              loads.push_back(F);
+    for (LoadInst *X : loads)
+      for (const auto &f : fieldsOf(X->getPointerOperand()))
+        out.insert(f);
+    return out;
+  };
+  for (const auto &kv : bodies) {
+    std::set<std::pair<std::string, int64_t>> tested, called;
     for (Instruction &I : instructions(*kv.second)) {
-      auto *C = dyn_cast<ICmpInst>(&I);
-      if (!C || !C->isEquality() || !(isNull(C->getOperand(0)) || isNull(C->getOperand(1))) || !nullReturns(C))
+      if (auto *CB = dyn_cast<CallBase>(&I)) {
+        if (!isa<Function>(CB->getCalledOperand()->stripPointerCasts()) && !CB->isInlineAsm())
+          for (const auto &f : fieldsLoaded(CB->getCalledOperand()))
+            called.insert(f);
         continue;
-      Value *V = (isNull(C->getOperand(0)) ? C->getOperand(1) : C->getOperand(0))->stripPointerCasts();
-      std::vector<LoadInst *> loads;
-      if (auto *L = dyn_cast<LoadInst>(V)) {
-        loads.push_back(L);
-        if (auto *Al = dyn_cast<AllocaInst>(fieldAddress(L->getPointerOperand())))
-          for (User *U : Al->users())
-            if (auto *S = dyn_cast<StoreInst>(U))
-              if (S->getPointerOperand()->stripPointerCasts() == Al)
-                if (auto *F = dyn_cast<LoadInst>(S->getValueOperand()->stripPointerCasts()))
-                  loads.push_back(F);
       }
-      for (LoadInst *L : loads)
-        for (const auto &f : fieldsOf(L->getPointerOperand()))
-          nullFields.insert(f);
+      auto *C = dyn_cast<ICmpInst>(&I);
+      if (!C || !C->isEquality() || !(isNull(C->getOperand(0)) || isNull(C->getOperand(1))))
+        continue;
+      auto fs = fieldsLoaded(isNull(C->getOperand(0)) ? C->getOperand(1) : C->getOperand(0));
+      tested.insert(fs.begin(), fs.end());
+      if (nullReturns(C))
+        nullFields.insert(fs.begin(), fs.end());
     }
+    for (const auto &f : called)
+      if (!tested.count(f))
+        unguardedCalls.insert(f);
+  }
+  for (const auto &f : unguardedCalls)
+    nullFields.erase(f);
 }
 
 // A3 for fields: integer field b of S bounds pointer field a of S when the
@@ -1326,6 +1348,154 @@ const std::vector<std::string> &Client::compared(Function *F, unsigned i, const 
     }
   }
   return comparedOf[key] = out;
+}
+
+// §2.4 Key(t): the names a function t is registered under, where an indirect
+// call can reach it. A store of t into a field of an object some call made
+// names t by the text constants passed to that call; a constant record that
+// holds t names it by the text constants beside it. A name is a token
+// (letters and digits, at most 16), since the client spells it as the
+// extension of the input file's name.
+std::vector<std::string> Client::keysOf(Function *T) const {
+  std::vector<std::string> out;
+  std::set<std::string> seen;
+  auto add = [&](Value *V) {
+    auto *GV = dyn_cast<GlobalVariable>(getUnderlyingObject(V));
+    auto *D = GV && GV->hasInitializer() ? dyn_cast<ConstantDataSequential>(GV->getInitializer()) : nullptr;
+    if (!D || !D->isCString())
+      return;
+    std::string s = D->getAsCString().str();
+    bool token = !s.empty() && s.size() <= 16;
+    for (char c : s)
+      token = token && std::isalnum((unsigned char)c);
+    if (token && out.size() < 8 && seen.insert(s).second)
+      out.push_back(s);
+  };
+  auto maker = [&](Value *Base, auto &self, int depth) -> void {
+    if (auto *CB = dyn_cast<CallBase>(Base)) {
+      for (Value *A : CB->args())
+        add(A);
+      return;
+    }
+    auto *L = dyn_cast<LoadInst>(Base);
+    auto *Al = L ? dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts()) : nullptr;
+    if (!Al || depth > 0)
+      return;
+    for (User *U : Al->users())
+      if (auto *S = dyn_cast<StoreInst>(U))
+        if (S->getPointerOperand()->stripPointerCasts() == Al)
+          self(getUnderlyingObject(S->getValueOperand()), self, depth + 1);
+  };
+  for (Module *M : {&down, &up}) {
+    for (Function &G : *M)
+      for (Instruction &I : instructions(G))
+        if (auto *S = dyn_cast<StoreInst>(&I))
+          if (S->getValueOperand()->stripPointerCasts() == T)
+            maker(getUnderlyingObject(S->getPointerOperand()), maker, 0);
+    std::function<void(Constant *)> record = [&](Constant *C) {
+      if (!C || !isa<ConstantAggregate>(C))
+        return;
+      bool holds = false;
+      for (Use &U : C->operands())
+        holds = holds || U.get()->stripPointerCasts() == T;
+      for (Use &U : C->operands()) {
+        if (holds)
+          add(U.get());
+        record(dyn_cast<Constant>(U.get()));
+      }
+    };
+    for (GlobalVariable &GV : M->globals())
+      if (GV.hasInitializer())
+        record(GV.getInitializer());
+  }
+  return out;
+}
+
+FnSet Client::installers(Function *T) const {
+  FnSet out;
+  StringRef name = T->getName();
+  auto isT = [&](Value *V) {
+    auto *F = dyn_cast<Function>(V->stripPointerCasts());
+    return F && F->getName() == name;
+  };
+  // A record holds t when its initializer reaches t through aggregates and
+  // the addresses of records that hold t (a table of driver classes).
+  std::set<const GlobalVariable *> holders;
+  std::function<bool(Constant *)> holds = [&](Constant *C) {
+    if (!C)
+      return false;
+    if (isT(C))
+      return true;
+    if (auto *G = dyn_cast<GlobalVariable>(C->stripPointerCasts()))
+      return holders.count(G) > 0;
+    if (!isa<ConstantAggregate>(C))
+      return false;
+    for (Use &U : C->operands())
+      if (holds(dyn_cast<Constant>(U.get())))
+        return true;
+    return false;
+  };
+  for (bool grew = true; grew && holders.size() < 4096;) {
+    grew = false;
+    for (Module *M : {&down, &up})
+      for (GlobalVariable &GV : M->globals())
+        if (GV.hasInitializer() && !holders.count(&GV) && holds(GV.getInitializer()))
+          grew = holders.insert(&GV).second || grew;
+  }
+  auto addUser = [&](Instruction *I) {
+    if (Function *B = body(I->getFunction()->getName().str()))
+      out.insert(B);
+  };
+  for (Module *M : {&down, &up}) {
+    for (Function &G : *M)
+      for (Instruction &I : instructions(G)) {
+        auto *CB = dyn_cast<CallBase>(&I);
+        for (Use &U : I.operands())
+          if (isT(U.get()) && !(CB && CB->isCallee(&U)))
+            addUser(&I);
+      }
+    for (GlobalVariable &GV : M->globals()) {
+      if (!holders.count(&GV))
+        continue;
+      std::vector<User *> work(GV.user_begin(), GV.user_end());
+      std::set<User *> seen;
+      while (!work.empty()) {
+        User *U = work.back();
+        work.pop_back();
+        if (!seen.insert(U).second)
+          continue;
+        if (auto *I = dyn_cast<Instruction>(U))
+          addUser(I);
+        else if (isa<ConstantExpr>(U))
+          work.insert(work.end(), U->user_begin(), U->user_end());
+      }
+    }
+  }
+  return out;
+}
+
+// §3.7: a call reads the input when it takes an input channel (a byte
+// buffer or a callback, whose contents the harness makes symbolic) or its
+// closure opens a path (§7 FileEnv).
+bool Client::opensFile(Function *F) const {
+  auto it = opensOf.find(F);
+  if (it != opensOf.end())
+    return it->second;
+  static const std::set<std::string> open{"fopen", "fopen64", "freopen", "open", "open64", "openat", "creat"};
+  bool r = false;
+  for (const Param &p : signature(F))
+    r = r || p.kind == Kind::Bytes || p.kind == Kind::Callback;
+  if (r)
+    return opensOf[F] = true;
+  for (Function *G : closureOf(F)) {
+    for (Instruction &I : instructions(*G))
+      if (auto *CB = dyn_cast<CallBase>(&I))
+        if (auto *C = dyn_cast<Function>(CB->getCalledOperand()->stripPointerCasts()))
+          r = r || open.count(bareName(C->getName().str())) > 0;
+    if (r)
+      break;
+  }
+  return opensOf[F] = r;
 }
 
 // Whether obtaining a held U can require obtaining T.
@@ -2997,6 +3167,78 @@ Client::Plan Client::plan(const std::vector<std::pair<std::vector<std::string>, 
     auto it = producers.find(T);
     P.handles.push_back({T, it == producers.end() ? std::vector<Producer>{} : it->second});
   }
+  // §2.4 Key and §3.7: an edge a -> b of a witness is indirect when a has no
+  // call of b. Definition D realizes its dispatch by a key (1), by a call
+  // of the harness installing b while the harness reads the input (2), or
+  // by a writer the harness calls installing it (3). The harness calls the
+  // producers of the held handles and the calls they depend on, the
+  // writers and the entry.
+  FnSet made;
+  for (const auto &h : P.handles)
+    for (const Producer &pr : h.second)
+      made.insert(pr.fn);
+  for (const auto &[k, ds] : P.deps)
+    made.insert(ds.begin(), ds.end());
+  std::set<std::string> keySeen;
+  for (const auto &[seq, phi] : ws) {
+    Function *E = seq.empty() ? nullptr : body(seq[0]);
+    FnSet calls = made;
+    if (E)
+      calls.insert(E);
+    bool file = false;
+    for (Function *H : calls)
+      file = file || opensFile(H);
+    std::vector<std::string> notes;
+    unsigned indirect = 0, open = 0;
+    for (size_t i = 0; i + 1 < seq.size(); ++i) {
+      Function *A = body(seq[i]), *T = body(seq[i + 1]);
+      if (!A || !T)
+        continue;
+      bool direct = false;
+      for (Instruction &I : instructions(*A))
+        if (auto *CB = dyn_cast<CallBase>(&I))
+          if (auto *C = dyn_cast<Function>(CB->getCalledOperand()->stripPointerCasts()))
+            direct = direct || C->getName() == T->getName();
+      if (direct)
+        continue;
+      ++indirect;
+      std::vector<std::string> ks = keysOf(T);
+      for (const std::string &k : ks)
+        if (P.keys.size() < 16 && keySeen.insert(k).second)
+          P.keys.push_back(k);
+      FnSet St = installers(T);
+      std::string how;
+      if (!ks.empty() && file)
+        how += " key";
+      if (file) {
+        Function *by = nullptr;
+        for (Function *H : calls)
+          for (Function *G : St)
+            if (!by && closureOf(H).count(G))
+              by = G;
+        if (by)
+          how += " input:" + by->getName().str();
+      }
+      for (Function *W : P.writers) {
+        bool by = false;
+        for (Function *G : St)
+          by = by || closureOf(W).count(G) > 0;
+        if (by) {
+          how += " writer:" + W->getName().str();
+          break;
+        }
+      }
+      open += how.empty();
+      notes.push_back("  D " + A->getName().str() + " -> " + T->getName().str() + " st " +
+                      std::to_string(St.size()) + (how.empty() ? " OPEN" : how));
+    }
+    std::string head = "obligations " + (seq.empty() ? std::string("-") : seq[0]) + " edges " +
+                       std::to_string(seq.empty() ? 0 : seq.size() - 1) + " indirect " +
+                       std::to_string(indirect) + " open " + std::to_string(open) + " file " +
+                       std::to_string(file ? 1 : 0);
+    P.obligations.push_back(head);
+    P.obligations.insert(P.obligations.end(), notes.begin(), notes.end());
+  }
   return P;
 }
 
@@ -3040,6 +3282,8 @@ void Client::report(const Plan &P, raw_ostream &out) const {
   for (const auto &[F, cs] : P.files)
     for (const Cell &c : cs)
       out << "file " << F->getName() << " " << c.type << "+" << c.off << "\n";
+  for (const std::string &k : P.keys)
+    out << "key " << k << "\n";
   for (Function *F : P.entries)
     out << "entry " << F->getName() << " (" << sig(F) << ")\n";
   for (const auto &h : P.handles) {
@@ -3060,6 +3304,9 @@ void Client::report(const Plan &P, raw_ostream &out) const {
   out << "writers " << P.writers.size() << "\n";
   for (const std::string &v : P.verdicts)
     out << v << "\n";
+  for (const std::string &o : P.obligations)
+    out << o << "\n";
+  out << "null-fields " << nullFields.size() << " unguarded-calls " << unguardedCalls.size() << "\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -3358,7 +3605,8 @@ struct FileEnv {
   Value *stream(IRBuilder<> &B, Value *s) { return at(B, files, s); }
   Value *fd(IRBuilder<> &B, Value *s) { return B.CreateAdd(s, B.getInt64(FirstFd)); }
 
-  // The path is "f". A shorter string is not read past its end.
+  // The path is "f", or "f." and an extension (§2.4 Key). A shorter string
+  // is not read past its end.
   Value *isF(IRBuilder<> &B, Function *F, Value *path) {
     auto *c0 = BasicBlock::Create(ctx, "path0", F), *c1 = BasicBlock::Create(ctx, "path1", F),
          *done = BasicBlock::Create(ctx, "path", F);
@@ -3367,7 +3615,8 @@ struct FileEnv {
     IRBuilder<> A(c0);
     A.CreateCondBr(A.CreateICmpEQ(A.CreateLoad(i8, path), A.getInt8('f')), c1, done);
     IRBuilder<> C(c1);
-    Value *end = C.CreateICmpEQ(C.CreateLoad(i8, C.CreateGEP(i8, path, C.getInt64(1))), C.getInt8(0));
+    Value *c = C.CreateLoad(i8, C.CreateGEP(i8, path, C.getInt64(1)));
+    Value *end = C.CreateOr(C.CreateICmpEQ(c, C.getInt8(0)), C.CreateICmpEQ(c, C.getInt8('.')));
     C.CreateBr(done);
     B.SetInsertPoint(done);
     PHINode *r = B.CreatePHI(B.getInt1Ty(), 3);
@@ -3996,6 +4245,30 @@ void Client::emit(const Plan &P, Module &H) const {
   files.plant(down, up);
   LoaderEnv(files, installed).plant(down, up);
   auto *p0 = PointerType::get(ctx, 0);
+  // §2.4 Open: the names of the input file. A name carries a format key two
+  // canonical ways: as the path's extension "f.k", and as a scheme prefix
+  // "k:f". A reader that dispatches by key selects its target from either,
+  // and a prefix also spares it from inferring the key from the bytes. The
+  // library opens "f" for a prefixed name (it strips the scheme) and "f.k"
+  // for an extension, both of which the file environment serves.
+  std::vector<std::string> fileNames{"f"};
+  for (const std::string &k : P.keys) {
+    std::string lo = k;
+    for (char &c : lo)
+      c = (char)std::tolower((unsigned char)c);
+    if (std::find(fileNames.begin(), fileNames.end(), k + ":f") == fileNames.end()) {
+      fileNames.push_back(k + ":f");
+      fileNames.push_back("f." + lo);
+    }
+  }
+  auto named = [&](const std::vector<std::string> &ts) {
+    std::vector<std::string> out = ts;
+    if (std::find(ts.begin(), ts.end(), "f") != ts.end())
+      for (size_t i = 1; i < fileNames.size(); ++i)
+        if (std::find(out.begin(), out.end(), fileNames[i]) == out.end())
+          out.push_back(fileNames[i]);
+    return out;
+  };
   Function *Main = Function::Create(FunctionType::get(Type::getInt32Ty(ctx), false), GlobalValue::ExternalLinkage, "main", &H);
   IRBuilder<> B(BasicBlock::Create(ctx, "entry", Main));
   K.start(B);
@@ -4370,7 +4643,7 @@ void Client::emit(const Plan &P, Module &H) const {
             v = C.CreateGlobalStringPtr("");
             break;
           }
-          v = nullOr(C, nullable, [&](IRBuilder<> &D) { return K.text(D, compared(F, i)); });
+          v = nullOr(C, nullable, [&](IRBuilder<> &D) { return K.text(D, named(compared(F, i))); });
           break;
         case Kind::Callback: {
           auto ct = fnTypes.find({F, i});
@@ -4437,11 +4710,21 @@ void Client::emit(const Plan &P, Module &H) const {
           continue;
         Value *at = C.CreateGEP(C.getInt8Ty(), args[c.root], C.getInt64(off));
         auto *AT = dyn_cast<ArrayType>(FT);
-        if (AT && AT->getElementType()->isIntegerTy(8) && AT->getNumElements() >= 2) {
-          C.CreateStore(C.getInt8('f'), at);
-          C.CreateStore(C.getInt8(0), C.CreateGEP(C.getInt8Ty(), at, C.getInt64(1)));
-        } else if (FT->isPointerTy())
-          C.CreateStore(C.CreateGlobalStringPtr("f"), at);
+        bool array = AT && AT->getElementType()->isIntegerTy(8);
+        if (!array && !FT->isPointerTy())
+          continue;
+        std::vector<std::function<void(IRBuilder<> &)>> alts;
+        for (const std::string &s : fileNames) {
+          if (array && AT->getNumElements() < s.size() + 1)
+            continue;
+          alts.push_back([&, at, array, s](IRBuilder<> &D) {
+            if (array)
+              D.CreateMemCpy(at, MaybeAlign(1), D.CreateGlobalStringPtr(s), MaybeAlign(1), s.size() + 1);
+            else
+              D.CreateStore(D.CreateGlobalStringPtr(s), at);
+          });
+        }
+        K.oneOf(C, alts, "file");
       }
     // One witness suffices: pick one, set its configuration, and assume
     // its guards.
