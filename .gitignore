@@ -9,3 +9,4 @@ model/build-asan/
 *.ll
 *.bc
 *.istats
+dataset.tar.gz

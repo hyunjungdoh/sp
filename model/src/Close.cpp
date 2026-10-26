@@ -26,6 +26,23 @@ namespace fs = std::filesystem;
 using namespace llvm;
 using namespace llvm::object;
 
+fs::path caseFile(const fs::path &caseDir, const std::string &recorded) {
+  std::error_code ec;
+  if (recorded.empty())
+    return {};
+  if (fs::is_regular_file(recorded, ec))
+    return recorded;
+  fs::path dir = fs::absolute(caseDir, ec).lexically_normal();
+  if (dir.filename().empty())
+    dir = dir.parent_path();
+  std::string marker = "/" + dir.filename().string() + "/";
+  auto pos = recorded.find(marker);
+  if (pos == std::string::npos)
+    return {};
+  fs::path mapped = dir / recorded.substr(pos + marker.size());
+  return fs::is_regular_file(mapped, ec) ? mapped : fs::path();
+}
+
 namespace {
 
 // One installed ELF image. Section bytes alias the file buffer the image owns.
@@ -95,7 +112,7 @@ std::vector<std::string> installedObjects(const fs::path &dir) {
     auto e = text.find('"', q + 1);
     if (q == std::string::npos || e == std::string::npos)
       continue;
-    std::string so = text.substr(q + 1, e - q - 1);
+    std::string so = caseFile(dir, text.substr(q + 1, e - q - 1)).string();
     std::error_code ec;
     fs::path real = fs::weakly_canonical(so, ec);
     std::string key = ec ? so : real.string();
@@ -105,20 +122,7 @@ std::vector<std::string> installedObjects(const fs::path &dir) {
   return out;
 }
 
-// A path recorded on the build machine names the same file here when the case
-// directory moved: the suffix after "/<case>/" is the path inside this case.
-fs::path remap(const fs::path &caseDir, StringRef recorded) {
-  fs::path asIs(recorded.str());
-  std::error_code ec;
-  if (fs::is_regular_file(asIs, ec))
-    return asIs;
-  std::string marker = "/" + caseDir.filename().string() + "/";
-  auto pos = recorded.find(marker);
-  if (pos == StringRef::npos)
-    return {};
-  fs::path mapped = caseDir / recorded.substr(pos + marker.size()).str();
-  return fs::is_regular_file(mapped, ec) ? mapped : fs::path();
-}
+fs::path remap(const fs::path &caseDir, StringRef recorded) { return caseFile(caseDir, recorded.str()); }
 
 std::set<std::string> definedIn(const fs::path &bc, LLVMContext &ctx) {
   std::set<std::string> out;
@@ -162,12 +166,121 @@ std::set<std::string> unresolved(Module &M) {
   return out;
 }
 
+// One bitcode unit. A path is a file in the case. Raw is a .llvm_bc section
+// that is bitcode itself rather than a list of paths.
+struct Cand {
+  fs::path path;
+  std::string raw;
+};
+
+// The external definition `have` holds under name n: a function, a variable,
+// or an alias. A local symbol is private to its unit and never shared.
+bool definesExternal(Module &have, StringRef n) {
+  GlobalValue *V = have.getNamedValue(n);
+  if (!V || V->hasLocalLinkage())
+    return false;
+  if (isa<GlobalAlias>(V))
+    return true;
+  return !V->isDeclaration();
+}
+
+// An external definition `have` already holds becomes a declaration in mod.
+// The program then has one body under each name: the one in `have`.
+unsigned demote(Module &mod, Module &have) {
+  unsigned n = 0;
+  for (Function &F : mod) {
+    if (F.isDeclaration() || F.hasLocalLinkage() || !definesExternal(have, F.getName()))
+      continue;
+    F.setComdat(nullptr);
+    F.deleteBody();
+    F.setLinkage(GlobalValue::ExternalLinkage);
+    ++n;
+  }
+  for (GlobalVariable &G : mod.globals()) {
+    if (G.isDeclaration() || G.hasLocalLinkage() || !definesExternal(have, G.getName()))
+      continue;
+    G.setComdat(nullptr);
+    G.setInitializer(nullptr);
+    G.setLinkage(GlobalValue::ExternalLinkage);
+    ++n;
+  }
+  std::vector<GlobalAlias *> aliases;
+  for (GlobalAlias &A : mod.aliases())
+    if (!A.hasLocalLinkage() && definesExternal(have, A.getName()))
+      aliases.push_back(&A);
+  for (GlobalAlias *A : aliases) {
+    std::string name = A->getName().str();
+    GlobalValue *decl;
+    if (auto *FT = dyn_cast<FunctionType>(A->getValueType()))
+      decl = Function::Create(FT, GlobalValue::ExternalLinkage, "", &mod);
+    else
+      decl = new GlobalVariable(mod, A->getValueType(), false, GlobalValue::ExternalLinkage, nullptr, "");
+    A->replaceAllUsesWith(decl);
+    A->eraseFromParent();
+    decl->setName(name);
+    ++n;
+  }
+  return n;
+}
+
+// Symbols mod only declares and the other library does not define: the ones
+// the program D ∪ U still lacks.
+std::set<std::string> openIn(Module &mod, Module &other) {
+  std::set<std::string> out;
+  for (const std::string &s : unresolved(mod))
+    if (!definesExternal(other, s))
+      out.insert(s);
+  return out;
+}
+
+std::set<std::string> definedInCand(const Cand &c, LLVMContext &ctx) {
+  if (!c.path.empty())
+    return definedIn(c.path, ctx);
+  std::set<std::string> out;
+  SMDiagnostic err;
+  auto mod = parseIR(MemoryBufferRef(c.raw, "llvm_bc"), err, ctx);
+  if (!mod)
+    return out;
+  for (Function &F : *mod)
+    if (!F.isDeclaration())
+      out.insert(F.getName().str());
+  for (GlobalVariable &G : mod->globals())
+    if (!G.isDeclaration())
+      out.insert(G.getName().str());
+  return out;
+}
+
+bool linkCand(Module &dest, Module *have, const Cand &c) {
+  SMDiagnostic err;
+  std::unique_ptr<Module> mod = c.path.empty()
+                                    ? parseIR(MemoryBufferRef(c.raw, "llvm_bc"), err, dest.getContext())
+                                    : parseIRFile(c.path.string(), err, dest.getContext());
+  if (!mod)
+    return false;
+  if (have)
+    demote(*mod, *have);
+  Linker L(dest);
+  if (L.linkInModule(std::move(mod), Linker::Flags::LinkOnlyNeeded)) {
+    errs() << "close: link failed " << (c.path.empty() ? std::string("llvm_bc") : c.path.string()) << "\n";
+    return false;
+  }
+  return true;
+}
+
+bool hits(const std::set<std::string> &defs, const std::set<std::string> &open) {
+  for (const std::string &d : defs)
+    if (open.count(d) && !environmentSymbol(d))
+      return true;
+  return false;
+}
+
 // Bitcode the case still has, including the list an installed library stores
-// in its .llvm_bc section. The two modules already linked are not read again.
-unsigned linkRecordedBitcode(Module &M, const fs::path &caseDir, const std::vector<std::string> &objects) {
+// in its .llvm_bc section. The two input files are not read again.
+std::vector<Cand> collectBitcode(LLVMContext &ctx, const fs::path &caseDir, const std::vector<std::string> &objects) {
+  (void)ctx;
   std::set<std::string> skip = {(caseDir / "upstream.bc").string(), (caseDir / "upstream.pre.bc").string(),
                                 (caseDir / "se_lib" / "downstream.closure.bc").string()};
-  std::vector<fs::path> cands;
+  std::vector<Cand> cands;
   std::set<std::string> seen;
   std::error_code ec;
   for (fs::recursive_directory_iterator it(caseDir, fs::directory_options::skip_permission_denied, ec), end; it != end;
@@ -175,19 +288,12 @@ unsigned linkRecordedBitcode(Module &M, const fs::path &caseDir, const std::vect
     if (!it->is_regular_file(ec) || it->path().extension() != ".bc")
       continue;
     if (!skip.count(it->path().string()) && seen.insert(it->path().string()).second)
-      cands.push_back(it->path());
+      cands.push_back({it->path(), {}});
   }
-  unsigned linked = 0;
   auto takeSection = [&](StringRef bytes) {
     if (bytes.size() >= 4 && bytes[0] == 'B' && bytes[1] == 'C' && (unsigned char)bytes[2] == 0xc0 &&
         (unsigned char)bytes[3] == 0xde) {
-      SMDiagnostic err;
-      auto mod = parseIR(MemoryBufferRef(bytes, "llvm_bc"), err, M.getContext());
-      if (!mod)
-        return;
-      Linker L(M);
-      if (!L.linkInModule(std::move(mod), Linker::Flags::LinkOnlyNeeded))
-        ++linked;
+      cands.push_back({{}, bytes.str()});
       return;
     }
     StringRef rest = bytes;
@@ -199,7 +305,7 @@ unsigned linkRecordedBitcode(Module &M, const fs::path &caseDir, const std::vect
         continue;
       fs::path mapped = remap(caseDir, line);
       if (!mapped.empty() && seen.insert(mapped.string()).second)
-        cands.push_back(mapped);
+        cands.push_back({mapped, {}});
     }
   };
   for (const std::string &so : objects) {
@@ -223,8 +329,13 @@ unsigned linkRecordedBitcode(Module &M, const fs::path &caseDir, const std::vect
       takeSection(*bytes);
     }
   }
-  Linker L(M);
+  return cands;
+}
+
+unsigned linkRecordedBitcode(Module &M, const fs::path &caseDir, const std::vector<std::string> &objects) {
+  std::vector<Cand> cands = collectBitcode(M.getContext(), caseDir, objects);
   std::vector<char> used(cands.size(), 0);
+  unsigned linked = 0;
   bool progress = true;
   while (progress) {
     progress = false;
@@ -232,22 +343,49 @@ unsigned linkRecordedBitcode(Module &M, const fs::path &caseDir, const std::vect
     for (size_t i = 0; i < cands.size(); ++i) {
       if (used[i])
         continue;
-      std::set<std::string> defs = definedIn(cands[i], M.getContext());
-      bool useful = false;
-      for (const std::string &d : defs)
-        if (open.count(d) && !environmentSymbol(d))
-          useful = true;
-      if (!useful)
+      std::set<std::string> defs = definedInCand(cands[i], M.getContext());
+      if (!hits(defs, open))
         continue;
-      SMDiagnostic err;
-      auto mod = parseIRFile(cands[i].string(), err, M.getContext());
-      if (!mod)
-        continue;
-      if (L.linkInModule(std::move(mod), Linker::Flags::LinkOnlyNeeded))
-        errs() << "close: link failed " << cands[i].string() << "\n";
-      else
-        ++linked;
       used[i] = 1;
+      if (linkCand(M, nullptr, cands[i]))
+        ++linked;
+      progress = true;
+    }
+  }
+  return linked;
+}
+
+// The two input libraries, closed before analysis. A unit that defines a symbol
+// declared in upstream is linked there; one that defines a symbol declared only
+// in downstream is linked there. A symbol both declare is defined once, in upstream.
+unsigned closeModulesBitcode(Module &down, Module &up, const fs::path &caseDir, const std::vector<std::string> &objects) {
+  // The client loads D, then U as D's dependency. A name both define
+  // resolves to D's definition for every caller, U's own included.
+  demote(up, down);
+  std::vector<Cand> cands = collectBitcode(up.getContext(), caseDir, objects);
+  std::vector<char> used(cands.size(), 0);
+  unsigned linked = 0;
+  bool progress = true;
+  while (progress) {
+    progress = false;
+    std::set<std::string> openD = openIn(down, up);
+    std::set<std::string> openU = openIn(up, down);
+    for (size_t i = 0; i < cands.size(); ++i) {
+      if (used[i])
+        continue;
+      std::set<std::string> defs = definedInCand(cands[i], up.getContext());
+      bool inU = hits(defs, openU);
+      bool inD = hits(defs, openD);
+      if (!inU && !inD)
+        continue;
+      used[i] = 1;
+      bool ok = false;
+      if (inU)
+        ok = linkCand(up, &down, cands[i]) || ok;
+      if (inD)
+        ok = linkCand(down, &up, cands[i]) || ok;
+      if (ok)
+        ++linked;
       progress = true;
     }
   }
@@ -823,6 +961,13 @@ std::vector<std::string> closureObjects(const fs::path &caseDir) {
 }
 
 } // namespace
+
+unsigned closeModules(Module &down, Module &up, const fs::path &caseDir) {
+  std::vector<std::string> objects = closureObjects(caseDir);
+  unsigned linked = closeModulesBitcode(down, up, caseDir, objects);
+  errs() << "modules " << caseDir.filename().string() << " bitcode " << linked << "\n";
+  return linked;
+}
 
 void closeLibrary(Module &M, const fs::path &caseDir) {
   std::vector<std::string> objects = closureObjects(caseDir);

@@ -863,6 +863,7 @@ CMakeFiles/model.dir/src/Client.cpp.o
  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/stddef.h
  /Library/Developer/CommandLineTools/usr/lib/clang/21/include/stdint.h
  /Users/hyunjung/Desktop/sp/model/src/Client.h
+ /Users/hyunjung/Desktop/sp/model/src/Close.h
  /Users/hyunjung/Desktop/sp/model/src/Model.h
  /Users/hyunjung/Desktop/sp/model/src/Source.h
  /opt/homebrew/opt/llvm@18/include/llvm-c/DataTypes.h

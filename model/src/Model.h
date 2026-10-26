@@ -65,11 +65,12 @@
 //
 // Sequence 0 is the best simple path from an interface function of D to
 // the sink: fewer indirect edges, then fewer calls, then earlier call sites
-// and demangled names. The interface is what D's shared object exports;
-// those are the functions a client calls. Without it, a caller-facing
-// export stands in: one that reaches the sink and is not called by another
-// function on those paths. Index k is that path in the
-// graph that no longer contains the last edge of any earlier path.
+// and demangled names. The interface is the functions a client calls: D's
+// exports that an installed header declares. A dynamic symbol outside that
+// set is not a start. Without the set, a caller-facing export stands in:
+// one that reaches the sink and is not called by another function on those
+// paths. Index k is that path in the graph that no longer contains the last
+// edge of any earlier path.
 
 #include "Source.h"
 
@@ -435,7 +436,7 @@ inline bool ignorable(const Function *F) {
 
 class Model {
  public:
-  // D's interface: the functions its shared object exports. When known,
+  // D's interface I: exports an installed header declares. When known,
   // sequences start only at these, the functions a client can call.
   std::set<std::string> interfaceNames;
   Model(Module &down, Module &up, StringRef file, unsigned line) : down(down), up(up), dl(down.getDataLayout()), sinkFile(file), sinkLine(line) {}

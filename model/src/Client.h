@@ -121,6 +121,10 @@ public:
 
   Client(Module &down, Module &up, const fs::path &dir);
   static std::set<std::string> downstreamInterface(const fs::path &dir);
+  // I: exports of D that an installed header declares. Witnesses start here,
+  // the same functions the client calls. A dynamic symbol the header does
+  // not declare is not a start.
+  static std::set<std::string> publicInterface(llvm::Module &down, llvm::Module &up, const fs::path &dir);
   // Every symbol, function or data, exported or local, a library the closure
   // installs defines.
   static std::set<std::string> installedExports(const fs::path &dir);

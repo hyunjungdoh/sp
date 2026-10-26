@@ -1045,6 +1045,7 @@ int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, cons
   auto down2 = parseIRFile((dir / "se_lib" / "downstream.closure.bc").string(), e2, ctx);
   if (!up2 || !down2)
     return 1;
+  closeModules(*down2, *up2, dir);
   annotateLibcalls(*up2);
   annotateLibcalls(*down2);
   source::reset();
@@ -1079,9 +1080,8 @@ int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, cons
     errs() << "link failed\n";
     return 1;
   }
-  // Every case, including ones not in this set, gets the same closure: bitcode
-  // the installed libraries still point at, then the bytes of data objects the
-  // bitcode left undefined. A function with no bitcode stays a declaration.
+  // Data the two libraries still leave undefined is filled from the installed
+  // images. Function bodies were linked into the two libraries before analysis.
   closeLibrary(ch, dir);
   if (!witnesses.empty())
     plantExternal(ch, witnesses[0].rets, false);
@@ -1152,6 +1152,7 @@ int main(int argc, char **argv) {
     derr.print("model", errs());
     return 1;
   }
+  closeModules(*down, *up, dir);
   annotateLibcalls(*up);
   annotateLibcalls(*down);
   std::error_code ec;
@@ -1164,7 +1165,7 @@ int main(int argc, char **argv) {
   source::index(*down);
   source::index(*up);
   Model model(*down, *up, file, line);
-  model.interfaceNames = Client::downstreamInterface(dir);
+  model.interfaceNames = Client::publicInterface(*down, *up, dir);
   model.run(seqPick, out);
   {
     const auto &st = source::stats();

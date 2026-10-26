@@ -23,6 +23,7 @@
 // in cost order and each exists before it is used.
 
 #include "Client.h"
+#include "Close.h"
 
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/TargetParser/Triple.h"
@@ -438,8 +439,16 @@ Client::Param Client::result(Function *F) const {
 std::set<std::string> Client::downstreamInterface(const fs::path &dir) {
   std::ifstream js(dir / "surfaces.json");
   std::string text((std::istreambuf_iterator<char>(js)), std::istreambuf_iterator<char>());
-  std::string so = jsonString(text, "so", text.find("\"ds_core\""));
+  std::string so = caseFile(dir, jsonString(text, "so", text.find("\"ds_core\""))).string();
   return so.empty() ? std::set<std::string>{} : dynamicSymbols(so);
+}
+
+std::set<std::string> Client::publicInterface(Module &down, Module &up, const fs::path &dir) {
+  Client c(down, up, dir);
+  std::set<std::string> names;
+  for (Function *F : c.ifaceD)
+    names.insert(F->getName().str());
+  return names;
 }
 
 std::set<std::string> Client::installedExports(const fs::path &dir) {
@@ -447,7 +456,7 @@ std::set<std::string> Client::installedExports(const fs::path &dir) {
   std::string text((std::istreambuf_iterator<char>(js)), std::istreambuf_iterator<char>());
   std::set<std::string> out, seen;
   for (size_t k = text.find("\"so\""); k != std::string::npos; k = text.find("\"so\"", k + 1))
-    if (std::string so = jsonString(text, "so", k); !so.empty() && seen.insert(so).second) {
+    if (std::string so = caseFile(dir, jsonString(text, "so", k)).string(); !so.empty() && seen.insert(so).second) {
       std::string cmd = "nm --defined-only '" + so + "' 2>/dev/null";
       FILE *p = popen(cmd.c_str(), "r");
       if (!p)
@@ -468,8 +477,8 @@ std::set<std::string> Client::installedExports(const fs::path &dir) {
 Client::Client(Module &down, Module &up, const fs::path &dir) : down(down), up(up), dl(down.getDataLayout()) {
   std::ifstream js(dir / "surfaces.json");
   std::string text((std::istreambuf_iterator<char>(js)), std::istreambuf_iterator<char>());
-  std::string dso = jsonString(text, "so", text.find("\"ds_core\""));
-  std::string uso = jsonString(text, "so", text.find("\"us\""));
+  std::string dso = caseFile(dir, jsonString(text, "so", text.find("\"ds_core\""))).string();
+  std::string uso = caseFile(dir, jsonString(text, "so", text.find("\"us\""))).string();
   for (const std::string &so : {dso, uso}) {
     if (so.empty())
       continue;
@@ -482,7 +491,7 @@ Client::Client(Module &down, Module &up, const fs::path &dir) : down(down), up(u
   }
   std::set<std::string> seen;
   for (size_t k = text.find("\"so\""); k != std::string::npos; k = text.find("\"so\"", k + 1)) {
-    std::string so = jsonString(text, "so", k);
+    std::string so = caseFile(dir, jsonString(text, "so", k)).string();
     if (so.empty() || !seen.insert(so).second)
       continue;
     fs::path rel = fs::path(so).lexically_relative(fs::absolute(dir).lexically_normal());
@@ -2118,7 +2127,11 @@ bool Client::callable(Function *F) const {
     if (at[i] < 0)
       continue;
     const Param &p = sig[at[i]];
-    if (held(p) && !cost.count(p.type))
+    // A1: a pointer F compares with null, null returning, has the client
+    // value NULL even when no producer of its type can be built.
+    bool nullArg = (p.kind == Kind::Handle || p.kind == Kind::Object) && F->getArg(i)->getType()->isPointerTy() &&
+                   nullTested(F, i);
+    if (held(p) && !cost.count(p.type) && !nullArg)
       return false;
     // §2.2 V-Opaque 정제: 생성자가 없는 불투명 포인터(핸들로 분류되나 생산자 없음)는
     // 클라이언트가 가질 수 있는 값이 NULL뿐이다. 어떤 클라이언트도 그 타입의 non-null
@@ -3003,8 +3016,15 @@ void Client::report(const Plan &P, raw_ostream &out) const {
     }
     return s;
   };
-  for (Function *F : P.firsts)
-    out << "first " << F->getName() << " iface " << ifaceD.count(F) << " (" << sig(F) << ")\n";
+  for (Function *F : P.firsts) {
+    out << "first " << F->getName() << " iface " << ifaceD.count(F) << " callable " << callable(F) << " (" << sig(F) << ")";
+    const auto &ps = signature(F);
+    auto at = irParams(F);
+    for (unsigned i = 0; i < at.size(); ++i)
+      if (at[i] >= 0 && held(ps[at[i]]) && !cost.count(ps[at[i]].type))
+        out << " unproducible " << at[i] << ":" << ps[at[i]].type << (nullTested(F, i) ? "(null)" : "");
+    out << "\n";
+  }
   for (const auto &[F, disj] : P.guards)
     for (size_t w = 0; w < disj.size(); ++w)
       for (const Guard &g : disj[w])
