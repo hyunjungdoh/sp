@@ -25,6 +25,7 @@
 #include "Client.h"
 
 #include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/TargetParser/Triple.h"
 
 #include <cstdio>
 #include <functional>
@@ -47,7 +48,9 @@ std::string jsonString(const std::string &text, const std::string &key, size_t f
   return text.substr(q + 1, e - q - 1);
 }
 
-std::set<std::string> dynamicSymbols(const std::string &so) {
+// The functions so exports, and with data its objects too.
+std::set<std::string> dynamicSymbols(const std::string &so, bool data = false) {
+  static const std::set<std::string> objects = {"D", "B", "R", "V", "u"};
   std::set<std::string> out;
   std::string cmd = "nm -D --defined-only '" + so + "' 2>/dev/null";
   FILE *p = popen(cmd.c_str(), "r");
@@ -58,7 +61,7 @@ std::set<std::string> dynamicSymbols(const std::string &so) {
     std::istringstream in(line);
     std::string addr, kind, name;
     in >> addr >> kind >> name;
-    if (kind != "T" && kind != "W")
+    if (kind != "T" && kind != "W" && !(data && objects.count(kind)))
       continue;
     auto at = name.find('@');
     out.insert(at == std::string::npos ? name : name.substr(0, at));
@@ -439,6 +442,29 @@ std::set<std::string> Client::downstreamInterface(const fs::path &dir) {
   return so.empty() ? std::set<std::string>{} : dynamicSymbols(so);
 }
 
+std::set<std::string> Client::installedExports(const fs::path &dir) {
+  std::ifstream js(dir / "surfaces.json");
+  std::string text((std::istreambuf_iterator<char>(js)), std::istreambuf_iterator<char>());
+  std::set<std::string> out, seen;
+  for (size_t k = text.find("\"so\""); k != std::string::npos; k = text.find("\"so\"", k + 1))
+    if (std::string so = jsonString(text, "so", k); !so.empty() && seen.insert(so).second) {
+      std::string cmd = "nm --defined-only '" + so + "' 2>/dev/null";
+      FILE *p = popen(cmd.c_str(), "r");
+      if (!p)
+        continue;
+      char line[4096];
+      while (fgets(line, sizeof line, p)) {
+        std::istringstream in(line);
+        std::string addr, kind, name;
+        in >> addr >> kind >> name;
+        if (!name.empty() && std::string("TtWDdBbRrVu").find(kind) != std::string::npos)
+          out.insert(name.substr(0, name.find('@')));
+      }
+      pclose(p);
+    }
+  return out;
+}
+
 Client::Client(Module &down, Module &up, const fs::path &dir) : down(down), up(up), dl(down.getDataLayout()) {
   std::ifstream js(dir / "surfaces.json");
   std::string text((std::istreambuf_iterator<char>(js)), std::istreambuf_iterator<char>());
@@ -453,6 +479,19 @@ Client::Client(Module &down, Module &up, const fs::path &dir) : down(down), up(u
     headers.insert(inc.begin(), inc.end());
     auto ids = headerIdentifiers(fs::path(so).parent_path().parent_path() / "include");
     declared.insert(ids.begin(), ids.end());
+  }
+  std::set<std::string> seen;
+  for (size_t k = text.find("\"so\""); k != std::string::npos; k = text.find("\"so\"", k + 1)) {
+    std::string so = jsonString(text, "so", k);
+    if (so.empty() || !seen.insert(so).second)
+      continue;
+    fs::path rel = fs::path(so).lexically_relative(fs::absolute(dir).lexically_normal());
+    Library L;
+    L.key = rel.empty() || *rel.begin() == ".." ? so : "/" + rel.generic_string();
+    std::error_code ec;
+    L.link = fs::is_symlink(so, ec);
+    L.exports = dynamicSymbols(so, true);
+    installed.push_back(std::move(L));
   }
   for (Module *M : {&down, &up})
     for (Function &F : *M) {
@@ -3028,8 +3067,9 @@ void Client::report(const Plan &P, raw_ostream &out) const {
 // is its length, at most n. A callback is a function of the harness: given
 // a buffer and a length it delivers the next bytes of an n-byte symbolic
 // input and returns their count; otherwise it returns a symbolic value. An
-// out-parameter is a slot the call fills. Every byte the library reads is
-// the client's choice, so no input file is assumed.
+// out-parameter is a slot the call fills. The file "f" of the environment
+// holds the same n bytes (FileEnv), so every byte the library reads, from
+// an argument, a callback, or the file, is the client's choice.
 
 namespace {
 
@@ -3219,6 +3259,712 @@ struct Builder {
   }
 };
 
+// The environment E (§7): the file system holds one file, "f", whose bytes
+// are the client's input. Each file call D or U makes without a body takes
+// its POSIX meaning over those bytes: opening "f" yields a descriptor or a
+// stream, reads deliver the bytes at the position, writes store into them
+// up to the input bound, and any other path names no file. Standard streams
+// are outside the file: reading them meets the end, writing them succeeds.
+struct FileEnv {
+  static constexpr unsigned Slots = 4, FileBytes = 256;
+  static constexpr int64_t FirstFd = 3;
+  Builder &K;
+  Module &H;
+  LLVMContext &ctx;
+  Type *i8, *i32, *i64;
+  PointerType *p0;
+  // Per open: in use, position, end seen. The streams are FileBytes-byte
+  // objects, zero so that an inlined getc finds an empty buffer.
+  GlobalVariable *used, *pos, *eof, *files, *size;
+
+  FileEnv(Builder &K)
+      : K(K), H(K.H), ctx(K.ctx), i8(Type::getInt8Ty(ctx)), i32(Type::getInt32Ty(ctx)), i64(Type::getInt64Ty(ctx)),
+        p0(PointerType::get(ctx, 0)) {
+    auto table = [&](Type *T, unsigned n, const char *name) {
+      auto *A = ArrayType::get(T, n);
+      return new GlobalVariable(H, A, false, GlobalValue::PrivateLinkage, ConstantAggregateZero::get(A), name);
+    };
+    used = table(i8, Slots, "client.file.used");
+    pos = table(i64, Slots, "client.file.pos");
+    eof = table(i8, Slots, "client.file.eof");
+    files = table(ArrayType::get(i8, FileBytes), Slots, "client.file.stream");
+    size = new GlobalVariable(H, i64, false, GlobalValue::PrivateLinkage, ConstantInt::get(i64, K.n), "client.file.size");
+  }
+
+  Value *at(IRBuilder<> &B, GlobalVariable *G, Value *s) {
+    return B.CreateGEP(G->getValueType(), G, {B.getInt64(0), s});
+  }
+  Value *byte(IRBuilder<> &B, Value *off) { return B.CreateGEP(i8, K.data, off); }
+  Value *zext(IRBuilder<> &B, Value *v) { return B.CreateZExtOrTrunc(v, i64); }
+  Value *sext(IRBuilder<> &B, Value *v) { return B.CreateSExtOrTrunc(v, i64); }
+  Value *umin(IRBuilder<> &B, Value *a, Value *b) { return B.CreateSelect(B.CreateICmpULT(a, b), a, b); }
+
+  void ret(IRBuilder<> &B, Function *F, Value *v) {
+    Type *R = F->getReturnType();
+    if (R->isVoidTy())
+      B.CreateRetVoid();
+    else if (R->isPointerTy())
+      B.CreateRet(v->getType()->isPointerTy() ? v : B.CreateIntToPtr(v, R));
+    else
+      B.CreateRet(B.CreateSExtOrTrunc(v, R));
+  }
+  // Return v unless cond holds; continue where it does.
+  void unless(IRBuilder<> &B, Function *F, Value *cond, Value *v) {
+    auto *ok = BasicBlock::Create(ctx, "ok", F), *no = BasicBlock::Create(ctx, "no", F);
+    B.CreateCondBr(cond, ok, no);
+    IRBuilder<> N(no);
+    ret(N, F, v);
+    B.SetInsertPoint(ok);
+  }
+  Value *minus1() { return ConstantInt::getSigned(i64, -1); }
+  Value *null() { return ConstantPointerNull::get(p0); }
+
+  // The open a descriptor or a stream names, clamped into the tables.
+  Value *slotOfFd(IRBuilder<> &B, Value *fd, Value *&ok) {
+    Value *i = B.CreateSub(sext(B, fd), B.getInt64(FirstFd));
+    Value *in = B.CreateICmpULT(i, B.getInt64(Slots));
+    Value *s = B.CreateSelect(in, i, B.getInt64(0));
+    ok = B.CreateAnd(in, B.CreateICmpNE(B.CreateLoad(i8, at(B, used, s)), B.getInt8(0)));
+    return s;
+  }
+  Value *slotOfStream(IRBuilder<> &B, Value *fp, Value *&ok) {
+    Value *d = B.CreateSub(B.CreatePtrToInt(fp, i64), B.CreatePtrToInt(files, i64));
+    Value *in = B.CreateAnd(B.CreateICmpULT(d, B.getInt64(Slots * FileBytes)),
+                            B.CreateICmpEQ(B.CreateURem(d, B.getInt64(FileBytes)), B.getInt64(0)));
+    Value *s = B.CreateSelect(in, B.CreateUDiv(d, B.getInt64(FileBytes)), B.getInt64(0));
+    ok = B.CreateAnd(in, B.CreateICmpNE(B.CreateLoad(i8, at(B, used, s)), B.getInt8(0)));
+    return s;
+  }
+  Value *stream(IRBuilder<> &B, Value *s) { return at(B, files, s); }
+  Value *fd(IRBuilder<> &B, Value *s) { return B.CreateAdd(s, B.getInt64(FirstFd)); }
+
+  // The path is "f". A shorter string is not read past its end.
+  Value *isF(IRBuilder<> &B, Function *F, Value *path) {
+    auto *c0 = BasicBlock::Create(ctx, "path0", F), *c1 = BasicBlock::Create(ctx, "path1", F),
+         *done = BasicBlock::Create(ctx, "path", F);
+    BasicBlock *from = B.GetInsertBlock();
+    B.CreateCondBr(B.CreateIsNull(path), done, c0);
+    IRBuilder<> A(c0);
+    A.CreateCondBr(A.CreateICmpEQ(A.CreateLoad(i8, path), A.getInt8('f')), c1, done);
+    IRBuilder<> C(c1);
+    Value *end = C.CreateICmpEQ(C.CreateLoad(i8, C.CreateGEP(i8, path, C.getInt64(1))), C.getInt8(0));
+    C.CreateBr(done);
+    B.SetInsertPoint(done);
+    PHINode *r = B.CreatePHI(B.getInt1Ty(), 3);
+    r->addIncoming(B.getFalse(), from);
+    r->addIncoming(B.getFalse(), c0);
+    r->addIncoming(end, c1);
+    return r;
+  }
+  // A fresh open of "f", or the value of a failed open.
+  Value *open(IRBuilder<> &B, Function *F, Value *path, Value *failed) {
+    unless(B, F, isF(B, F, path), failed);
+    Value *s = minus1();
+    for (unsigned k = Slots; k-- > 0;)
+      s = B.CreateSelect(B.CreateICmpEQ(B.CreateLoad(i8, at(B, used, B.getInt64(k))), B.getInt8(0)), B.getInt64(k), s);
+    unless(B, F, B.CreateICmpSGE(s, B.getInt64(0)), failed);
+    B.CreateStore(B.getInt8(1), at(B, used, s));
+    B.CreateStore(B.getInt64(0), at(B, pos, s));
+    B.CreateStore(B.getInt8(0), at(B, eof, s));
+    return s;
+  }
+  void truncate(IRBuilder<> &B, Value *s, Value *trunc, Value *append) {
+    B.CreateStore(B.CreateSelect(trunc, B.getInt64(0), B.CreateLoad(i64, size)), size);
+    B.CreateStore(B.CreateSelect(append, B.CreateLoad(i64, size), B.CreateLoad(i64, at(B, pos, s))), at(B, pos, s));
+  }
+
+  // Move n bytes between buf and the file at the position of open s, or at
+  // off when given (which leaves the position). Returns the count moved.
+  Value *transfer(IRBuilder<> &B, Value *s, Value *buf, Value *n, Value *off, bool write) {
+    Value *p = off ? off : B.CreateLoad(i64, at(B, pos, s));
+    Value *end = write ? (Value *)B.getInt64(K.n) : B.CreateLoad(i64, size);
+    Value *left = B.CreateSelect(B.CreateICmpULT(p, end), B.CreateSub(end, p), B.getInt64(0));
+    Value *k = umin(B, n, left);
+    Value *safe = B.CreateSelect(B.CreateICmpULT(p, end), p, B.getInt64(0));
+    if (write) {
+      B.CreateMemCpy(byte(B, safe), MaybeAlign(1), buf, MaybeAlign(1), k);
+      Value *grown = B.CreateAdd(p, k), *sz = B.CreateLoad(i64, size);
+      B.CreateStore(B.CreateSelect(B.CreateICmpUGT(grown, sz), grown, sz), size);
+    } else
+      B.CreateMemCpy(buf, MaybeAlign(1), byte(B, safe), MaybeAlign(1), k);
+    if (!off) {
+      B.CreateStore(B.CreateAdd(p, k), at(B, pos, s));
+      if (!write)
+        B.CreateStore(B.CreateZExt(B.CreateICmpULT(k, n), i8), at(B, eof, s));
+    }
+    return k;
+  }
+  // The new position of a seek, or -1.
+  Value *seek(IRBuilder<> &B, Function *F, Value *s, Value *off, Value *whence, Value *failed) {
+    Value *w = sext(B, whence);
+    Value *base = B.CreateSelect(B.CreateICmpEQ(w, B.getInt64(1)), B.CreateLoad(i64, at(B, pos, s)),
+                                 B.CreateSelect(B.CreateICmpEQ(w, B.getInt64(2)), B.CreateLoad(i64, size), B.getInt64(0)));
+    unless(B, F, B.CreateICmpULE(w, B.getInt64(2)), failed);
+    Value *to = B.CreateAdd(base, sext(B, off));
+    unless(B, F, B.CreateICmpSGE(to, B.getInt64(0)), failed);
+    B.CreateStore(to, at(B, pos, s));
+    B.CreateStore(B.getInt8(0), at(B, eof, s));
+    return to;
+  }
+  // struct stat of a regular file of the current size (x86-64 Linux).
+  void fill(IRBuilder<> &B, Value *st) {
+    B.CreateMemSet(st, B.getInt8(0), B.getInt64(144), MaybeAlign(1));
+    B.CreateStore(B.getInt64(1), B.CreateGEP(i8, st, B.getInt64(16)));
+    B.CreateStore(B.getInt32(0100644), B.CreateGEP(i8, st, B.getInt64(24)));
+    B.CreateStore(B.CreateLoad(i64, size), B.CreateGEP(i8, st, B.getInt64(48)));
+    B.CreateStore(B.getInt64(4096), B.CreateGEP(i8, st, B.getInt64(56)));
+  }
+  // The next byte of open s, consumed or not, or -1 at the end.
+  Value *next(IRBuilder<> &B, Function *F, Value *s, bool consume) {
+    Value *p = B.CreateLoad(i64, at(B, pos, s));
+    auto *more = BasicBlock::Create(ctx, "more", F), *end = BasicBlock::Create(ctx, "end", F);
+    B.CreateCondBr(B.CreateICmpULT(p, B.CreateLoad(i64, size)), more, end);
+    IRBuilder<> E(end);
+    E.CreateStore(E.getInt8(1), at(E, eof, s));
+    ret(E, F, minus1());
+    B.SetInsertPoint(more);
+    Value *c = B.CreateZExt(B.CreateLoad(i8, byte(B, p)), i64);
+    if (consume)
+      B.CreateStore(B.CreateAdd(p, B.getInt64(1)), at(B, pos, s));
+    return c;
+  }
+  // fgets: at most n-1 bytes, through the first newline.
+  void fgets(IRBuilder<> &B, Function *F, Value *buf, Value *n, Value *s) {
+    Value *m = B.CreateSub(sext(B, n), B.getInt64(1));
+    unless(B, F, B.CreateICmpSGE(m, B.getInt64(0)), null());
+    BasicBlock *start = B.GetInsertBlock();
+    auto *head = BasicBlock::Create(ctx, "head", F), *body = BasicBlock::Create(ctx, "body", F),
+         *got = BasicBlock::Create(ctx, "got", F), *done = BasicBlock::Create(ctx, "done", F);
+    B.CreateBr(head);
+    IRBuilder<> Hd(head);
+    PHINode *i = Hd.CreatePHI(i64, 2);
+    i->addIncoming(Hd.getInt64(0), start);
+    Hd.CreateCondBr(Hd.CreateICmpSLT(i, m), body, done);
+    IRBuilder<> Bd(body);
+    Value *p = Bd.CreateLoad(i64, at(Bd, pos, s));
+    Value *more = Bd.CreateICmpULT(p, Bd.CreateLoad(i64, size));
+    Bd.CreateStore(Bd.CreateZExt(Bd.CreateNot(more), i8), at(Bd, eof, s));
+    Bd.CreateCondBr(more, got, done);
+    IRBuilder<> G(got);
+    Value *c = G.CreateLoad(i8, byte(G, p));
+    G.CreateStore(G.CreateAdd(p, G.getInt64(1)), at(G, pos, s));
+    G.CreateStore(c, G.CreateGEP(i8, buf, i));
+    Value *i1 = G.CreateAdd(i, G.getInt64(1));
+    i->addIncoming(i1, got);
+    G.CreateCondBr(G.CreateICmpEQ(c, G.getInt8('\n')), done, head);
+    B.SetInsertPoint(done);
+    PHINode *count = B.CreatePHI(i64, 3);
+    count->addIncoming(i, head);
+    count->addIncoming(i, body);
+    count->addIncoming(i1, got);
+    B.CreateStore(B.getInt8(0), B.CreateGEP(i8, buf, count));
+    ret(B, F, B.CreateSelect(B.CreateAnd(B.CreateICmpEQ(count, B.getInt64(0)), B.CreateICmpSGT(m, B.getInt64(0))),
+                             null(), buf));
+  }
+
+  // The parameters match kinds ('p' pointer, 'i' integer) and the result
+  // is 'p', 'i', or 'v'.
+  static bool shaped(FunctionType *FT, const std::string &params, char result) {
+    if (FT->getNumParams() != params.size())
+      return false;
+    for (unsigned k = 0; k < params.size(); ++k)
+      if ((params[k] == 'p') != FT->getParamType(k)->isPointerTy() ||
+          (params[k] == 'i') != FT->getParamType(k)->isIntegerTy())
+        return false;
+    Type *R = FT->getReturnType();
+    return result == 'v' ? R->isVoidTy() : result == 'p' ? R->isPointerTy() : R->isIntegerTy();
+  }
+
+  // Defines name with type FT when it is one of the file calls.
+  void define(const std::string &name, FunctionType *FT, bool linux64) {
+    struct Spec {
+      const char *params;
+      char result;
+      std::function<void(FileEnv &, IRBuilder<> &, Function *)> body;
+    };
+    using E = FileEnv;
+    static const std::map<std::string, Spec> specs = [] {
+      std::map<std::string, Spec> m;
+      auto openFd = [](E &e, IRBuilder<> &B, Function *F, unsigned path, int flags) {
+        Value *s = e.open(B, F, F->getArg(path), e.minus1());
+        Value *fl = flags >= 0 ? e.sext(B, F->getArg((unsigned)flags)) : B.getInt64(0);
+        e.truncate(B, s, B.CreateICmpNE(B.CreateAnd(fl, B.getInt64(01000)), B.getInt64(0)),
+                   B.CreateICmpNE(B.CreateAnd(fl, B.getInt64(02000)), B.getInt64(0)));
+        e.ret(B, F, e.fd(B, s));
+      };
+      for (const char *n : {"open", "open64"})
+        m[n] = {"pi", 'i', [=](E &e, IRBuilder<> &B, Function *F) { openFd(e, B, F, 0, 1); }};
+      for (const char *n : {"openat", "openat64"})
+        m[n] = {"ipi", 'i', [=](E &e, IRBuilder<> &B, Function *F) { openFd(e, B, F, 1, 2); }};
+      for (const char *n : {"fopen", "fopen64"})
+        m[n] = {"pp", 'p', [](E &e, IRBuilder<> &B, Function *F) {
+                  Value *s = e.open(B, F, F->getArg(0), e.null());
+                  Value *mode = F->getArg(1);
+                  e.unless(B, F, B.CreateIsNotNull(mode), e.null());
+                  Value *m0 = B.CreateLoad(e.i8, mode);
+                  e.truncate(B, s, B.CreateICmpEQ(m0, B.getInt8('w')), B.CreateICmpEQ(m0, B.getInt8('a')));
+                  e.ret(B, F, e.stream(B, s));
+                }};
+      m["fdopen"] = {"ip", 'p', [](E &e, IRBuilder<> &B, Function *F) {
+                       Value *ok, *s = e.slotOfFd(B, F->getArg(0), ok);
+                       e.unless(B, F, ok, e.null());
+                       e.ret(B, F, e.stream(B, s));
+                     }};
+      m["fileno"] = {"p", 'i', [](E &e, IRBuilder<> &B, Function *F) {
+                       Value *ok, *s = e.slotOfStream(B, F->getArg(0), ok);
+                       e.unless(B, F, ok, e.minus1());
+                       e.ret(B, F, e.fd(B, s));
+                     }};
+      m["read"] = {"ipi", 'i', [](E &e, IRBuilder<> &B, Function *F) {
+                     Value *ok, *s = e.slotOfFd(B, F->getArg(0), ok);
+                     e.unless(B, F, ok, B.CreateSelect(B.CreateICmpEQ(e.sext(B, F->getArg(0)), B.getInt64(0)), B.getInt64(0), e.minus1()));
+                     e.ret(B, F, e.transfer(B, s, F->getArg(1), e.zext(B, F->getArg(2)), nullptr, false));
+                   }};
+      m["write"] = {"ipi", 'i', [](E &e, IRBuilder<> &B, Function *F) {
+                      Value *ok, *s = e.slotOfFd(B, F->getArg(0), ok);
+                      Value *n = e.zext(B, F->getArg(2));
+                      Value *stdio = B.CreateICmpULE(e.sext(B, F->getArg(0)), B.getInt64(2));
+                      e.unless(B, F, ok, B.CreateSelect(stdio, n, e.minus1()));
+                      Value *k = e.transfer(B, s, F->getArg(1), n, nullptr, true);
+                      e.ret(B, F, B.CreateSelect(B.CreateAnd(B.CreateICmpEQ(k, B.getInt64(0)), B.CreateICmpNE(n, B.getInt64(0))), e.minus1(), k));
+                    }};
+      for (const char *n : {"pread", "pread64"})
+        m[n] = {"ipii", 'i', [](E &e, IRBuilder<> &B, Function *F) {
+                  Value *ok, *s = e.slotOfFd(B, F->getArg(0), ok);
+                  Value *off = e.sext(B, F->getArg(3));
+                  e.unless(B, F, B.CreateAnd(ok, B.CreateICmpSGE(off, B.getInt64(0))), e.minus1());
+                  e.ret(B, F, e.transfer(B, s, F->getArg(1), e.zext(B, F->getArg(2)), off, false));
+                }};
+      for (const char *n : {"lseek", "lseek64"})
+        m[n] = {"iii", 'i', [](E &e, IRBuilder<> &B, Function *F) {
+                  Value *ok, *s = e.slotOfFd(B, F->getArg(0), ok);
+                  e.unless(B, F, ok, e.minus1());
+                  e.ret(B, F, e.seek(B, F, s, F->getArg(1), F->getArg(2), e.minus1()));
+                }};
+      m["close"] = {"i", 'i', [](E &e, IRBuilder<> &B, Function *F) {
+                      Value *ok, *s = e.slotOfFd(B, F->getArg(0), ok);
+                      Value *stdio = B.CreateICmpULE(e.sext(B, F->getArg(0)), B.getInt64(2));
+                      e.unless(B, F, ok, B.CreateSelect(stdio, B.getInt64(0), e.minus1()));
+                      B.CreateStore(B.getInt8(0), e.at(B, e.used, s));
+                      e.ret(B, F, B.getInt64(0));
+                    }};
+      for (const char *n : {"fread", "fread_unlocked"})
+        m[n] = {"piip", 'i', [](E &e, IRBuilder<> &B, Function *F) {
+                  Value *ok, *s = e.slotOfStream(B, F->getArg(3), ok);
+                  Value *sz = e.zext(B, F->getArg(1));
+                  e.unless(B, F, B.CreateAnd(ok, B.CreateICmpNE(sz, B.getInt64(0))), B.getInt64(0));
+                  Value *k = e.transfer(B, s, F->getArg(0), B.CreateMul(sz, e.zext(B, F->getArg(2))), nullptr, false);
+                  e.ret(B, F, B.CreateUDiv(k, sz));
+                }};
+      for (const char *n : {"fwrite", "fwrite_unlocked"})
+        m[n] = {"piip", 'i', [](E &e, IRBuilder<> &B, Function *F) {
+                  Value *ok, *s = e.slotOfStream(B, F->getArg(3), ok);
+                  Value *sz = e.zext(B, F->getArg(1));
+                  e.unless(B, F, ok, F->getArg(2));
+                  e.unless(B, F, B.CreateICmpNE(sz, B.getInt64(0)), B.getInt64(0));
+                  Value *k = e.transfer(B, s, F->getArg(0), B.CreateMul(sz, e.zext(B, F->getArg(2))), nullptr, true);
+                  e.ret(B, F, B.CreateUDiv(k, sz));
+                }};
+      for (const char *n : {"fgetc", "getc", "_IO_getc", "getc_unlocked", "fgetc_unlocked", "__uflow"})
+        m[n] = {"p", 'i', [](E &e, IRBuilder<> &B, Function *F) {
+                  Value *ok, *s = e.slotOfStream(B, F->getArg(0), ok);
+                  e.unless(B, F, ok, e.minus1());
+                  e.ret(B, F, e.next(B, F, s, true));
+                }};
+      m["__underflow"] = {"p", 'i', [](E &e, IRBuilder<> &B, Function *F) {
+                            Value *ok, *s = e.slotOfStream(B, F->getArg(0), ok);
+                            e.unless(B, F, ok, e.minus1());
+                            e.ret(B, F, e.next(B, F, s, false));
+                          }};
+      for (const char *n : {"fgets", "fgets_unlocked"})
+        m[n] = {"pip", 'p', [](E &e, IRBuilder<> &B, Function *F) {
+                  Value *ok, *s = e.slotOfStream(B, F->getArg(2), ok);
+                  e.unless(B, F, ok, e.null());
+                  e.fgets(B, F, F->getArg(0), F->getArg(1), s);
+                }};
+      for (const char *n : {"feof", "feof_unlocked"})
+        m[n] = {"p", 'i', [](E &e, IRBuilder<> &B, Function *F) {
+                  Value *ok, *s = e.slotOfStream(B, F->getArg(0), ok);
+                  e.unless(B, F, ok, B.getInt64(0));
+                  e.ret(B, F, B.CreateZExt(B.CreateLoad(e.i8, e.at(B, e.eof, s)), e.i64));
+                }};
+      for (const char *n : {"ferror", "ferror_unlocked"})
+        m[n] = {"p", 'i', [](E &e, IRBuilder<> &B, Function *F) { e.ret(B, F, B.getInt64(0)); }};
+      for (const char *n : {"clearerr", "clearerr_unlocked", "rewind"})
+        m[n] = {"p", 'v', [n](E &e, IRBuilder<> &B, Function *F) {
+                  Value *ok, *s = e.slotOfStream(B, F->getArg(0), ok);
+                  e.unless(B, F, ok, nullptr);
+                  B.CreateStore(B.getInt8(0), e.at(B, e.eof, s));
+                  if (std::string(n) == "rewind")
+                    B.CreateStore(B.getInt64(0), e.at(B, e.pos, s));
+                  B.CreateRetVoid();
+                }};
+      for (const char *n : {"fseek", "fseeko", "fseeko64"})
+        m[n] = {"pii", 'i', [](E &e, IRBuilder<> &B, Function *F) {
+                  Value *ok, *s = e.slotOfStream(B, F->getArg(0), ok);
+                  e.unless(B, F, ok, e.minus1());
+                  e.seek(B, F, s, F->getArg(1), F->getArg(2), e.minus1());
+                  e.ret(B, F, B.getInt64(0));
+                }};
+      for (const char *n : {"ftell", "ftello", "ftello64"})
+        m[n] = {"p", 'i', [](E &e, IRBuilder<> &B, Function *F) {
+                  Value *ok, *s = e.slotOfStream(B, F->getArg(0), ok);
+                  e.unless(B, F, ok, e.minus1());
+                  e.ret(B, F, B.CreateLoad(e.i64, e.at(B, e.pos, s)));
+                }};
+      m["fclose"] = {"p", 'i', [](E &e, IRBuilder<> &B, Function *F) {
+                       Value *ok, *s = e.slotOfStream(B, F->getArg(0), ok);
+                       e.unless(B, F, ok, B.getInt64(0));
+                       B.CreateStore(B.getInt8(0), e.at(B, e.used, s));
+                       e.ret(B, F, B.getInt64(0));
+                     }};
+      m["access"] = {"pi", 'i', [](E &e, IRBuilder<> &B, Function *F) {
+                       e.ret(B, F, B.CreateSelect(e.isF(B, F, F->getArg(0)), B.getInt64(0), e.minus1()));
+                     }};
+      for (const char *n : {"mmap", "mmap64"})
+        m[n] = {"piiiii", 'p', [](E &e, IRBuilder<> &B, Function *F) {
+                  Value *len = e.zext(B, F->getArg(1));
+                  Value *anon = B.CreateICmpNE(B.CreateAnd(e.sext(B, F->getArg(3)), B.getInt64(0x20)), B.getInt64(0));
+                  Value *ok, *s = e.slotOfFd(B, F->getArg(4), ok);
+                  Value *off = e.sext(B, F->getArg(5));
+                  e.unless(B, F, B.CreateOr(anon, B.CreateAnd(ok, B.CreateICmpSGE(off, B.getInt64(0)))), e.minus1());
+                  Value *p = B.CreateCall(e.K.mallocF, {len});
+                  B.CreateMemSet(p, B.getInt8(0), len, MaybeAlign(1));
+                  e.unless(B, F, B.CreateNot(anon), p);
+                  e.transfer(B, s, p, len, off, false);
+                  e.ret(B, F, p);
+                }};
+      m["munmap"] = {"pi", 'i', [](E &e, IRBuilder<> &B, Function *F) { e.ret(B, F, B.getInt64(0)); }};
+      return m;
+    }();
+    static const std::map<std::string, Spec> statSpecs = [] {
+      std::map<std::string, Spec> m;
+      auto byPath = [](unsigned path, unsigned st) {
+        return [=](E &e, IRBuilder<> &B, Function *F) {
+          e.unless(B, F, e.isF(B, F, F->getArg(path)), e.minus1());
+          e.fill(B, F->getArg(st));
+          e.ret(B, F, B.getInt64(0));
+        };
+      };
+      auto byFd = [](unsigned fd, unsigned st) {
+        return [=](E &e, IRBuilder<> &B, Function *F) {
+          Value *ok;
+          e.slotOfFd(B, F->getArg(fd), ok);
+          e.unless(B, F, ok, e.minus1());
+          e.fill(B, F->getArg(st));
+          e.ret(B, F, B.getInt64(0));
+        };
+      };
+      for (const char *n : {"stat", "stat64", "lstat", "lstat64"})
+        m[n] = {"pp", 'i', byPath(0, 1)};
+      for (const char *n : {"__xstat", "__xstat64", "__lxstat", "__lxstat64"})
+        m[n] = {"ipp", 'i', byPath(1, 2)};
+      for (const char *n : {"fstat", "fstat64"})
+        m[n] = {"ip", 'i', byFd(0, 1)};
+      for (const char *n : {"__fxstat", "__fxstat64"})
+        m[n] = {"iip", 'i', byFd(1, 2)};
+      return m;
+    }();
+    const Spec *sp = nullptr;
+    if (auto it = specs.find(name); it != specs.end())
+      sp = &it->second;
+    else if (auto it = statSpecs.find(name); linux64 && it != statSpecs.end())
+      sp = &it->second;
+    if (!sp || !shaped(FT, sp->params, sp->result) || (FT->isVarArg() && name.rfind("open", 0) != 0))
+      return;
+    Function *F = Function::Create(FT, GlobalValue::ExternalLinkage, name, &H);
+    IRBuilder<> B(BasicBlock::Create(ctx, "entry", F));
+    sp->body(*this, B, F);
+  }
+
+  // The functions D or U declares and neither defines. A definition of
+  // local linkage is another function of the same name.
+  static std::map<std::string, FunctionType *> unbound(Module &down, Module &up) {
+    std::map<std::string, FunctionType *> want;
+    for (Module *M : {&down, &up})
+      for (Function &F : *M)
+        if (F.isDeclaration() && !F.isIntrinsic())
+          want.emplace(F.getName().str(), F.getFunctionType());
+    for (Module *M : {&down, &up})
+      for (Function &F : *M)
+        if (!F.isDeclaration() && !F.hasLocalLinkage())
+          want.erase(F.getName().str());
+    return want;
+  }
+  bool linux64() const {
+    Triple T(H.getTargetTriple());
+    return T.isOSLinux() && T.getArch() == Triple::x86_64;
+  }
+  void plant(Module &down, Module &up) {
+    for (const auto &[name, FT] : unbound(down, up))
+      if (!H.getFunction(name))
+        define(name, FT, linux64());
+  }
+};
+
+// The rest of E (§7): the environment has no variables, and the file system
+// also holds the shared libraries the closure installs, at their paths
+// relative to the case directory (the tree is relocatable, so a path names
+// a library when it ends with that relative path). A directory lists the
+// installed libraries in it. Opening a library yields its handle; a symbol
+// of a handle is the program's definition of that name when the library
+// exports it, and is absent otherwise. Only names the program passes to
+// dlsym as constants are resolved; any other name is absent, which loses
+// paths and never adds one.
+struct LoaderEnv {
+  static constexpr unsigned DirentBytes = 280, NameAt = 19, NameBytes = 256;
+  FileEnv &E;
+  Module &H;
+  LLVMContext &ctx;
+  const std::vector<Client::Library> &libs;
+  std::vector<std::string> dirs;
+  // Per directory, its first entry and count; the entries are dirents.
+  std::vector<std::pair<unsigned, unsigned>> listing;
+  GlobalVariable *handles = nullptr, *ents = nullptr, *dirpos = nullptr, *err = nullptr;
+  Function *streqF = nullptr, *endsF = nullptr;
+
+  LoaderEnv(FileEnv &E, const std::vector<Client::Library> &libs) : E(E), H(E.H), ctx(E.ctx), libs(libs) {}
+
+  static std::string parent(const std::string &key) { return key.substr(0, key.rfind('/')); }
+  static std::string leaf(const std::string &key) { return key.substr(key.rfind('/') + 1); }
+
+  Constant *cstr(const std::string &s) {
+    auto *C = ConstantDataArray::getString(ctx, s);
+    return new GlobalVariable(H, C->getType(), true, GlobalValue::PrivateLinkage, C, "client.env.str");
+  }
+  void build() {
+    for (const auto &L : libs)
+      if (std::find(dirs.begin(), dirs.end(), parent(L.key)) == dirs.end())
+        dirs.push_back(parent(L.key));
+    std::vector<Constant *> rows;
+    auto *Row = ArrayType::get(E.i8, DirentBytes);
+    for (const std::string &d : dirs) {
+      listing.push_back({(unsigned)rows.size(), 0});
+      for (const auto &L : libs) {
+        if (parent(L.key) != d)
+          continue;
+        std::vector<uint8_t> b(DirentBytes, 0);
+        uint64_t ino = rows.size() + 1;
+        for (unsigned k = 0; k < 8; ++k)
+          b[k] = (ino >> (8 * k)) & 0xff, b[8 + k] = ((ino + 1) >> (8 * k)) & 0xff;
+        b[16] = DirentBytes & 0xff, b[17] = DirentBytes >> 8;
+        b[18] = L.link ? 10 : 8;
+        std::string n = leaf(L.key).substr(0, NameBytes - 1);
+        std::copy(n.begin(), n.end(), b.begin() + NameAt);
+        rows.push_back(ConstantDataArray::get(ctx, b));
+        ++listing.back().second;
+      }
+    }
+    auto table = [&](Type *T, unsigned n, const char *name) {
+      auto *A = ArrayType::get(T, std::max(n, 1u));
+      return new GlobalVariable(H, A, false, GlobalValue::PrivateLinkage, ConstantAggregateZero::get(A), name);
+    };
+    handles = table(E.i8, libs.size() + 1, "client.env.lib");
+    dirpos = table(E.i64, dirs.size(), "client.env.dirpos");
+    auto *A = ArrayType::get(Row, std::max<size_t>(rows.size(), 1));
+    ents = new GlobalVariable(H, A, false, GlobalValue::PrivateLinkage,
+                              rows.empty() ? ConstantAggregateZero::get(A) : ConstantArray::get(A, rows), "client.env.dirent");
+    err = new GlobalVariable(H, E.p0, false, GlobalValue::PrivateLinkage, ConstantPointerNull::get(E.p0),
+                             "client.env.error");
+    streqF = streq();
+    endsF = ends();
+  }
+
+  // a and b, both non-null, hold the same string.
+  Function *streq() {
+    auto *F = Function::Create(FunctionType::get(Type::getInt1Ty(ctx), {E.p0, E.p0}, false), GlobalValue::InternalLinkage,
+                               "client.env.streq", &H);
+    auto *entry = BasicBlock::Create(ctx, "entry", F), *head = BasicBlock::Create(ctx, "head", F),
+         *same = BasicBlock::Create(ctx, "same", F), *done = BasicBlock::Create(ctx, "done", F);
+    IRBuilder<> B(entry);
+    B.CreateBr(head);
+    IRBuilder<> Hd(head);
+    PHINode *i = Hd.CreatePHI(E.i64, 2);
+    i->addIncoming(Hd.getInt64(0), entry);
+    Value *a = Hd.CreateLoad(E.i8, Hd.CreateGEP(E.i8, F->getArg(0), i));
+    Value *b = Hd.CreateLoad(E.i8, Hd.CreateGEP(E.i8, F->getArg(1), i));
+    Value *eq = Hd.CreateICmpEQ(a, b);
+    Hd.CreateCondBr(eq, same, done);
+    IRBuilder<> S(same);
+    i->addIncoming(S.CreateAdd(i, S.getInt64(1)), same);
+    Value *end = S.CreateICmpEQ(a, S.getInt8(0));
+    S.CreateCondBr(end, done, head);
+    IRBuilder<> D(done);
+    PHINode *r = D.CreatePHI(D.getInt1Ty(), 2);
+    r->addIncoming(D.getFalse(), head);
+    r->addIncoming(D.getTrue(), same);
+    D.CreateRet(r);
+    return F;
+  }
+  // p, non-null, ends with the n bytes of s.
+  Function *ends() {
+    auto *F = Function::Create(FunctionType::get(Type::getInt1Ty(ctx), {E.p0, E.p0, E.i64}, false),
+                               GlobalValue::InternalLinkage, "client.env.ends", &H);
+    Value *p = F->getArg(0), *s = F->getArg(1), *n = F->getArg(2);
+    auto *entry = BasicBlock::Create(ctx, "entry", F), *len = BasicBlock::Create(ctx, "len", F),
+         *step = BasicBlock::Create(ctx, "step", F), *cmp = BasicBlock::Create(ctx, "cmp", F),
+         *head = BasicBlock::Create(ctx, "head", F), *body = BasicBlock::Create(ctx, "body", F),
+         *yes = BasicBlock::Create(ctx, "yes", F), *no = BasicBlock::Create(ctx, "no", F);
+    IRBuilder<> B(entry);
+    B.CreateBr(len);
+    IRBuilder<> L(len);
+    PHINode *m = L.CreatePHI(E.i64, 2);
+    m->addIncoming(L.getInt64(0), entry);
+    L.CreateCondBr(L.CreateICmpEQ(L.CreateLoad(E.i8, L.CreateGEP(E.i8, p, m)), L.getInt8(0)), cmp, step);
+    IRBuilder<> St(step);
+    m->addIncoming(St.CreateAdd(m, St.getInt64(1)), step);
+    St.CreateBr(len);
+    IRBuilder<> C(cmp);
+    Value *base = C.CreateSub(m, n);
+    C.CreateCondBr(C.CreateICmpULT(m, n), no, head);
+    IRBuilder<> Hd(head);
+    PHINode *j = Hd.CreatePHI(E.i64, 2);
+    j->addIncoming(Hd.getInt64(0), cmp);
+    Hd.CreateCondBr(Hd.CreateICmpULT(j, n), body, yes);
+    IRBuilder<> Bd(body);
+    Value *x = Bd.CreateLoad(E.i8, Bd.CreateGEP(E.i8, p, Bd.CreateAdd(base, j)));
+    Value *y = Bd.CreateLoad(E.i8, Bd.CreateGEP(E.i8, s, j));
+    j->addIncoming(Bd.CreateAdd(j, Bd.getInt64(1)), body);
+    Bd.CreateCondBr(Bd.CreateICmpEQ(x, y), head, no);
+    IRBuilder<>(yes).CreateRet(ConstantInt::getTrue(ctx));
+    IRBuilder<>(no).CreateRet(ConstantInt::getFalse(ctx));
+    return F;
+  }
+  Value *endsWith(IRBuilder<> &B, Value *p, const std::string &key) {
+    return B.CreateCall(endsF, {p, cstr(key), B.getInt64(key.size())});
+  }
+  Value *handle(IRBuilder<> &B, unsigned k) { return E.at(B, handles, B.getInt64(k)); }
+  Value *fail(IRBuilder<> &B) {
+    B.CreateStore(cstr("not found"), err);
+    return E.null();
+  }
+
+  // The names D or U pass to dlsym as constant strings.
+  static std::set<std::string> looked(Module &down, Module &up) {
+    std::set<std::string> out;
+    for (Module *M : {&down, &up})
+      if (Function *S = M->getFunction("dlsym"))
+        for (User *U : S->users())
+          if (auto *CB = dyn_cast<CallBase>(U); CB && CB->getCalledOperand() == S && CB->arg_size() == 2)
+            if (auto *G = dyn_cast<GlobalVariable>(getUnderlyingObject(CB->getArgOperand(1))))
+              if (G->hasInitializer())
+                if (auto *C = dyn_cast<ConstantDataArray>(G->getInitializer()); C && C->isCString())
+                  out.insert(C->getAsCString().str());
+    return out;
+  }
+  // H's reference to the definition D or U gives name, or null.
+  Constant *definition(Module &down, Module &up, const std::string &name) {
+    for (Module *M : {&down, &up}) {
+      if (Function *F = M->getFunction(name); F && !F->isDeclaration() && !F->hasLocalLinkage())
+        return cast<Constant>(H.getOrInsertFunction(name, F->getFunctionType()).getCallee());
+      if (GlobalVariable *G = M->getGlobalVariable(name); G && G->hasInitializer() && !G->hasLocalLinkage())
+        return H.getOrInsertGlobal(name, G->getValueType());
+    }
+    return nullptr;
+  }
+
+  void plant(Module &down, Module &up) {
+    auto want = FileEnv::unbound(down, up);
+    bool any = false;
+    for (const char *n : {"dlopen", "dlsym", "dlclose", "dlerror", "opendir", "readdir", "readdir64", "closedir"})
+      any |= want.count(n) > 0;
+    if (any)
+      build();
+    auto shaped = [&](const char *name, const std::string &params, char result) -> Function * {
+      auto it = want.find(name);
+      if (it == want.end() || H.getFunction(name) || !FileEnv::shaped(it->second, params, result))
+        return nullptr;
+      return Function::Create(it->second, GlobalValue::ExternalLinkage, name, &H);
+    };
+    for (const char *n : {"getenv", "secure_getenv"})
+      if (Function *F = shaped(n, "p", 'p')) {
+        IRBuilder<> B(BasicBlock::Create(ctx, "entry", F));
+        B.CreateRet(E.null());
+      }
+    if (Function *F = shaped("dlopen", "pi", 'p')) {
+      IRBuilder<> B(BasicBlock::Create(ctx, "entry", F));
+      Value *path = F->getArg(0);
+      E.unless(B, F, B.CreateIsNotNull(path), handle(B, libs.size()));
+      for (unsigned k = 0; k < libs.size(); ++k)
+        E.unless(B, F, B.CreateNot(endsWith(B, path, libs[k].key)), handle(B, k));
+      B.CreateRet(fail(B));
+    }
+    if (Function *F = shaped("dlsym", "pp", 'p')) {
+      IRBuilder<> B(BasicBlock::Create(ctx, "entry", F));
+      Value *h = F->getArg(0), *name = F->getArg(1);
+      E.unless(B, F, B.CreateIsNotNull(name), E.null());
+      Value *global = B.CreateOr(B.CreateOr(B.CreateIsNull(h), B.CreateICmpEQ(h, handle(B, libs.size()))),
+                                 B.CreateICmpEQ(B.CreatePtrToInt(h, E.i64), E.minus1()));
+      for (const std::string &s : looked(down, up)) {
+        Value *mine = global;
+        for (unsigned k = 0; k < libs.size(); ++k)
+          if (libs[k].exports.count(s))
+            mine = B.CreateOr(mine, B.CreateICmpEQ(h, handle(B, k)));
+        bool exported = std::any_of(libs.begin(), libs.end(), [&](const auto &L) { return L.exports.count(s) > 0; });
+        Constant *def = exported ? definition(down, up, s) : nullptr;
+        if (!def)
+          continue;
+        Value *hit = B.CreateAnd(mine, B.CreateCall(streqF, {name, cstr(s)}));
+        E.unless(B, F, B.CreateNot(hit), def);
+      }
+      B.CreateRet(fail(B));
+    }
+    if (Function *F = shaped("dlclose", "p", 'i')) {
+      IRBuilder<> B(BasicBlock::Create(ctx, "entry", F));
+      E.ret(B, F, B.getInt64(0));
+    }
+    if (Function *F = shaped("dlerror", "", 'p')) {
+      IRBuilder<> B(BasicBlock::Create(ctx, "entry", F));
+      Value *m = B.CreateLoad(E.p0, err);
+      B.CreateStore(E.null(), err);
+      B.CreateRet(m);
+    }
+    if (Function *F = shaped("opendir", "p", 'p')) {
+      IRBuilder<> B(BasicBlock::Create(ctx, "entry", F));
+      Value *path = F->getArg(0);
+      E.unless(B, F, B.CreateIsNotNull(path), E.null());
+      for (unsigned d = 0; d < dirs.size(); ++d) {
+        Value *at = E.at(B, dirpos, B.getInt64(d));
+        auto *open = BasicBlock::Create(ctx, "open", F), *next = BasicBlock::Create(ctx, "next", F);
+        B.CreateCondBr(endsWith(B, path, dirs[d]), open, next);
+        IRBuilder<> O(open);
+        O.CreateStore(O.getInt64(0), at);
+        O.CreateRet(at);
+        B.SetInsertPoint(next);
+      }
+      B.CreateRet(E.null());
+    }
+    for (const char *n : {"readdir", "readdir64"}) {
+      Function *F = E.linux64() ? shaped(n, "p", 'p') : nullptr;
+      if (!F)
+        continue;
+      IRBuilder<> B(BasicBlock::Create(ctx, "entry", F));
+      Value *dp = F->getArg(0);
+      Value *off = B.CreateSub(B.CreatePtrToInt(dp, E.i64), B.CreatePtrToInt(dirpos, E.i64));
+      Value *d = B.CreateUDiv(off, B.getInt64(8));
+      E.unless(B, F,
+               B.CreateAnd(B.CreateICmpULT(off, B.getInt64(8 * dirs.size())),
+                           B.CreateICmpEQ(B.CreateURem(off, B.getInt64(8)), B.getInt64(0))),
+               E.null());
+      Value *first = B.getInt64(0), *count = B.getInt64(0);
+      for (unsigned k = 0; k < dirs.size(); ++k) {
+        Value *is = B.CreateICmpEQ(d, B.getInt64(k));
+        first = B.CreateSelect(is, B.getInt64(listing[k].first), first);
+        count = B.CreateSelect(is, B.getInt64(listing[k].second), count);
+      }
+      Value *slot = E.at(B, dirpos, d);
+      Value *pos = B.CreateLoad(E.i64, slot);
+      E.unless(B, F, B.CreateICmpULT(pos, count), E.null());
+      B.CreateStore(B.CreateAdd(pos, B.getInt64(1)), slot);
+      B.CreateRet(E.at(B, ents, B.CreateAdd(first, pos)));
+    }
+    if (Function *F = shaped("closedir", "p", 'i')) {
+      IRBuilder<> B(BasicBlock::Create(ctx, "entry", F));
+      E.ret(B, F, B.getInt64(0));
+    }
+  }
+};
+
 } // namespace
 
 void Client::emit(const Plan &P, Module &H) const {
@@ -3226,6 +3972,9 @@ void Client::emit(const Plan &P, Module &H) const {
   H.setDataLayout(dl);
   H.setTargetTriple(down.getTargetTriple());
   Builder K(H, dl, inputBound, textBound);
+  FileEnv files(K);
+  files.plant(down, up);
+  LoaderEnv(files, installed).plant(down, up);
   auto *p0 = PointerType::get(ctx, 0);
   Function *Main = Function::Create(FunctionType::get(Type::getInt32Ty(ctx), false), GlobalValue::ExternalLinkage, "main", &H);
   IRBuilder<> B(BasicBlock::Create(ctx, "entry", Main));
@@ -3255,12 +4004,21 @@ void Client::emit(const Plan &P, Module &H) const {
   auto declare = [&](Function *F) {
     return H.getOrInsertFunction(F->getName(), F->getFunctionType());
   };
-  // The pointer formals of F that integer formal j bounds (A3).
+  // The pointer formals of F that integer formal j bounds (A3): the ones
+  // F's code bounds by it, and without such evidence the byte buffer right
+  // before it. An unbounded length would let the library read past the
+  // client's buffer, an error no client makes.
   auto lengthOf = [&](Function *F, unsigned j) {
     std::vector<unsigned> out;
     for (auto [b, k] : formalsOf(F).len)
       if (k == j)
         out.push_back(b);
+    if (out.empty() && j > 0 && F->getArg(j)->getType()->isIntegerTy() && F->getArg(j - 1)->getType()->isPointerTy()) {
+      auto sig = signature(F);
+      auto at = irParams(F);
+      if (at[j - 1] >= 0 && at[j] >= 0 && at[j] == at[j - 1] + 1 && sig[at[j - 1]].kind == Kind::Bytes)
+        out.push_back(j - 1);
+    }
     return out;
   };
   // Val(tau), the values a client can hold of source type tau.

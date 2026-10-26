@@ -1,5 +1,6 @@
 #include "Model.h"
 #include "Client.h"
+#include "Close.h"
 
 #include <sstream>
 
@@ -42,6 +43,128 @@ static bool loadSink(const fs::path &yaml, std::string &file, unsigned &line) {
       line = (unsigned)std::stoul(s.substr(5));
   }
   return !file.empty() && line != 0;
+}
+
+// The symbols the installed libraries of the closure define. A declaration
+// among them is library code the bitcode lacks (an assembly routine, a
+// library left out of the link): no engine has its body, so a call of it
+// ends the path, and a global of it cannot be loaded.
+static std::set<std::string> projectExports;
+
+// Whether main reaches the sink marker along a control-flow path that passes
+// only calls which can return. A call returns when its callee is a
+// definition with a path from entry to a ret, an environment function (a
+// declaration outside projectExports) that is not noreturn, or an indirect
+// call some address-taken function of its type can serve. Least fixpoints
+// over the call graph, so a function proven to return or to reach the sink
+// has such a path. gaps receives the closure gaps that cut it: those called
+// in functions that reach the sink only when gaps could return.
+static bool flowReach(Module &M, std::set<std::string> &gaps, std::vector<std::string> &chain) {
+  std::map<const Function *, std::pair<const Function *, bool>> via;
+  std::map<FunctionType *, std::vector<Function *>> taken;
+  for (Function &F : M)
+    if (!F.isDeclaration() && F.hasAddressTaken())
+      taken[F.getFunctionType()].push_back(&F);
+  auto gap = [&](const Function *C) {
+    return C && C->isDeclaration() && !C->isIntrinsic() && projectExports.count(C->getName().str());
+  };
+  auto solve = [&](bool gapsReturn, std::set<const Function *> &returns, std::set<const Function *> &sinks) {
+  // One pass over F: whether it reaches a ret (for returns) or the marker.
+  auto walk = [&](Function &F, bool toSink) {
+    std::set<const BasicBlock *> done;
+    std::vector<const BasicBlock *> work{&F.getEntryBlock()};
+    while (!work.empty()) {
+      const BasicBlock *BB = work.back();
+      work.pop_back();
+      if (!done.insert(BB).second)
+        continue;
+      bool alive = true;
+      for (const Instruction &I : *BB) {
+        auto *CB = dyn_cast<CallBase>(&I);
+        if (!CB || isa<DbgInfoIntrinsic>(CB))
+          continue;
+        const Function *C = CB->getCalledFunction();
+        if (C && C->getName() == "klee_warning_once") {
+          if (toSink) {
+            via[&F] = {nullptr, false};
+            return true;
+          }
+          continue;
+        }
+        bool passes;
+        if (!C) {
+          auto it = taken.find(CB->getFunctionType());
+          passes = it == taken.end();
+          if (it != taken.end())
+            for (Function *T : it->second) {
+              if (toSink && sinks.count(T)) {
+                via[&F] = {T, true};
+                return true;
+              }
+              passes = passes || returns.count(T);
+            }
+        } else if (C->isDeclaration()) {
+          passes = (gapsReturn || !gap(C)) && !C->doesNotReturn() && !C->getName().starts_with("klee_silent_exit");
+        } else {
+          if (toSink && sinks.count(C)) {
+            via[&F] = {C, false};
+            return true;
+          }
+          passes = returns.count(C) > 0;
+        }
+        if (auto *II = dyn_cast<InvokeInst>(CB)) {
+          work.push_back(II->getUnwindDest());
+          if (passes)
+            work.push_back(II->getNormalDest());
+          alive = false;
+          break;
+        }
+        if (!passes) {
+          alive = false;
+          break;
+        }
+      }
+      if (!alive)
+        continue;
+      const Instruction *T = BB->getTerminator();
+      if (isa<ReturnInst>(T) && !toSink)
+        return true;
+      for (const BasicBlock *S : successors(BB))
+        work.push_back(S);
+    }
+    return false;
+  };
+  for (bool toSink : {false, true})
+    for (bool changed = true; changed;) {
+      changed = false;
+      for (Function &F : M) {
+        if (F.isDeclaration() || (toSink ? sinks : returns).count(&F))
+          continue;
+        if (walk(F, toSink)) {
+          (toSink ? sinks : returns).insert(&F);
+          changed = true;
+        }
+      }
+    }
+  };
+  Function *Main = M.getFunction("main");
+  if (!Main)
+    return false;
+  std::set<const Function *> returns, sinks, returnsIf, sinksIf;
+  solve(false, returns, sinks);
+  auto real = via;
+  solve(true, returnsIf, sinksIf);
+  bool byPointer = false;
+  for (const Function *F = Main; F && sinks.count(F) && chain.size() < 200;) {
+    chain.push_back((byPointer ? "*" : "") + F->getName().str());
+    std::tie(F, byPointer) = real[F];
+  }
+  for (const Function *F : sinksIf)
+    if (!sinks.count(F))
+      for (const Instruction &I : instructions(*F))
+        if (auto *CB = dyn_cast<CallBase>(&I); CB && gap(CB->getCalledFunction()))
+          gaps.insert(CB->getCalledFunction()->getName().str());
+  return sinks.count(Main) > 0;
 }
 
 // The linked program a harness runs: declarations bound to the bodies the
@@ -274,6 +397,42 @@ static int finish(Module &harness, LLVMContext &ctx, const fs::path &outDir, con
       }
     }
     std::error_code ec;
+    // Whether main reaches a function holding the sink marker through calls
+    // and the functions whose addresses the reached code takes.
+    {
+      std::vector<std::string> sinks;
+      for (const Function *F : reach)
+        for (const Instruction &I : instructions(*F))
+          if (auto *CB = dyn_cast<CallBase>(&I))
+            if (const Function *C = CB->getCalledFunction(); C && C->getName() == "klee_warning_once") {
+              sinks.push_back(F->getName().str());
+              break;
+            }
+      raw_fd_ostream rs((outDir / (stem + ".reach.txt")).string(), ec);
+      rs << "sink-reachable " << (sinks.empty() ? 0 : 1) << "\n";
+      for (const std::string &s : sinks)
+        rs << "sink-fn " << s << "\n";
+      std::set<std::string> gaps;
+      std::vector<std::string> chain;
+      bool cfg = flowReach(harness, gaps, chain);
+      // A library global the bitcode lacks has no initial contents, and the
+      // program cannot start without them.
+      std::vector<std::string> missing;
+      for (GlobalVariable &G : harness.globals())
+        if (G.isDeclaration() && G.getName() != "__dso_handle" && projectExports.count(G.getName().str()) &&
+            harness.getDataLayout().getTypeAllocSize(G.getValueType()) > 0)
+          missing.push_back(G.getName().str());
+      cfg = cfg && missing.empty();
+      rs << "sink-reachable-cfg " << (cfg ? 1 : 0) << "\n";
+      rs << "global-gaps " << missing.size() << "\n";
+      for (size_t k = 0; k < missing.size() && k < 20; ++k)
+        rs << "global-gap " << missing[k] << "\n";
+      // '*' marks a call through a pointer, resolved by type to that target.
+      for (const std::string &c : chain)
+        rs << "cfg-path " << c << "\n";
+      for (const std::string &g : gaps)
+        rs << "closure-gap " << g << "\n";
+    }
     raw_fd_ostream open((outDir / (stem == "run" ? std::string("open.txt") : stem + ".open.txt")).string(), ec);
     for (Function &F : harness) {
       if (!F.isDeclaration() || F.isIntrinsic() || !reach.count(&F) || F.getName().starts_with("klee_"))
@@ -725,10 +884,11 @@ static PtrExtent resultExtent(const CallBase *Root) {
   return out;
 }
 
-// A pointer result still present after linking. A body stays and the
-// comparison is assumed. A declaration with no integer argument cannot
-// allocate, so a non-null result is the object the continuation accesses.
-static void plantExternal(Module &M, const std::vector<Witness::Ret> &rets) {
+// A pointer result still present after linking. A body stays and, when
+// assumed is set, the comparison is assumed. A declaration with no integer
+// argument cannot allocate, so a non-null result is the object the
+// continuation accesses.
+static void plantExternal(Module &M, const std::vector<Witness::Ret> &rets, bool assumed = true) {
   if (rets.empty())
     return;
   LLVMContext &ctx = M.getContext();
@@ -857,6 +1017,8 @@ static void plantExternal(Module &M, const std::vector<Witness::Ret> &rets) {
         supply(CB, ptr);
         continue;
       }
+      if (!assumed)
+        continue;
       Instruction *ip = nullptr;
       if (auto *II = dyn_cast<InvokeInst>(CB))
         ip = II->getNormalDest()->getFirstNonPHI();
@@ -905,10 +1067,9 @@ int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, cons
   }
   if (plan.entries.empty())
     return rc;
-  if (!witnesses.empty()) {
-    plantReturns(*down2, witnesses[0].rets);
-    plantReturns(*up2, witnesses[0].rets);
-  }
+  // The client fixes no result of the library: every byte the library reads
+  // is the client's (arguments, callbacks, the file), so the path's
+  // comparisons are decided by those bytes, for every witness at once.
   Module ch("client", ctx);
   client.emit(plan, ch);
   if (verifyModule(ch, &errs()))
@@ -918,8 +1079,12 @@ int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, cons
     errs() << "link failed\n";
     return 1;
   }
+  // Every case, including ones not in this set, gets the same closure: bitcode
+  // the installed libraries still point at, then the bytes of data objects the
+  // bitcode left undefined. A function with no bitcode stays a declaration.
+  closeLibrary(ch, dir);
   if (!witnesses.empty())
-    plantExternal(ch, witnesses[0].rets);
+    plantExternal(ch, witnesses[0].rets, false);
   if (verifyModule(ch, &errs()))
     return 1;
   int r2 = finish(ch, ctx, outDir, "client", file, line);
@@ -949,6 +1114,7 @@ int main(int argc, char **argv) {
     errs() << "missing sink\n";
     return 1;
   }
+  projectExports = Client::installedExports(dir);
   LLVMContext ctx;
   // The must side depends on the may side only through its witnesses. With
   // MAY_REUSE set, the witnesses of an earlier run in out-dir stand for it.

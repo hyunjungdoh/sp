@@ -121,6 +121,9 @@ public:
 
   Client(Module &down, Module &up, const fs::path &dir);
   static std::set<std::string> downstreamInterface(const fs::path &dir);
+  // Every symbol, function or data, exported or local, a library the closure
+  // installs defines.
+  static std::set<std::string> installedExports(const fs::path &dir);
   Plan plan(const std::vector<std::pair<std::vector<std::string>, std::vector<Cell>>> &witnesses) const;
   void report(const Plan &P, raw_ostream &out) const;
   void emit(const Plan &P, Module &H) const;
@@ -133,6 +136,15 @@ public:
     textBound = text;
   }
 
+  // A shared library the closure installs: its path relative to the case
+  // directory ("/"-prefixed; absolute when outside it), whether it is a
+  // symbolic link, and the symbols it exports.
+  struct Library {
+    std::string key;
+    bool link = false;
+    std::set<std::string> exports;
+  };
+
   std::vector<Param> signature(Function *F) const;
   std::vector<int> irParams(Function *F) const;
   Param result(Function *F) const;
@@ -143,6 +155,7 @@ private:
   Module &up;
   const DataLayout &dl;
   std::set<std::string> dsyms, usyms, headers, declared;
+  std::vector<Library> installed;
   std::map<std::string, bool> defined;
   std::map<std::string, const DICompositeType *> composite;
   // The ODR identifiers (typeinfo names) the debug info of D and U carries.

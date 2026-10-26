@@ -1,0 +1,7 @@
+/Users/hyunjung/Desktop/sp/model/build/CMakeFiles/intrinsics_gen.dir
+/Users/hyunjung/Desktop/sp/model/build/CMakeFiles/omp_gen.dir
+/Users/hyunjung/Desktop/sp/model/build/CMakeFiles/acc_gen.dir
+/Users/hyunjung/Desktop/sp/model/build/CMakeFiles/RISCVTargetParserTableGen.dir
+/Users/hyunjung/Desktop/sp/model/build/CMakeFiles/model.dir
+/Users/hyunjung/Desktop/sp/model/build/CMakeFiles/edit_cache.dir
+/Users/hyunjung/Desktop/sp/model/build/CMakeFiles/rebuild_cache.dir
