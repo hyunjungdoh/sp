@@ -20,7 +20,7 @@ add_executable(model
   src/Source.cpp
 )
 target_include_directories(model PRIVATE ${LLVM_INCLUDE_DIRS})
-target_compile_definitions(model PRIVATE ${LLVM_DEFINITIONS})
+target_compile_definitions(model PRIVATE ${LLVM_DEFINITIONS} SP_ENV_SYMS="${CMAKE_SOURCE_DIR}/env.syms")
 target_link_libraries(model PRIVATE ${MODEL_LLVM})
 if(NOT LLVM_ENABLE_RTTI)
   target_compile_options(model PRIVATE -fno-rtti)

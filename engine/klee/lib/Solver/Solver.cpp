@@ -109,6 +109,14 @@ Solver::getInitialValues(const Query& query,
   return success;
 }
 
+bool Solver::getInitialValues(const Query &query,
+                              const std::vector<const Array *> &objects,
+                              std::vector<std::vector<unsigned char>> &values,
+                              bool &hasSolution) {
+  hasSolution = false;
+  return impl->computeInitialValues(query, objects, values, hasSolution);
+}
+
 std::pair< ref<Expr>, ref<Expr> > Solver::getRange(const Query& query) {
   ref<Expr> e = query.expr;
   Expr::Width width = e->getWidth();

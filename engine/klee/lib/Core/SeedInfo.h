@@ -12,6 +12,9 @@
 
 #include "klee/Expr/Assignment.h"
 
+#include <map>
+#include <string>
+
 extern "C" {
   struct KTest;
   struct KTestObject;
@@ -28,6 +31,8 @@ namespace klee {
     KTest *input;
     unsigned inputPosition;
     std::set<struct KTestObject*> used;
+    /// Concolic: the corpus file each data object of this seed was bound to.
+    std::map<std::string, size_t> corpusOf;
     
   public:
     explicit

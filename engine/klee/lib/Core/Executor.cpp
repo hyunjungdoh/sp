@@ -297,8 +297,23 @@ cl::opt<bool> Concolic(
 
 cl::opt<unsigned> ConcolicPending(
     "concolic-pending", cl::init(2000),
-    cl::desc("Concolic mode: at most this many unsolved flips are kept; the "
-             "farthest from the sink are discarded first (default=2000)"),
+    cl::desc("Concolic mode: at most this many unsolved flips are kept in "
+             "memory; the farthest from the sink are solved and deferred to a "
+             "later run from the initial state (default=2000)"),
+    cl::cat(SeedingCat));
+
+cl::opt<unsigned> ConcolicFlipBound(
+    "concolic-flip-bound", cl::init(1),
+    cl::desc("Concolic mode: a path flips each branch instruction in each "
+             "direction at most this many times. The bound K of an "
+             "exhaustive verdict (default=1)"),
+    cl::cat(SeedingCat));
+
+cl::list<std::string> ConcolicData(
+    "concolic-data", cl::CommaSeparated,
+    cl::desc("Concolic mode: names of the symbolic objects that hold data "
+             "(an object named N or N.<id>). The seed files are the values "
+             "such an object takes when a path first depends on it"),
     cl::cat(SeedingCat));
 
 cl::opt<std::string>
@@ -565,6 +580,11 @@ Executor::setModule(std::vector<std::unique_ptr<llvm::Module>> &modules,
          "can only register one module"); // XXX gross
 
   kmodule = std::unique_ptr<KModule>(new KModule());
+
+  // The program is the input module; what is linked below is environment.
+  for (const llvm::Function &F : *modules[0])
+    if (!F.isDeclaration())
+      programFunctions.insert(F.getName().str());
 
   // Preparing the final module happens in multiple stages
 
@@ -1080,9 +1100,14 @@ void Executor::branch(ExecutionState &state,
       }
     } else if (Concolic) {
       // Targets no seed took are flips: solved once when selected.
+      std::shared_ptr<const Assignment> parent;
+      if (!seeds.empty())
+        parent = std::make_shared<Assignment>(seeds.front().assignment);
       for (unsigned i=0; i<N; ++i)
-        if (result[i] && !seedMap.count(result[i]))
+        if (result[i] && !seedMap.count(result[i])) {
           result[i]->pendingSeed = true;
+          result[i]->parentInput = parent;
+        }
     }
   }
 
@@ -1162,17 +1187,27 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
                     : -1;
   if (decided >= 0) {
     // Concolic: the seeds decide the branch without the solver. The side no
-    // seed takes is a flip: created pending (solved once when selected) only
-    // for program branches, and once per branch and direction per lineage.
-    // Nothing here touches the constraint set (it may hold millions of
-    // conjuncts along a long concrete path); a refuted flip is found by the
-    // one solver call that tries to seed it.
+    // seed takes is a flip: created pending (solved once when selected) for
+    // program branches, at most K times per branch and direction per path,
+    // and not before the path's floor. Nothing here touches the constraint
+    // set (it may hold millions of conjuncts along a long concrete path); a
+    // refuted flip is found by the one solver call that tries to seed it.
+    unsigned decision = isInternal ? 0 : current.decisions++;
     if (decided == 2) {
       res = Solver::Unknown; // seeds split, both sides seeded
     } else {
-      bool flip = !isInternal &&
-                  current.flipped.insert({current.prevPC, decided == 1}).second;
+      bool flip = false;
+      if (!isInternal) {
+        unsigned &k = current.flips[{current.prevPC, decided == 1}];
+        if (k < ConcolicFlipBound) {
+          ++k;
+          flip = decision >= current.floor;
+        } else if (decision >= current.floor) {
+          ++ledger.bounded;
+        }
+      }
       if (flip) {
+        ++ledger.flips;
         res = Solver::Unknown;
       } else {
         res = decided ? Solver::True : Solver::False;
@@ -1316,17 +1351,24 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
       }
       
       bool swapInfo = false;
+      std::shared_ptr<const Assignment> parent;
+      if (Concolic && !seeds.empty())
+        parent = std::make_shared<Assignment>(seeds.front().assignment);
       if (trueSeeds.empty()) {
         if (&current == trueState) swapInfo = true;
         seedMap.erase(trueState);
-        if (Concolic)
+        if (Concolic) {
           trueState->pendingSeed = true;
+          trueState->parentInput = parent;
+        }
       }
       if (falseSeeds.empty()) {
         if (&current == falseState) swapInfo = true;
         seedMap.erase(falseState);
-        if (Concolic)
+        if (Concolic) {
           falseState->pendingSeed = true;
+          falseState->parentInput = parent;
+        }
       }
       if (swapInfo) {
         std::swap(trueState->coveredNew, falseState->coveredNew);
@@ -1382,6 +1424,8 @@ void Executor::addConstraint(ExecutionState &state, ref<Expr> condition) {
     }
     llvm::report_fatal_error("attempt to add invalid constraint");
   }
+  if (Concolic)
+    bindCorpus(state, condition);
 
   // Check to see if this constraint violates seeds.
   std::map< ExecutionState*, std::vector<SeedInfo> >::iterator it = 
@@ -1391,16 +1435,20 @@ void Executor::addConstraint(ExecutionState &state, ref<Expr> condition) {
     // seed the constraint refutes is removed; with none left the state is a
     // pending flip.
     auto &seeds = it->second;
-    seeds.erase(std::remove_if(seeds.begin(), seeds.end(),
-                               [&](SeedInfo &si) {
-                                 ref<Expr> v = si.assignment.evaluate(condition);
-                                 ConstantExpr *CE = dyn_cast<ConstantExpr>(v);
-                                 return CE && CE->isFalse();
-                               }),
-                seeds.end());
-    if (seeds.empty()) {
+    auto kept = std::stable_partition(
+        seeds.begin(), seeds.end(), [&](SeedInfo &si) {
+          ref<Expr> v = si.assignment.evaluate(condition);
+          ConstantExpr *CE = dyn_cast<ConstantExpr>(v);
+          return !(CE && CE->isFalse());
+        });
+    if (kept == seeds.begin()) {
+      if (!seeds.empty())
+        state.parentInput =
+            std::make_shared<Assignment>(seeds.front().assignment);
       seedMap.erase(it);
       state.pendingSeed = true;
+    } else {
+      seeds.erase(kept, seeds.end());
     }
     // Append without simplification. The seed decides the path, so the
     // constraint set is read only when a flip is solved; simplifying on
@@ -1514,12 +1562,19 @@ ref<klee::ConstantExpr> Executor::toConstant(ExecutionState &state, ref<Expr> e,
 
   if (concretize)
     addConstraint(state, EqExpr::create(e, cvalue));
+  if (Concolic && !(statsTracker && userSearcherRequiresSink() &&
+                    sinkDistance(state) == 0)) {
+    // The other values of e are not explored on this path.
+    state.concretized = true;
+    ++ledger.open["concretized:" + reason];
+  }
 
   return cvalue;
 }
 
 ref<klee::ConstantExpr> Executor::getValueFromSeeds(ExecutionState &state,
                                                     ref<Expr> e) {
+  bindCorpus(state, e);
   auto found = seedMap.find(&state);
   if (found == seedMap.end())
     return nullptr;
@@ -1540,7 +1595,92 @@ bool Executor::concolicSeeded(ExecutionState &state) {
   return it != seedMap.end() && !it->second.empty();
 }
 
+bool Executor::isDataObject(const Array *array) {
+  auto it = dataObjects.find(array);
+  if (it != dataObjects.end())
+    return it->second;
+  bool data = false;
+  for (const std::string &n : ConcolicData) {
+    const std::string &a = array->name;
+    if (a == n || (a.size() > n.size() && a.compare(0, n.size(), n) == 0 &&
+                   (a[n.size()] == '.' || a[n.size()] == '_')))
+      data = true;
+  }
+  return dataObjects[array] = data;
+}
+
+// The length of data object d is the object the harness names "length:d":
+// a file is its bytes and its size, so the seed that gives d file f gives
+// it |f| (at most the size of d).
+void Executor::bindLength(ExecutionState &state, const Array *d) {
+  const std::string name = "length:" + d->name;
+  const Array *len = nullptr;
+  for (auto &sym : state.symbolics)
+    if (sym.second->name == name)
+      len = sym.second;
+  if (!len || !state.fixed.insert(len->name).second)
+    return;
+  auto it = seedMap.find(&state);
+  if (it == seedMap.end())
+    return;
+  for (SeedInfo &si : it->second) {
+    auto c = si.corpusOf.find(d->name);
+    if (c == si.corpusOf.end())
+      continue;
+    uint64_t n = std::min<uint64_t>(corpus[c->second].size(), d->size);
+    std::vector<unsigned char> &v = si.assignment.bindings[len];
+    v.assign(len->size, 0);
+    for (unsigned b = 0; b < len->size && b < 8; ++b)
+      v[b] = (unsigned char)(n >> (8 * b));
+  }
+}
+
+void Executor::bindCorpus(ExecutionState &state, ref<Expr> e) {
+  if (corpus.empty() || isa<ConstantExpr>(e))
+    return;
+  std::vector<const Array *> arrays;
+  findSymbolicObjects(e, arrays);
+  for (const Array *a : arrays) {
+    // A length read first binds the data object it measures.
+    if (a->name.rfind("length:", 0) == 0) {
+      const std::string dn = a->name.substr(7);
+      for (auto &sym : state.symbolics)
+        if (sym.second->name == dn) {
+          a = sym.second;
+          break;
+        }
+    }
+    if (!isDataObject(a))
+      continue;
+    if (!state.fixed.insert(a->name).second) {
+      bindLength(state, a);
+      continue;
+    }
+    auto it = seedMap.find(&state);
+    if (it == seedMap.end() || it->second.empty())
+      continue; // pending: the solver gives this object its value
+    // No constraint of the path reads a yet, so any value of a keeps every
+    // seed on the path.
+    std::vector<SeedInfo> &seeds = it->second;
+    size_t n = std::max(seeds.size(), corpus.size());
+    std::vector<SeedInfo> bound;
+    bound.reserve(n);
+    for (size_t j = 0; j < n; ++j) {
+      SeedInfo si = seeds[j % seeds.size()];
+      const std::vector<unsigned char> &f = corpus[j % corpus.size()];
+      std::vector<unsigned char> &v = si.assignment.bindings[a];
+      v.assign(a->size, 0);
+      std::copy_n(f.begin(), std::min<size_t>(f.size(), a->size), v.begin());
+      si.corpusOf[a->name] = j % corpus.size();
+      bound.push_back(std::move(si));
+    }
+    seeds.swap(bound);
+    bindLength(state, a);
+  }
+}
+
 int Executor::seedsDecide(ExecutionState &state, ref<Expr> condition) {
+  bindCorpus(state, condition);
   auto it = seedMap.find(&state);
   if (it == seedMap.end() || it->second.empty())
     return -1;
@@ -1555,33 +1695,165 @@ int Executor::seedsDecide(ExecutionState &state, ref<Expr> condition) {
   return (t && f) ? 2 : (t ? 1 : 0);
 }
 
+int Executor::solveInput(ExecutionState &state,
+                         std::vector<const Array *> &objects,
+                         std::vector<std::vector<unsigned char>> &values) {
+  for (auto &c : state.constraints) // rewritten to false: no solver needed
+    if (ConstantExpr *CE = dyn_cast<ConstantExpr>(c))
+      if (CE->isFalse())
+        return 0;
+  for (auto &s : state.symbolics)
+    objects.push_back(s.second);
+  bool hasSolution = false;
+  solver->setTimeout(coreSolverTimeout);
+  bool decided = solver->getInitialValues(state.constraints, objects, values,
+                                          state.queryMetaData, hasSolution);
+  solver->setTimeout(time::Span());
+  if (!decided)
+    return -1;
+  if (!hasSolution)
+    return 0;
+  if (!state.parentInput)
+    return 1;
+  // The constraints read only some bytes; the model fixes those, and every
+  // other byte keeps the parent's value, which is then also a model.
+  std::map<const Array *, std::vector<bool>> read;
+  std::set<const Array *> whole;
+  std::vector<ref<Expr>> stack;
+  ExprHashSet visited;
+  std::set<const UpdateNode *> updates;
+  auto push = [&](const ref<Expr> &e) {
+    if (!isa<ConstantExpr>(e) && visited.insert(e).second)
+      stack.push_back(e);
+  };
+  for (auto &c : state.constraints)
+    push(c);
+  while (!stack.empty()) {
+    ref<Expr> top = stack.back();
+    stack.pop_back();
+    if (ReadExpr *re = dyn_cast<ReadExpr>(top)) {
+      const Array *root = re->updates.root;
+      if (ConstantExpr *CE = dyn_cast<ConstantExpr>(re->index)) {
+        uint64_t i = CE->getZExtValue();
+        auto &bits = read[root];
+        bits.resize(root->size);
+        if (i < root->size)
+          bits[i] = true;
+      } else {
+        whole.insert(root);
+        push(re->index);
+      }
+      if (updates.insert(re->updates.head.get()).second)
+        for (const auto *un = re->updates.head.get(); un; un = un->next.get()) {
+          push(un->index);
+          push(un->value);
+        }
+    } else {
+      for (unsigned i = 0; i < top->getNumKids(); ++i)
+        push(top->getKid(i));
+    }
+  }
+  for (size_t k = 0; k < objects.size(); ++k) {
+    const Array *a = objects[k];
+    if (whole.count(a))
+      continue;
+    auto p = state.parentInput->bindings.find(a);
+    if (p == state.parentInput->bindings.end() || p->second.size() != a->size)
+      continue;
+    auto r = read.find(a);
+    for (unsigned i = 0; i < a->size; ++i)
+      if (r == read.end() || !r->second[i])
+        values[k][i] = p->second[i];
+  }
+  return 1;
+}
+
 bool Executor::ensureSeed(ExecutionState &state) {
   if (!state.pendingSeed)
     return true;
   state.pendingSeed = false;
-  for (auto &c : state.constraints) // rewritten to false: no solver needed
-    if (ConstantExpr *CE = dyn_cast<ConstantExpr>(c))
-      if (CE->isFalse()) {
-        ++concolicInfeasible;
-        return false;
-      }
   std::vector<const Array *> objects;
-  for (auto &s : state.symbolics)
-    objects.push_back(s.second);
   std::vector<std::vector<unsigned char>> values;
-  solver->setTimeout(coreSolverTimeout);
-  bool ok = solver->getInitialValues(state.constraints, objects, values,
-                                     state.queryMetaData);
-  solver->setTimeout(time::Span());
-  if (!ok) {
-    ++concolicInfeasible;
+  int r = solveInput(state, objects, values);
+  state.parentInput.reset();
+  if (r <= 0) {
+    // No model: proven infeasible only if no value of the path was fixed,
+    // since a fixed value may be what refutes it.
+    state.fate = r < 0 ? "open:solver-gave-up"
+                 : state.concretized ? "open:infeasible-after-concretization"
+                                     : "infeasible";
     return false;
   }
-  ++concolicSolved;
+  ++ledger.fates["solved"];
   SeedInfo si(nullptr);
   si.assignment = Assignment(objects, values, true);
   seedMap[&state].push_back(si);
   return true;
+}
+
+void Executor::concolicAccount(ExecutionState &state,
+                               StateTerminationType reason) {
+  std::string fate;
+  if (state.fate) {
+    fate = state.fate;
+  } else if (reason > StateTerminationType::SOLVERERR &&
+             reason <= StateTerminationType::PROGERR &&
+             !programFunctions.count(
+                 state.prevPC->inst->getFunction()->getName().str())) {
+    // An error inside the environment model (KLEE runtime, env.bc) is a
+    // limit of the model, not evidence that the program stops here.
+    fate = "open:environment-error";
+  } else if (reason == StateTerminationType::Exit ||
+             reason == StateTerminationType::SilentExit ||
+             (reason > StateTerminationType::SOLVERERR &&
+              reason <= StateTerminationType::USERERR)) {
+    // The path ended in the program (exit, an error in program code, an
+    // infeasible klee_assume): it has no continuation to explore.
+    fate = "completed";
+  } else if (statsTracker && userSearcherRequiresSink() &&
+             sinkDistance(state) == 0) {
+    fate = "unreachable";
+  } else {
+    // Ended by a resource or engine limit with the sink still ahead.
+    fate = std::string("open:") +
+           (reason == StateTerminationType::Interrupted     ? "halted"
+            : reason == StateTerminationType::MaxDepth      ? "max-depth"
+            : reason == StateTerminationType::OutOfMemory   ? "memory"
+            : reason == StateTerminationType::OutOfStackMemory ? "stack"
+            : reason == StateTerminationType::Solver        ? "solver"
+            : reason == StateTerminationType::External      ? "external"
+            : reason == StateTerminationType::Execution     ? "execution"
+                                                            : "other");
+  }
+  if (fate.compare(0, 5, "open:") == 0)
+    ++ledger.open[fate.substr(5)];
+  else
+    ++ledger.fates[fate];
+}
+
+void Executor::writeLedger(bool exhausted) {
+  uint64_t open = 0;
+  for (auto &kv : ledger.open)
+    open += kv.second;
+  std::unique_ptr<llvm::raw_fd_ostream> f =
+      interpreterHandler->openOutputFile("concolic.txt");
+  if (!f)
+    return;
+  // exhaustive: every input within the bounds was explored or proven not to
+  // reach the sink. Otherwise the open counts are what was not.
+  *f << "exhaustive " << (exhausted && open == 0 ? 1 : 0) << "\n"
+     << "states-left " << (exhausted ? 0 : 1) << "\n"
+     << "open " << open << "\n";
+  for (auto &kv : ledger.open)
+    *f << "open:" << kv.first << " " << kv.second << "\n";
+  *f << "flips " << ledger.flips << "\n"
+     << "bounded " << ledger.bounded << "\n"
+     << "flip-bound " << ConcolicFlipBound << "\n"
+     << "respawned " << ledger.respawned << "\n"
+     << "checkpoints " << ledger.checkpoints << "\n"
+     << "checkpoint-at " << ledger.checkpointAt << "\n";
+  for (auto &kv : ledger.fates)
+    *f << "fate:" << kv.first << " " << kv.second << "\n";
 }
 
 Executor::StatePair Executor::seedFork(ExecutionState &state, ref<Expr> condition,
@@ -1604,15 +1876,20 @@ uint64_t Executor::sinkDistance(ExecutionState &state) {
   return computeMinDistToSink(state.pc, state.stack.back().minDistToSinkOnReturn);
 }
 
-void Executor::dropUnreachableFlip(ExecutionState *state) {
-  if (!state || !state->pendingSeed || !statsTracker ||
-      !userSearcherRequiresSink())
-    return;
-  if (sinkDistance(*state) == 0) {
-    ++concolicDropped;
-    terminateStateEarlyAlgorithm(*state, "concolic: flip cannot reach sink",
-                                 StateTerminationType::Replay);
-  }
+uint64_t Executor::sinkOrder(ExecutionState &state) {
+  return sinkGuide(computeMinDistToSinkSlot(
+                       state.pc, state.stack.back().minDistToSinkSlotOnReturn),
+                   sinkDistance(state));
+}
+
+bool Executor::dropUnreachable(ExecutionState *state) {
+  if (!state || !statsTracker || !userSearcherRequiresSink() ||
+      sinkDistance(*state) != 0)
+    return false;
+  state->fate = "unreachable";
+  terminateStateEarlyAlgorithm(*state, "concolic: cannot reach sink",
+                               StateTerminationType::Replay);
+  return true;
 }
 
 void Executor::prunePending() {
@@ -1620,7 +1897,7 @@ void Executor::prunePending() {
   std::vector<std::pair<uint64_t, ExecutionState *>> pending;
   for (ExecutionState *s : states)
     if (s->pendingSeed) {
-      uint64_t d = directed ? sinkDistance(*s) : 1;
+      uint64_t d = directed ? sinkOrder(*s) : 1;
       pending.emplace_back(d ? d : ~0ULL, s);
     }
   if (pending.size() <= ConcolicPending)
@@ -1628,15 +1905,140 @@ void Executor::prunePending() {
   std::sort(pending.begin(), pending.end(),
             [](auto &a, auto &b) { return a.first > b.first; });
   size_t n = pending.size() - ConcolicPending * 9 / 10;
-  klee_message("concolic: states %zu, seeded %zu, pending %zu, pruning %zu "
-               "(solved %u, infeasible %u, unreachable %u)",
-               states.size(), seedMap.size(), pending.size(), n,
-               concolicSolved, concolicInfeasible, concolicDropped);
-  for (size_t i = 0; i < n; ++i) {
-    ++concolicPruned;
-    terminateStateEarlyAlgorithm(*pending[i].second, "concolic: flip pruned",
-                                 StateTerminationType::Replay);
+  klee_message("concolic: states %zu, seeded %zu, pending %zu, deferring %zu "
+               "(flips %" PRIu64 ", deferred %zu)",
+               states.size(), seedMap.size(), pending.size(), n, ledger.flips,
+               deferred.size());
+  for (size_t i = 0; i < n && !haltExecution; ++i) {
+    defer(*pending[i].second);
+    timers.invoke();
   }
+}
+
+void Executor::defer(ExecutionState &state) {
+  uint64_t distance = statsTracker && userSearcherRequiresSink()
+                          ? sinkOrder(state)
+                          : 1;
+  if (distance == 0) {
+    dropUnreachable(&state);
+    return;
+  }
+  // The inputs of the state: its seeds, or the model of its path.
+  std::vector<std::vector<std::vector<unsigned char>>> inputs;
+  if (state.pendingSeed) {
+    std::vector<const Array *> objects;
+    std::vector<std::vector<unsigned char>> values;
+    int r = solveInput(state, objects, values);
+    if (r <= 0) {
+      state.fate = r < 0 ? "open:solver-gave-up"
+                   : state.concretized ? "open:infeasible-after-concretization"
+                                       : "infeasible";
+      terminateStateEarlyAlgorithm(state, "concolic: flip has no input",
+                                   StateTerminationType::Replay);
+      return;
+    }
+    inputs.push_back(std::move(values));
+  } else {
+    auto it = seedMap.find(&state);
+    if (it != seedMap.end())
+      for (SeedInfo &si : it->second) {
+        std::vector<std::vector<unsigned char>> values;
+        for (auto &s : state.symbolics) {
+          auto b = si.assignment.bindings.find(s.second);
+          values.push_back(b != si.assignment.bindings.end()
+                               ? b->second
+                               : std::vector<unsigned char>(s.second->size, 0));
+        }
+        inputs.push_back(std::move(values));
+      }
+  }
+  Deferred entry{distance, std::max(state.floor, state.decisions), {},
+                 state.fixed};
+  for (auto &values : inputs) {
+    KTest *kt = new KTest();
+    kt->version = kTest_getCurrentVersion();
+    kt->numObjects = state.symbolics.size();
+    kt->objects = new KTestObject[kt->numObjects];
+    for (unsigned i = 0; i < kt->numObjects; ++i) {
+      const std::string &name = state.symbolics[i].first->name;
+      kt->objects[i].name = new char[name.size() + 1];
+      std::memcpy(kt->objects[i].name, name.c_str(), name.size() + 1);
+      kt->objects[i].numBytes = values[i].size();
+      kt->objects[i].bytes = new unsigned char[values[i].size()];
+      std::memcpy(kt->objects[i].bytes, values[i].data(), values[i].size());
+    }
+    deferredInputs.emplace_back(kt, [](KTest *k) {
+      for (unsigned i = 0; i < k->numObjects; ++i) {
+        delete[] k->objects[i].name;
+        delete[] k->objects[i].bytes;
+      }
+      delete[] k->objects;
+      delete k;
+    });
+    entry.inputs.push_back(kt);
+  }
+  if (!entry.inputs.empty()) {
+    deferred.push_back(std::move(entry));
+    std::push_heap(deferred.begin(), deferred.end(),
+                   [](const Deferred &a, const Deferred &b) {
+                     return a.distance > b.distance;
+                   });
+  }
+  state.fate = inputs.empty() ? "open:no-input" : "deferred";
+  terminateStateEarlyAlgorithm(state, "concolic: deferred",
+                               StateTerminationType::Replay);
+}
+
+void Executor::respawn() {
+  std::pop_heap(deferred.begin(), deferred.end(),
+                [](const Deferred &a, const Deferred &b) {
+                  return a.distance > b.distance;
+                });
+  Deferred d = deferred.back();
+  deferred.pop_back();
+  ExecutionState *s = pristine->branch();
+  executionTree->attach(pristine->executionTreeNode, s, pristine,
+                        BranchType::NONE);
+  s->floor = d.floor;
+  s->fixed = d.fixed; // the inputs already hold these objects' values
+  addedStates.push_back(s);
+  // The checkpoint already made its symbolic objects: bind each input to
+  // them in creation order, as executeMakeSymbolic would have.
+  for (KTest *kt : d.inputs) {
+    SeedInfo si(kt);
+    for (auto &sym : s->symbolics)
+      bindSeedObject(*s, si, sym.first.get(), sym.second);
+    seedMap[s].push_back(std::move(si));
+  }
+  ++ledger.respawned;
+}
+
+void Executor::advanceCheckpoint() {
+  // Every input runs the same prefix until a constraint or a second state
+  // first depends on it. A state with no constraint and no concretization
+  // is that prefix; a deferred input restarted from a copy of it runs as
+  // it would from the initial state.
+  if (!pristine || !checkpointOpen)
+    return;
+  if (states.size() != 1 || !deferred.empty() || ledger.flips) {
+    checkpointOpen = false;
+    return;
+  }
+  ExecutionState &es = **states.begin();
+  if (!es.constraints.empty() || es.concretized || es.pendingSeed ||
+      !es.fixed.empty()) {
+    checkpointOpen = false;
+    return;
+  }
+  uint64_t i = stats::instructions;
+  if (i & (i - 1))
+    return; // geometric: the copy covers at least half of the prefix
+  executionTree->remove(pristine->executionTreeNode);
+  delete pristine;
+  pristine = es.branch();
+  executionTree->attach(es.executionTreeNode, pristine, &es, BranchType::NONE);
+  ++ledger.checkpoints;
+  ledger.checkpointAt = i;
 }
 
 bool Executor::concolicAssume(ExecutionState &state, ref<Expr> e) {
@@ -1648,6 +2050,8 @@ bool Executor::concolicAssume(ExecutionState &state, ref<Expr> e) {
   if (d == 0) {
     // No seed satisfies the assumption: the path continues only for other
     // inputs, which the flip step must produce.
+    state.parentInput =
+        std::make_shared<Assignment>(seedMap[&state].front().assignment);
     seedMap.erase(&state);
     state.pendingSeed = true;
   } else if (d == 2) {
@@ -1669,6 +2073,8 @@ void Executor::executeGetValue(ExecutionState &state,
                                KInstruction *target) {
   if (!concolicSeeded(state))
     e = ConstraintManager::simplifyExpr(state.constraints, e);
+  if (Concolic)
+    bindCorpus(state, e);
   std::map< ExecutionState*, std::vector<SeedInfo> >::iterator it = 
     seedMap.find(&state);
   if (it==seedMap.end() || isa<ConstantExpr>(e)) {
@@ -2547,8 +2953,8 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       if (branches.second)
         transferToBasicBlock(bi->getSuccessor(1), bi->getParent(), *branches.second);
       if (Concolic) {
-        dropUnreachableFlip(branches.first);
-        dropUnreachableFlip(branches.second);
+        dropUnreachable(branches.first);
+        dropUnreachable(branches.second);
       }
     }
     break;
@@ -2637,13 +3043,27 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     // the others become pending flips. No solver here.
     bool concolicSwitch = concolicSeeded(state) && !isa<ConstantExpr>(cond) &&
                           seedsDecide(state, cond) >= 0;
-    if (concolicSwitch && seedsDecide(state, cond) != 2 &&
-        !state.flipped.insert({ki, true}).second) {
-      // Already flipped in this lineage: follow the seed, keep the constraint.
-      ref<ConstantExpr> v = getValueFromSeeds(state, cond);
-      addConstraint(state, EqExpr::create(cond, v));
-      cond = v;
-      concolicSwitch = false;
+    if (concolicSwitch) {
+      unsigned decision = state.decisions++;
+      bool flip = false;
+      if (seedsDecide(state, cond) == 2) {
+        flip = true; // seeds split: every case keeps or gets an input
+      } else {
+        unsigned &k = state.flips[{ki, true}];
+        if (k < ConcolicFlipBound) {
+          ++k;
+          flip = decision >= state.floor;
+        } else if (decision >= state.floor) {
+          ++ledger.bounded;
+        }
+      }
+      if (!flip) {
+        // Follow the seed and keep the constraint.
+        ref<ConstantExpr> v = getValueFromSeeds(state, cond);
+        addConstraint(state, EqExpr::create(cond, v));
+        cond = v;
+        concolicSwitch = false;
+      }
     }
     if (!concolicSwitch)
       cond = toUnique(state, cond);
@@ -2764,8 +3184,11 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
         ExecutionState *es = *bit;
         if (es) {
           transferToBasicBlock(*it, bb, *es);
-          if (Concolic)
-            dropUnreachableFlip(es);
+          if (Concolic) {
+            if (concolicSwitch && es->pendingSeed)
+              ++ledger.flips;
+            dropUnreachable(es);
+          }
         }
         ++bit;
       }
@@ -2864,7 +3287,10 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
           assert(success && "FIXME: Unhandled solver failure");
           (void) success;
         }
-        StatePair res = fork(*free, EqExpr::create(v, value), true, BranchType::Call);
+        // Concolic: another callee is a program decision like a branch side,
+        // so it is a flip under the same bound (not an internal fork).
+        StatePair res = fork(*free, EqExpr::create(v, value), !Concolic,
+                             BranchType::Call);
         if (res.first) {
           uint64_t addr = value->getZExtValue();
           auto it = legalFunctions.find(addr);
@@ -2879,10 +3305,9 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
 
             executeCall(*res.first, ki, f, arguments);
           } else {
-            if (!hasInvalid) {
-              terminateStateOnExecError(state, "invalid function pointer");
-              hasInvalid = true;
-            }
+            // The side that took this value, which is not always state.
+            terminateStateOnExecError(*res.first, "invalid function pointer");
+            hasInvalid = true;
           }
         }
 
@@ -3889,7 +4314,10 @@ bool Executor::checkMemoryUsage() {
   // check memory limit
   const auto mallocUsage = util::GetTotalMallocUsage() >> 20U;
   const auto mmapUsage = memory->getUsedDeterministicSize() >> 20U;
-  const auto totalUsage = mallocUsage + mmapUsage;
+  // Concolic: the limit bounds what the states hold, above the memory of
+  // the loaded program that no deferral can free.
+  const auto totalUsage =
+      mallocUsage + mmapUsage - std::min<uint64_t>(memoryBase, mallocUsage + mmapUsage);
   atMemoryLimit = totalUsage > MaxMemory; // inhibit forking
   if (!atMemoryLimit)
     return true;
@@ -3906,20 +4334,26 @@ bool Executor::checkMemoryUsage() {
   // randomly select states for early termination
   std::vector<ExecutionState *> arr(states.begin(), states.end()); // FIXME: expensive
   if (Concolic) {
-    // Pending flips first: nothing has been spent on them yet. Among them,
-    // random; seeded states only if that is not enough.
-    auto mid = std::stable_partition(
-        arr.begin(), arr.end(), [](ExecutionState *s) { return !s->pendingSeed; });
-    unsigned pending = arr.end() - mid;
-    while (toKill && pending) {
-      unsigned idx = arr.size() - 1 - theRNG.getInt32() % pending;
-      std::swap(arr[idx], arr.back());
-      terminateStateEarly(*arr.back(), "Memory limit exceeded.",
-                          StateTerminationType::OutOfMemory);
-      arr.pop_back();
-      --pending;
-      --toKill;
+    // Nothing is discarded: states are replaced by their inputs, farthest
+    // from the sink first, pending flips before seeded states.
+    bool directed = statsTracker && userSearcherRequiresSink();
+    std::vector<std::tuple<bool, uint64_t, ExecutionState *>> order;
+    for (ExecutionState *s : arr) {
+      uint64_t d = directed ? sinkOrder(*s) : 1;
+      order.emplace_back(!s->pendingSeed, d ? d : ~0ULL, s);
     }
+    std::sort(order.begin(), order.end(), [](auto &a, auto &b) {
+      if (std::get<0>(a) != std::get<0>(b))
+        return std::get<0>(a) < std::get<0>(b);
+      return std::get<1>(a) > std::get<1>(b);
+    });
+    // The last state always keeps running, so the search makes progress.
+    for (unsigned i = 0; i < toKill && i + 1 < order.size() && !haltExecution;
+         ++i) {
+      defer(*std::get<2>(order[i]));
+      timers.invoke();
+    }
+    return false;
   }
   for (unsigned i = 0, N = arr.size(); N && i < toKill; ++i, --N) {
     unsigned idx = theRNG.getInt32() % N;
@@ -3960,12 +4394,41 @@ void Executor::run(ExecutionState &initialState) {
 
   states.insert(&initialState);
 
+  if (Concolic) {
+    memoryBase = (util::GetTotalMallocUsage() >> 20U) +
+                 (memory->getUsedDeterministicSize() >> 20U);
+    // A copy of the initial state that never runs: deferred inputs restart
+    // from it.
+    pristine = initialState.branch();
+    executionTree->attach(initialState.executionTreeNode, pristine,
+                          &initialState, BranchType::NONE);
+  }
+
   if (usingSeeds) {
     std::vector<SeedInfo> &v = seedMap[&initialState];
     
     for (std::vector<KTest*>::const_iterator it = usingSeeds->begin(), 
            ie = usingSeeds->end(); it != ie; ++it)
       v.push_back(SeedInfo(*it));
+    if (Concolic && !ConcolicData.empty()) {
+      std::set<std::vector<unsigned char>> files;
+      for (KTest *kt : *usingSeeds)
+        for (unsigned i = 0; i < kt->numObjects; ++i) {
+          std::string name = kt->objects[i].name;
+          bool data = false;
+          for (const std::string &n : ConcolicData)
+            data |= name == n;
+          if (data && files.insert(std::vector<unsigned char>(
+                                       kt->objects[i].bytes,
+                                       kt->objects[i].bytes +
+                                           kt->objects[i].numBytes))
+                          .second)
+            corpus.emplace_back(kt->objects[i].bytes,
+                                kt->objects[i].bytes + kt->objects[i].numBytes);
+        }
+      klee_message("concolic: corpus of %zu files for data objects",
+                   corpus.size());
+    }
 
     int lastNumSeeds = usingSeeds->size()+10;
     time::Point lastTime, startTime = lastTime = time::getWallTime();
@@ -4033,7 +4496,15 @@ void Executor::run(ExecutionState &initialState) {
 
   // main interpreter loop
   ExecutionState *lastSeeded = nullptr;
-  while (!states.empty() && !haltExecution) {
+  while ((!states.empty() || (Concolic && !deferred.empty())) &&
+         !haltExecution) {
+    // A deferred input is a path of P_K waiting to run. Bring it back whenever
+    // there is room; waiting for seedMap to empty never does (seeds persist).
+    if (Concolic && !deferred.empty() && states.size() < ConcolicPending) {
+      respawn();
+      updateStates(nullptr);
+      continue;
+    }
     ExecutionState *selected = nullptr;
     if (Concolic && !seedMap.empty()) {
       // Generational order: states on a concrete input run first (round
@@ -4064,6 +4535,8 @@ void Executor::run(ExecutionState &initialState) {
       dumpExecutionTree();
 
     updateStates(&state);
+    if (Concolic)
+      advanceCheckpoint();
 
     if (Concolic && (stats::instructions & 0x3FFFU) == 0 &&
         states.size() > ConcolicPending) {
@@ -4077,16 +4550,31 @@ void Executor::run(ExecutionState &initialState) {
     }
   }
 
-  if (Concolic)
-    klee_message("concolic: flips solved %u, infeasible %u, unreachable %u, "
-                 "pruned %u",
-                 concolicSolved, concolicInfeasible, concolicDropped,
-                 concolicPruned);
+  bool exhausted = states.empty() && deferred.empty();
 
   delete searcher;
   searcher = nullptr;
 
   doDumpStates();
+
+  if (Concolic) {
+    for (const Deferred &d : deferred)
+      ledger.open["halted-deferred"] += d.inputs.size();
+    deferred.clear();
+    writeLedger(exhausted);
+    uint64_t open = 0;
+    for (auto &kv : ledger.open)
+      open += kv.second;
+    klee_message("concolic: flips %" PRIu64 ", bounded %" PRIu64
+                 ", respawned %" PRIu64 ", open %" PRIu64 ", exhaustive %d",
+                 ledger.flips, ledger.bounded, ledger.respawned, open,
+                 exhausted && open == 0);
+    if (pristine) {
+      executionTree->remove(pristine->executionTreeNode);
+      delete pristine;
+      pristine = nullptr;
+    }
+  }
 }
 
 std::string Executor::getAddressInfo(ExecutionState &state, 
@@ -4150,6 +4638,8 @@ void Executor::terminateState(ExecutionState &state,
 
   interpreterHandler->incPathsExplored();
   executionTree->setTerminationType(state, reason);
+  if (Concolic)
+    concolicAccount(state, reason);
 
   std::vector<ExecutionState *>::iterator it =
       std::find(addedStates.begin(), addedStates.end(), &state);
@@ -4208,8 +4698,11 @@ void Executor::terminateStateEarly(ExecutionState &state, const Twine &message,
     ++stats::terminationEarly;
   }
 
-  if ((reason <= StateTerminationType::EARLY && shouldWriteTest(state)) ||
-      (AlwaysOutputSeeds && seedMap.count(&state))) {
+  // A pending flip has no input until it is solved, and a discarded one is
+  // never solved: it writes no test (its constraint set may also be refuted).
+  if (!state.pendingSeed &&
+      ((reason <= StateTerminationType::EARLY && shouldWriteTest(state)) ||
+       (AlwaysOutputSeeds && seedMap.count(&state)))) {
     interpreterHandler->processTestCase(
         state, (message + "\n").str().c_str(),
         terminationTypeFileExtension(reason).c_str());
@@ -5008,6 +5501,14 @@ void Executor::executeMemoryOperation(ExecutionState &state,
   }
   // XXX there is some query wasteage here. who cares?
   ExecutionState *unbound = &state;
+  if (Concolic && concolicSeeded(state) && rl.size() > 1 &&
+      !(statsTracker && userSearcherRequiresSink() &&
+        sinkDistance(state) == 0)) {
+    // The seeds pick one object (internal fork); the address could also
+    // select the others.
+    state.concretized = true;
+    ++ledger.open["concretized:address-objects"];
+  }
   
   for (ResolutionList::iterator i = rl.begin(), ie = rl.end(); i != ie; ++i) {
     const MemoryObject *mo = i->first;
@@ -5076,6 +5577,35 @@ void Executor::executeMemoryOperation(ExecutionState &state,
   }
 }
 
+bool Executor::bindSeedObject(ExecutionState &state, SeedInfo &si,
+                              const MemoryObject *mo, const Array *array) {
+  KTestObject *obj = si.getNextInput(mo, NamedSeedMatching);
+  std::vector<unsigned char> &values = si.assignment.bindings[array];
+  if (!obj) {
+    if (AllowSeedExtension || Concolic) {
+      values = std::vector<unsigned char>(mo->size, '\0');
+      return true;
+    }
+    terminateStateOnUserError(state, "ran out of inputs during seeding");
+    return false;
+  }
+  /* The condition below implies obj->numBytes != mo->size */
+  if ((obj->numBytes < mo->size && !AllowSeedExtension) ||
+      (obj->numBytes > mo->size && !AllowSeedTruncation)) {
+    std::stringstream msg;
+    msg << "replace size mismatch: " << mo->name << "[" << mo->size << "]"
+        << " vs " << obj->name << "[" << obj->numBytes << "]"
+        << " in test\n";
+    terminateStateOnUserError(state, msg.str());
+    return false;
+  }
+  /* Either sizes are equal or seed extension/trucation is allowed */
+  values.assign(obj->bytes,
+                obj->bytes + std::min((size_t)obj->numBytes, mo->size));
+  values.resize(mo->size, '\0');
+  return true;
+}
+
 void Executor::executeMakeSymbolic(ExecutionState &state, 
                                    const MemoryObject *mo,
                                    const std::string &name) {
@@ -5103,40 +5633,9 @@ void Executor::executeMakeSymbolic(ExecutionState &state,
     auto found = seedMap.find(&state);
     if (found != seedMap.end()) {
       // In seed mode we need to add this as binding
-
-      for (SeedInfo &si : found->second) {
-        KTestObject *obj = si.getNextInput(mo, NamedSeedMatching);
-
-        if (!obj) {
-          if (AllowSeedExtension || Concolic) {
-            std::vector<unsigned char> &values = si.assignment.bindings[array];
-            values = std::vector<unsigned char>(mo->size, '\0');
-          } else /*if (!AllowSeedExtension)*/ {
-            terminateStateOnUserError(state,
-                                      "ran out of inputs during seeding");
-            break;
-          }
-        } else {
-          /* The condition below implies obj->numBytes != mo->size */
-          if ((obj->numBytes < mo->size && !AllowSeedExtension) ||
-              (obj->numBytes > mo->size && !AllowSeedTruncation)) {
-            std::stringstream msg;
-	    msg << "replace size mismatch: "
-		<< mo->name << "[" << mo->size << "]"
-		<< " vs " << obj->name << "[" << obj->numBytes << "]"
-		<< " in test\n";
-            terminateStateOnUserError(state, msg.str());
-            break;
-          } else {
-            /* Either sizes are equal or seed extension/trucation is allowed */
-            std::vector<unsigned char> &values = si.assignment.bindings[array];
-            values.insert(values.begin(), obj->bytes,
-                          obj->bytes + std::min((size_t) obj->numBytes, mo->size));
-              for (unsigned i = obj->numBytes; i < mo->size; ++i)
-                values.push_back('\0');
-          }
-        }
-      }
+      for (SeedInfo &si : found->second)
+        if (!bindSeedObject(state, si, mo, array))
+          break;
     }
   } else {
     ObjectState *os = bindObjectInState(state, mo, false);
@@ -5311,6 +5810,10 @@ bool Executor::getSymbolicSolution(const ExecutionState &state,
                                    std::pair<std::string,
                                    std::vector<unsigned char> > >
                                    &res) {
+  for (auto &c : state.constraints) // refuted set (see addConstraintInternal)
+    if (ConstantExpr *CE = dyn_cast<ConstantExpr>(c))
+      if (CE->isFalse())
+        return false;
   solver->setTimeout(coreSolverTimeout);
 
   ConstraintSet extendedConstraints(state.constraints);

@@ -1,12 +1,8 @@
 dataset/
 engine/runs/
+out/
 *.ll
 *.bc
 *.istats
 model/build-asan/
-runs/
-model/build-asan/
-*.ll
-*.bc
-*.istats
 dataset.tar.gz

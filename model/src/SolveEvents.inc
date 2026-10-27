@@ -1341,6 +1341,11 @@
           };
           return go(V);
         };
+        // 반환 제약(§3.4 정제): 경로가 호출 CB의 결과를 상수와 비교해 한쪽만 이어질 때,
+        // 그 비교는 피호출자의 반환값에 대한 must 조건이다. 'q' 이벤트(may측 실현)와
+        // 별도로 호출지별로 모아 두어, 아래 피호출자 하강이 목표 ret를 이 제약을
+        // 만족할 수 있는 ret로 한정하게 한다.
+        std::map<const CallBase *, std::vector<std::pair<unsigned, int64_t>>> retCons;
         auto noteReturn = [&](CallBase *CB, ICmpInst::Predicate pred, Constant *C) {
           if (!factAt || !CB)
             return;
@@ -1348,12 +1353,15 @@
           if (!Cal)
             return;
           std::string k;
+          int64_t kv = 0;
           if (isa<ConstantPointerNull>(C))
             k = "0";
-          else if (auto *CI = dyn_cast<ConstantInt>(C))
+          else if (auto *CI = dyn_cast<ConstantInt>(C)) {
             k = dec(CI);
-          else
+            kv = CI->getSExtValue();
+          } else
             return;
+          retCons[CB].push_back({(unsigned)pred, kv});
           Ev ev;
           ev.at = CB;
           ev.fn = F;
@@ -1679,10 +1687,69 @@
             }
             if (!touch || !didCallee.insert(D).second)
               continue;
-            std::unordered_set<Instruction *> rets;
-            for (BasicBlock &RBB : *D)
-              if (auto *R = dyn_cast<ReturnInst>(RBB.getTerminator()))
+            // 피호출자 안의 목표는 반환이다. 이 호출의 결과에 경로가 반환 제약을
+            // 걸었으면(위 retCons), 목표는 그 제약을 만족할 수 있는 반환값의
+            // 정의 지점으로 한정한다. 반환값이 phi면 incoming 변, 반환 슬롯의
+            // load면 그 슬롯에의 store, 그 밖이면 ret 자체가 정의 지점이다. 상수
+            // 정의는 상수가 제약을 어기면 제외되고, 상수가 아닌 정의는 남는다.
+            // 그러면 "한쪽 후계자만 목표에 닿는" 분기 규칙이 제외된 정의로만 가는
+            // 분기를 조건으로 잡아, 피호출자가 결과를 정하는 데 읽는 셀이 경로의
+            // 셀이 된다. 어떤 정의도 제약을 만족할 수 없으면 제약을 무시한다.
+            std::unordered_set<Instruction *> rets, allRets;
+            auto rc = retCons.find(CB);
+            auto admits = [&](Value *V) {
+              while (V && isa<CastInst>(V))
+                V = cast<CastInst>(V)->getOperand(0);
+              std::optional<int64_t> cv;
+              if (V && isa<ConstantPointerNull>(V))
+                cv = 0;
+              else if (auto *CI = dyn_cast_or_null<ConstantInt>(V))
+                cv = CI->getSExtValue();
+              if (!cv)
+                return true;
+              for (const auto &c : rc->second)
+                if (!cmpHolds(c.first, *cv, c.second))
+                  return false;
+              return true;
+            };
+            for (BasicBlock &RBB : *D) {
+              auto *R = dyn_cast<ReturnInst>(RBB.getTerminator());
+              if (!R)
+                continue;
+              allRets.insert(R);
+              if (rc == retCons.end()) {
                 rets.insert(R);
+                continue;
+              }
+              Value *RV = R->getReturnValue();
+              while (RV && isa<CastInst>(RV))
+                RV = cast<CastInst>(RV)->getOperand(0);
+              if (auto *Phi = dyn_cast_or_null<PHINode>(RV)) {
+                for (unsigned pi = 0; pi < Phi->getNumIncomingValues(); ++pi)
+                  if (admits(Phi->getIncomingValue(pi)))
+                    rets.insert(Phi->getIncomingBlock(pi)->getTerminator());
+                continue;
+              }
+              if (auto *Ld = dyn_cast_or_null<LoadInst>(RV)) {
+                auto *Slot = dyn_cast<AllocaInst>(Ld->getPointerOperand()->stripPointerCasts());
+                bool anyStore = false;
+                if (Slot)
+                  for (User *U : Slot->users()) {
+                    auto *St = dyn_cast<StoreInst>(U);
+                    if (!St || St->getPointerOperand()->stripPointerCasts() != Slot)
+                      continue;
+                    anyStore = true;
+                    if (admits(St->getValueOperand()))
+                      rets.insert(St);
+                  }
+                if (anyStore)
+                  continue;
+              }
+              if (admits(RV))
+                rets.insert(R);
+            }
+            if (rets.empty())
+              rets = allRets;
             Instruction *savedA = evAnchor;
             bool savedM = evCallMust;
             if (F == seq[curStep]) {

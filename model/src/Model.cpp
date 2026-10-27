@@ -1,7 +1,7 @@
 #include "Model.h"
 #include "Client.h"
 #include "Close.h"
-
+#include "../../engine/klee/include/klee/Support/SlotTargets.h"
 #include <sstream>
 
 #include "llvm/Analysis/TargetLibraryInfo.h"
@@ -59,12 +59,18 @@ static std::set<std::string> projectExports;
 // over the call graph, so a function proven to return or to reach the sink
 // has such a path. gaps receives the closure gaps that cut it: those called
 // in functions that reach the sink only when gaps could return.
-static bool flowReach(Module &M, std::set<std::string> &gaps, std::vector<std::string> &chain) {
+// With bySlot, an indirect call reaches only the functions its callee slot
+// admits (klee::slots, DESIGN-D §6 slot targets).
+static bool flowReach(Module &M, std::set<std::string> &gaps, std::vector<std::string> &chain,
+                      bool bySlot = false) {
   std::map<const Function *, std::pair<const Function *, bool>> via;
   std::map<FunctionType *, std::vector<Function *>> taken;
   for (Function &F : M)
     if (!F.isDeclaration() && F.hasAddressTaken())
       taken[F.getFunctionType()].push_back(&F);
+  klee::slots::Targets slot;
+  if (bySlot)
+    slot.build(M);
   auto gap = [&](const Function *C) {
     return C && C->isDeclaration() && !C->isIntrinsic() && projectExports.count(C->getName().str());
   };
@@ -93,10 +99,14 @@ static bool flowReach(Module &M, std::set<std::string> &gaps, std::vector<std::s
         }
         bool passes;
         if (!C) {
+          // Indirect: every address-taken function of the same type (C11
+          // 6.3.2.3p8: a call through an incompatible type is undefined).
           auto it = taken.find(CB->getFunctionType());
           passes = it == taken.end();
           if (it != taken.end())
             for (Function *T : it->second) {
+              if (bySlot && !slot.admits(*CB, T))
+                continue;
               if (toSink && sinks.count(T)) {
                 via[&F] = {T, true};
                 return true;
@@ -213,6 +223,8 @@ static int finish(Module &harness, LLVMContext &ctx, const fs::path &outDir, con
   }
   // A call with no body whose pointer argument is the address of a pointer
   // the caller then loads stores an object of its last integer argument.
+  // A function the environment defines is not body-less: its specification
+  // is the environment model's (strtoul's out slot is an end pointer).
   std::map<Function *, int> allocSlot;
   std::map<Function *, int> allocSize;
   std::set<Function *> allocSkip;
@@ -224,7 +236,8 @@ static int finish(Module &harness, LLVMContext &ctx, const fs::path &outDir, con
       if (!CB)
         continue;
       Function *D = CB->getCalledFunction();
-      if (!D || !D->isDeclaration() || D->getName().starts_with("llvm.") || !D->getReturnType()->isIntegerTy())
+      if (!D || !D->isDeclaration() || D->getName().starts_with("llvm.") || !D->getReturnType()->isIntegerTy() ||
+          environmentSymbol(D->getName().str()))
         continue;
       int lastInt = -1;
       int slot = -1;
@@ -364,10 +377,6 @@ static int finish(Module &harness, LLVMContext &ctx, const fs::path &outDir, con
   // environment. A called function that neither defines breaks that
   // precondition; it is reported, since no execution can go past it.
   {
-    std::vector<void *> env;
-    for (const char *lib : {"libc.so.6", "libm.so.6", "libstdc++.so.6", "libgcc_s.so.1"})
-      if (void *h = dlopen(lib, RTLD_LAZY))
-        env.push_back(h);
     std::set<const Function *> reach;
     std::set<const Value *> seen;
     std::vector<const Value *> work;
@@ -427,9 +436,15 @@ static int finish(Module &harness, LLVMContext &ctx, const fs::path &outDir, con
       rs << "global-gaps " << missing.size() << "\n";
       for (size_t k = 0; k < missing.size() && k < 20; ++k)
         rs << "global-gap " << missing[k] << "\n";
-      // '*' marks a call through a pointer, resolved by type to that target.
+      // '*' marks an indirect call whose type-matched targets include that step.
       for (const std::string &c : chain)
         rs << "cfg-path " << c << "\n";
+      std::set<std::string> slotGaps;
+      std::vector<std::string> slotChain;
+      bool bySlot = flowReach(harness, slotGaps, slotChain, true);
+      rs << "sink-reachable-slot " << (bySlot ? 1 : 0) << "\n";
+      for (const std::string &c : slotChain)
+        rs << "slot-path " << c << "\n";
       for (const std::string &g : gaps)
         rs << "closure-gap " << g << "\n";
     }
@@ -438,10 +453,7 @@ static int finish(Module &harness, LLVMContext &ctx, const fs::path &outDir, con
       if (!F.isDeclaration() || F.isIntrinsic() || !reach.count(&F) || F.getName().starts_with("klee_"))
         continue;
       std::string name = F.getName().str();
-      bool provided = false;
-      for (void *h : env)
-        provided = provided || dlsym(h, name.c_str());
-      if (provided)
+      if (environmentSymbol(name))
         continue;
       open << name << "\n";
       errs() << "open: " << name << "\n";

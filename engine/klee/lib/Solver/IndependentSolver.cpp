@@ -485,6 +485,15 @@ bool IndependentSolver::computeInitialValues(const Query& query,
     // Going to use this as the "fresh" expression for the Query() invocation below
     assert(it->exprs.size() >= 1 && "No null/empty factors");
     if (arraysInFactor.size() == 0){
+      // No array to solve for, but a constant false conjunct still refutes
+      // the set (a set marked unsatisfiable by addConstraintInternal).
+      for (auto &e : it->exprs)
+        if (ConstantExpr *CE = dyn_cast<ConstantExpr>(e))
+          if (CE->isFalse()) {
+            values.clear();
+            hasSolution = false;
+            return true;
+          }
       continue;
     }
     ConstraintSet tmp(it->exprs);

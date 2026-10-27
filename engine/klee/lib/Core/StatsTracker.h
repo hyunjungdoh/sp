@@ -109,6 +109,15 @@ namespace klee {
   /// instruction distance is d+1, and 0 means unreachable.
   uint64_t computeMinDistToSink(const KInstruction *ki, uint64_t minDistAtRA);
 
+  /// The same over the call graph of slot targets (T_slot).
+  uint64_t computeMinDistToSinkSlot(const KInstruction *ki,
+                                    uint64_t minDistAtRA);
+
+  /// The search order of a state: T_slot when finite, else past every
+  /// finite T_slot by T. 0 exactly when T is infinite.
+  extern uint64_t sinkGuideOffset;
+  uint64_t sinkGuide(uint64_t slot, uint64_t sig);
+
 }
 
 #endif /* KLEE_STATSTRACKER_H */

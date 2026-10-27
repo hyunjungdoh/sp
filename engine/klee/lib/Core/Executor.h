@@ -433,9 +433,66 @@ private:
   int seedsDecide(ExecutionState &state, ref<Expr> condition);
 
   /// Concolic mode. A pending state (split off without a seed) is solved once;
-  /// the model becomes its seed. Returns false if the path is infeasible (or
-  /// the solver gave up), in which case the caller discards the state.
+  /// the model becomes its seed. Returns false if it gets no seed, in which
+  /// case the caller discards the state; its fate then says whether the path
+  /// was proven infeasible or the solver gave up.
   bool ensureSeed(ExecutionState &state);
+
+  /// Concolic mode. Solve the path condition of a state for a full input.
+  /// 1: values are a model; 0: no model exists (proven only if the path was
+  /// never concretized); -1: the solver gave up.
+  int solveInput(ExecutionState &state, std::vector<const Array *> &objects,
+                 std::vector<std::vector<unsigned char>> &values);
+
+  /// Concolic mode. The fate of every state the search ends, and the
+  /// candidates (pending flips) it creates. The run is exhaustive within its
+  /// bounds iff it ends with no state, no deferred input and no open count.
+  struct Ledger {
+    uint64_t flips = 0, bounded = 0, respawned = 0;
+    uint64_t checkpoints = 0, checkpointAt = 0; // pristine moves, last count
+    std::map<std::string, uint64_t> fates, open;
+  } ledger;
+  void concolicAccount(ExecutionState &state, StateTerminationType reason);
+  void writeLedger(bool exhausted);
+
+  /// Concolic mode. A state the search cannot keep in memory is replaced by
+  /// its input (solved now if it is pending), run again later from the
+  /// checkpoint (advanceCheckpoint); decisions before floor are not flipped
+  /// again. Nothing is
+  /// discarded for lack of memory.
+  struct Deferred {
+    uint64_t distance;
+    unsigned floor;
+    std::vector<KTest *> inputs; // the state's seeds, re-run together
+    std::set<std::string> fixed;
+  };
+  std::vector<Deferred> deferred; // min-heap on distance
+  std::vector<std::unique_ptr<KTest, void (*)(KTest *)>> deferredInputs;
+  ExecutionState *pristine = nullptr;
+  std::set<std::string> programFunctions; // defined in the input module
+  uint64_t memoryBase = 0; // MB in use when the run starts
+  void defer(ExecutionState &state);
+  void respawn();
+  /// Concolic mode. Move pristine forward along the input-independent
+  /// prefix (no constraint, one state), at instruction counts 2^k.
+  bool checkpointOpen = true;
+  void advanceCheckpoint();
+  /// Bind seed si's value for a new symbolic object (by name or position).
+  bool bindSeedObject(ExecutionState &state, SeedInfo &si,
+                      const MemoryObject *mo, const Array *array);
+
+  /// Concolic mode. The seed files (--seed-dir) as values of a data object.
+  /// A path's constraints read only some bytes of its input; every other
+  /// value of the rest gives an input of the same path. When a seeded state
+  /// first depends on a data object (--concolic-data) that its path does not
+  /// yet constrain, the object takes the corpus files as its values instead
+  /// of zeros: seed j gets file j, and the state carries max(seeds, files)
+  /// seeds.
+  std::vector<std::vector<unsigned char>> corpus;
+  std::map<const Array *, bool> dataObjects;
+  bool isDataObject(const Array *array);
+  void bindCorpus(ExecutionState &state, ref<Expr> e);
+  void bindLength(ExecutionState &state, const Array *data);
 
   /// Concolic mode. klee_assume(e) in a seeded state: seeds satisfying e stay;
   /// if none does, the state drops its seeds and becomes pending. Returns
@@ -451,15 +508,17 @@ private:
   /// Concolic mode. Sink distance of a state (d+1; 0 = sink unreachable).
   uint64_t sinkDistance(ExecutionState &state);
 
-  /// Concolic mode. Discard a pending flip whose target cannot reach the sink.
-  void dropUnreachableFlip(ExecutionState *state);
+  /// Concolic mode. Order of a state toward the sink (sinkGuide): T_slot,
+  /// falling back to T. Zero exactly when sinkDistance is.
+  uint64_t sinkOrder(ExecutionState &state);
 
-  /// Concolic mode. Keep at most --concolic-pending flips; the farthest from
-  /// the sink are discarded first.
+  /// Concolic mode. Keep at most --concolic-pending flips in memory; the
+  /// farthest from the sink are deferred first.
   void prunePending();
 
-  unsigned concolicSolved = 0, concolicInfeasible = 0, concolicDropped = 0,
-           concolicPruned = 0;
+  /// Concolic mode. End a state (seeded or pending) whose sink distance is
+  /// infinite: no continuation of it, hence no flip of it, reaches the sink.
+  bool dropUnreachable(ExecutionState *state);
 
   /// Bind a constant value for e to the given target. NOTE: This
   /// function may fork state if the state has multiple seeds.

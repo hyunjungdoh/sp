@@ -98,10 +98,22 @@ public:
     // The client sets the field (configuration) rather than assuming it.
     bool config = false;
   };
+  // §3.6 생성자 레버: 클라이언트가 직접 쓸 수 없는(불투명, 생산자가 세우는) 보유
+  // 인자의 경로 셀은, 그 셀로 값이 흘러드는 생산자의 입력 형식인자로 실현된다.
+  // 클라이언트는 그 인자를 셀이 요구하는 대로 고른다: 등식은 값을 넘기고,
+  // 부등식은 가정한다(§4 가드와 같은 의미).
+  struct Lever {
+    unsigned formal = 0;
+    bool eq = true;
+    std::vector<int64_t> values;
+    std::string text;
+  };
   struct Plan {
     // Per entry, a disjunction over its witnesses of the conjunction of
     // their frozen constraints. An entry with an unguarded witness has none.
     FnMap<std::vector<std::vector<Guard>>> guards;
+    // Per producer, the constructor levers of the cells its inputs decide.
+    FnMap<std::vector<Lever>> levers;
     std::vector<Function *> firsts;
     std::vector<Function *> entries;
     std::vector<std::pair<std::string, std::vector<Producer>>> handles;

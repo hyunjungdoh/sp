@@ -27,3 +27,8 @@ unsigned closeModules(llvm::Module &down, llvm::Module &up, const std::filesyste
 // given that image's bytes. Bitcode still missing is linked by the same rule
 // as closeModules. A function with no bitcode stays a declaration.
 void closeLibrary(llvm::Module &M, const std::filesystem::path &caseDir);
+
+// Whether the environment (the target's libc, libm, libstdc++, libgcc_s;
+// model/env.syms) defines the symbol. Such a function has a specification
+// and the environment model, not the harness, gives its body.
+bool environmentSymbol(const std::string &name);

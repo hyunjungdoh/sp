@@ -52,7 +52,8 @@ std::uint32_t ExecutionState::nextID = 1;
 
 StackFrame::StackFrame(KInstIterator _caller, KFunction *_kf)
   : caller(_caller), kf(_kf), callPathNode(0), 
-    minDistToUncoveredOnReturn(0), minDistToSinkOnReturn(0), varargs(0) {
+    minDistToUncoveredOnReturn(0), minDistToSinkOnReturn(0),
+    minDistToSinkSlotOnReturn(0), varargs(0) {
   locals = new Cell[kf->numRegisters];
 }
 
@@ -63,6 +64,7 @@ StackFrame::StackFrame(const StackFrame &s)
     allocas(s.allocas),
     minDistToUncoveredOnReturn(s.minDistToUncoveredOnReturn),
     minDistToSinkOnReturn(s.minDistToSinkOnReturn),
+    minDistToSinkSlotOnReturn(s.minDistToSinkSlotOnReturn),
     varargs(s.varargs) {
   locals = new Cell[s.kf->numRegisters];
   for (unsigned i=0; i<s.kf->numRegisters; i++)
@@ -118,7 +120,12 @@ ExecutionState::ExecutionState(const ExecutionState& state):
     coveredNew(state.coveredNew),
     forkDisabled(state.forkDisabled),
     pendingSeed(state.pendingSeed),
-    flipped(state.flipped),
+    flips(state.flips),
+    decisions(state.decisions),
+    floor(state.floor),
+    concretized(state.concretized),
+    fixed(state.fixed),
+    parentInput(state.parentInput),
     base_addrs(state.base_addrs),
     base_mos(state.base_mos) {
   for (const auto &cur_mergehandler: openMergeStack)

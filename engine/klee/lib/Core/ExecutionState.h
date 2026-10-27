@@ -16,6 +16,7 @@
 
 #include "klee/ADT/ImmutableSet.h"
 #include "klee/ADT/TreeStream.h"
+#include "klee/Expr/Assignment.h"
 #include "klee/Expr/Constraints.h"
 #include "klee/Expr/Expr.h"
 #include "klee/KDAlloc/kdalloc.h"
@@ -58,6 +59,7 @@ struct StackFrame {
   /// Distance to the sink once this function returns. Same folding as
   /// minDistToUncoveredOnReturn, for the sink-directed searcher.
   unsigned minDistToSinkOnReturn;
+  unsigned minDistToSinkSlotOnReturn;
 
   // For vararg functions: arguments not passed via parameter are
   // stored (packed tightly) in a local (alloca) memory object. This
@@ -257,10 +259,32 @@ public:
   /// it is next selected; the model becomes its seed, or it is discarded.
   bool pendingSeed = false;
 
-  /// @brief Concolic mode: branch instructions (with the direction the seed
-  /// took) that this lineage has already flipped once. A loop condition is
-  /// flipped once per concrete run, not once per iteration.
-  std::set<std::pair<const KInstruction *, bool>> flipped;
+  /// @brief Concolic mode: times this lineage has flipped each branch
+  /// instruction in each seed direction (at most --concolic-flip-bound).
+  std::map<std::pair<const KInstruction *, bool>, unsigned> flips;
+
+  /// @brief Concolic mode: symbolic decisions the seeds made on this path so
+  /// far, and the first one this state may flip. The decisions before floor
+  /// were flipped by the run that produced this state's input.
+  unsigned decisions = 0, floor = 0;
+
+  /// @brief Concolic mode: a symbolic value of this path was fixed to one
+  /// concrete value, so its other values are not explored.
+  bool concretized = false;
+
+  /// @brief Concolic mode: the search's reason for ending this state, if the
+  /// search ended it (see Executor::concolicAccount).
+  const char *fate = nullptr;
+
+  /// @brief Concolic mode: data objects (--concolic-data) whose value this
+  /// path is committed to: a constraint reads them or a corpus value was
+  /// bound (Executor::bindCorpus). Names, so that a re-run keeps them.
+  std::set<std::string> fixed;
+
+  /// @brief Concolic mode: an input of the state this pending state was split
+  /// from. Its model keeps these bytes wherever the path condition does not
+  /// read them (Executor::solveInput).
+  std::shared_ptr<const Assignment> parentInput;
 
   /// @brief Mapping symbolic address expressions to concrete base addresses
   using base_addrs_t = std::map<ref<Expr>, ref<ConstantExpr>>;

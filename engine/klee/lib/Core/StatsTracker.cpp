@@ -20,6 +20,7 @@
 #include "klee/Statistics/Statistics.h"
 #include "klee/Support/ErrorHandling.h"
 #include "klee/Support/ModuleUtil.h"
+#include "klee/Support/SlotTargets.h"
 #include "klee/System/MemoryUsage.h"
 
 #include "CallPathManager.h"
@@ -421,6 +422,9 @@ void StatsTracker::framePushed(ExecutionState &es, StackFrame *parentFrame) {
       minDistAtRA = parentFrame->minDistToSinkOnReturn;
     sf.minDistToSinkOnReturn =
         sf.caller ? computeMinDistToSink(sf.caller, minDistAtRA) : 0;
+    uint64_t slotAtRA = parentFrame ? parentFrame->minDistToSinkSlotOnReturn : 0;
+    sf.minDistToSinkSlotOnReturn =
+        sf.caller ? computeMinDistToSinkSlot(sf.caller, slotAtRA) : 0;
   }
 }
 
@@ -845,22 +849,60 @@ bool isSink(const Instruction *inst) {
 
 } // namespace
 
+static uint64_t foldMinDist(uint64_t local, uint64_t distToReturn,
+                            uint64_t minDistAtRA) {
+  if (minDistAtRA == 0)
+    return local;
+  if (distToReturn == 0 || local == 0)
+    return local ? local : distToReturn + minDistAtRA;
+  return std::min(local, distToReturn + minDistAtRA);
+}
+
 uint64_t klee::computeMinDistToSink(const KInstruction *ki,
                                     uint64_t minDistAtRA) {
   StatisticManager &sm = *theStatisticManager;
   uint64_t local = sm.getIndexedValue(stats::minDistToSink, ki->info->id);
   if (minDistAtRA == 0)
     return local;
-  uint64_t distToReturn =
-      sm.getIndexedValue(stats::minDistToReturn, ki->info->id);
-  if (distToReturn == 0 || local == 0)
-    return local ? local : distToReturn + minDistAtRA;
-  return std::min(local, distToReturn + minDistAtRA);
+  return foldMinDist(local,
+                     sm.getIndexedValue(stats::minDistToReturn, ki->info->id),
+                     minDistAtRA);
 }
 
-// Minimum fixpoint of the design distance. A call costs the callee's
-// distance to return. An indirect call reaches every address-taken
-// function of the same type. Stored distances are d+1; 0 is unreachable.
+uint64_t klee::computeMinDistToSinkSlot(const KInstruction *ki,
+                                        uint64_t minDistAtRA) {
+  StatisticManager &sm = *theStatisticManager;
+  return foldMinDist(
+      sm.getIndexedValue(stats::minDistToSinkSlot, ki->info->id),
+      sm.getIndexedValue(stats::minDistToReturnSlot, ki->info->id),
+      minDistAtRA);
+}
+
+uint64_t klee::sinkGuideOffset = 0;
+
+uint64_t klee::sinkGuide(uint64_t slot, uint64_t sig) {
+  if (slot)
+    return slot;
+  return sig ? sinkGuideOffset + sig : 0;
+}
+
+// A frame is left by a return, by resume, or by a call that unwinds through
+// it (an exception the frame does not catch).
+static bool leavesFrame(const Instruction *I) {
+  if (isa<ReturnInst>(I) || isa<ResumeInst>(I))
+    return true;
+  const auto *ci = dyn_cast<CallInst>(I);
+  return ci && !ci->doesNotThrow() && !isa<DbgInfoIntrinsic>(ci) &&
+         !isa<InlineAsm>(ci->getCalledOperand());
+}
+
+// Minimum fixpoint of the design distance, over two call graphs. A call
+// costs the callee's distance to return. In the first graph an indirect
+// call reaches every address-taken function of its type (T, the
+// over-approximation that proves a state cannot reach the sink). In the
+// second it reaches only the functions its callee slot admits (T_slot,
+// the order of the search, §6 slot targets). Stored distances are d+1; 0
+// is unreachable.
 void StatsTracker::computeSinkDistance() {
   KModule *km = executor.kmodule.get();
   Module *m = km->module.get();
@@ -869,22 +911,19 @@ void StatsTracker::computeSinkDistance() {
   const unsigned n = infos.getMaxID();
 
   std::vector<Instruction *> insts, byId(n, nullptr);
-  std::vector<std::vector<unsigned>> succs(n), preds(n), callers(n);
-  // One direct callee, or every address-taken function of the call's type.
+  std::vector<std::vector<unsigned>> succs(n), preds(n);
   std::vector<Function *> directTarget(n, nullptr);
-  std::vector<const std::vector<Function *> *> indirectTargets(n, nullptr);
+  std::vector<const std::vector<Function *> *> sigTargets(n, nullptr),
+      slotTargets(n, nullptr);
+  std::vector<std::vector<Function *>> slotOwn(n);
   std::unordered_map<FunctionType *, std::vector<Function *>> byType;
   for (Function *f : km->escapingFunctions)
     byType[f->getFunctionType()].push_back(f);
-  auto forTargets = [&](unsigned id, auto body) {
-    if (directTarget[id])
-      body(directTarget[id]);
-    else if (indirectTargets[id])
-      for (Function *c : *indirectTargets[id])
-        body(c);
-  };
+  slots::Targets slot;
+  slot.build(*m);
 
   std::vector<char> isEntry(n, 0);
+  unsigned narrowed = 0, indirect = 0;
   for (Function &F : *m) {
     if (F.isDeclaration())
       continue;
@@ -894,22 +933,27 @@ void StatsTracker::computeSinkDistance() {
       unsigned id = infos.getInfo(I).id;
       byId[id] = &I;
       insts.push_back(&I);
-      if (const auto *cb = dyn_cast<CallBase>(&I)) {
-        if (isa<InlineAsm>(cb->getCalledOperand()))
-          continue;
-        if (Function *direct =
-                getDirectCallTarget(*cb, /*moduleIsFullyLinked=*/true))
-          directTarget[id] = direct;
-        else {
-          auto it = byType.find(cb->getFunctionType());
-          if (it != byType.end())
-            indirectTargets[id] = &it->second;
-        }
-        forTargets(id, [&](Function *callee) {
-          if (!callee->isDeclaration())
-            callers[infos.getInfo(callee->getEntryBlock().front()).id]
-                .push_back(id);
-        });
+      const auto *cb = dyn_cast<CallBase>(&I);
+      if (!cb || isa<InlineAsm>(cb->getCalledOperand()))
+        continue;
+      if (Function *direct =
+              getDirectCallTarget(*cb, /*moduleIsFullyLinked=*/true)) {
+        directTarget[id] = direct;
+        continue;
+      }
+      auto it = byType.find(cb->getFunctionType());
+      if (it == byType.end())
+        continue;
+      sigTargets[id] = slotTargets[id] = &it->second;
+      ++indirect;
+      if (!slots::calleeSlot(*cb))
+        continue;
+      for (Function *f : it->second)
+        if (slot.admits(*cb, f))
+          slotOwn[id].push_back(f);
+      if (slotOwn[id].size() < it->second.size()) {
+        slotTargets[id] = &slotOwn[id];
+        ++narrowed;
       }
     }
   }
@@ -922,94 +966,79 @@ void StatsTracker::computeSinkDistance() {
     for (unsigned s : succs[id])
       preds[s].push_back(id);
 
-  auto calleeReturn = [&](Function *f) -> uint64_t {
-    if (f->isDeclaration())
-      return f->doesNotReturn() ? 0 : 1;
-    return sm.getIndexedValue(stats::minDistToReturn,
-                              infos.getInfo(f->getEntryBlock().front()).id);
-  };
-  auto calleeSink = [&](Function *f) -> uint64_t {
-    if (f->isDeclaration())
-      return 0;
-    return sm.getIndexedValue(stats::minDistToSink,
-                              infos.getInfo(f->getEntryBlock().front()).id);
-  };
+  unsigned sinks = 0;
+  for (Instruction *I : insts)
+    sinks += isSink(I);
+  if (!sinks)
+    klee_warning("nurs:sink found no SINK-REACHED marker");
 
-  std::deque<unsigned> wl;
-  std::vector<char> queued(n, 0);
-  auto enqueue = [&](unsigned id) {
-    if (!queued[id]) {
-      queued[id] = 1;
-      wl.push_back(id);
-    }
-  };
-  auto relaxReturn = [&](unsigned id) {
-    Instruction *I = byId[id];
-    uint64_t best = isa<ReturnInst>(I) ? 1 : 0;
-    if (const auto *cb = dyn_cast<CallBase>(I);
-        cb && !isa<InlineAsm>(cb->getCalledOperand())) {
-      uint64_t bestCallee = 0;
-      forTargets(id, [&](Function *c) {
-        uint64_t d = calleeReturn(c);
-        if (d && (bestCallee == 0 || d < bestCallee))
-          bestCallee = d;
+  auto solve = [&](const std::vector<const std::vector<Function *> *> &targets,
+                   Statistic &R, Statistic &T) {
+    auto forTargets = [&](unsigned id, auto body) {
+      if (directTarget[id])
+        body(directTarget[id]);
+      else if (targets[id])
+        for (Function *c : *targets[id])
+          body(c);
+    };
+    std::vector<std::vector<unsigned>> callers(n);
+    for (Instruction *I : insts) {
+      unsigned id = infos.getInfo(*I).id;
+      forTargets(id, [&](Function *callee) {
+        if (!callee->isDeclaration())
+          callers[infos.getInfo(callee->getEntryBlock().front()).id]
+              .push_back(id);
       });
-      if (bestCallee)
-        for (unsigned s : succs[id]) {
-          uint64_t d = sm.getIndexedValue(stats::minDistToReturn, s);
-          if (!d)
-            continue;
-          uint64_t val = 1 + bestCallee + d;
-          if (best == 0 || val < best)
-            best = val;
-        }
-    } else if (!isa<ReturnInst>(I)) {
-      for (unsigned s : succs[id]) {
-        uint64_t d = sm.getIndexedValue(stats::minDistToReturn, s);
-        if (!d)
-          continue;
-        uint64_t val = 1 + d;
-        if (best == 0 || val < best)
-          best = val;
-      }
     }
-    uint64_t cur = sm.getIndexedValue(stats::minDistToReturn, id);
-    if (best && (cur == 0 || best < cur)) {
-      sm.setIndexedValue(stats::minDistToReturn, id, best);
+    auto calleeReturn = [&](Function *f) -> uint64_t {
+      if (f->isDeclaration())
+        return f->doesNotReturn() ? 0 : 1;
+      return sm.getIndexedValue(R, infos.getInfo(f->getEntryBlock().front()).id);
+    };
+    auto calleeSink = [&](Function *f) -> uint64_t {
+      if (f->isDeclaration())
+        return 0;
+      return sm.getIndexedValue(T, infos.getInfo(f->getEntryBlock().front()).id);
+    };
+
+    std::deque<unsigned> wl;
+    std::vector<char> queued(n, 0);
+    auto enqueue = [&](unsigned id) {
+      if (!queued[id]) {
+        queued[id] = 1;
+        wl.push_back(id);
+      }
+    };
+    auto propagate = [&](unsigned id) {
       if (isEntry[id])
         for (unsigned c : callers[id])
           enqueue(c);
       for (unsigned p : preds[id])
         enqueue(p);
-    }
-  };
-  auto relaxSink = [&](unsigned id) {
-    Instruction *I = byId[id];
-    uint64_t best = isSink(I) ? 1 : 0;
-    if (!isSink(I)) {
+    };
+    auto relaxReturn = [&](unsigned id) {
+      Instruction *I = byId[id];
+      uint64_t best = leavesFrame(I) ? 1 : 0;
       if (const auto *cb = dyn_cast<CallBase>(I);
           cb && !isa<InlineAsm>(cb->getCalledOperand())) {
         uint64_t bestCallee = 0;
         forTargets(id, [&](Function *c) {
-          uint64_t d = calleeSink(c);
-          if (d && (best == 0 || 1 + d < best))
-            best = 1 + d;
-          d = calleeReturn(c);
+          uint64_t d = calleeReturn(c);
           if (d && (bestCallee == 0 || d < bestCallee))
             bestCallee = d;
         });
         if (bestCallee)
           for (unsigned s : succs[id]) {
-            uint64_t d = sm.getIndexedValue(stats::minDistToSink, s);
+            uint64_t d = sm.getIndexedValue(R, s);
             if (!d)
               continue;
             uint64_t val = 1 + bestCallee + d;
             if (best == 0 || val < best)
               best = val;
           }
-      } else {
+      } else if (!isa<ReturnInst>(I)) {
         for (unsigned s : succs[id]) {
-          uint64_t d = sm.getIndexedValue(stats::minDistToSink, s);
+          uint64_t d = sm.getIndexedValue(R, s);
           if (!d)
             continue;
           uint64_t val = 1 + d;
@@ -1017,77 +1046,101 @@ void StatsTracker::computeSinkDistance() {
             best = val;
         }
       }
+      uint64_t cur = sm.getIndexedValue(R, id);
+      if (best && (cur == 0 || best < cur)) {
+        sm.setIndexedValue(R, id, best);
+        propagate(id);
+      }
+    };
+    auto relaxSink = [&](unsigned id) {
+      Instruction *I = byId[id];
+      uint64_t best = isSink(I) ? 1 : 0;
+      if (!isSink(I)) {
+        if (const auto *cb = dyn_cast<CallBase>(I);
+            cb && !isa<InlineAsm>(cb->getCalledOperand())) {
+          uint64_t bestCallee = 0;
+          forTargets(id, [&](Function *c) {
+            uint64_t d = calleeSink(c);
+            if (d && (best == 0 || 1 + d < best))
+              best = 1 + d;
+            d = calleeReturn(c);
+            if (d && (bestCallee == 0 || d < bestCallee))
+              bestCallee = d;
+          });
+          if (bestCallee)
+            for (unsigned s : succs[id]) {
+              uint64_t d = sm.getIndexedValue(T, s);
+              if (!d)
+                continue;
+              uint64_t val = 1 + bestCallee + d;
+              if (best == 0 || val < best)
+                best = val;
+            }
+        } else {
+          for (unsigned s : succs[id]) {
+            uint64_t d = sm.getIndexedValue(T, s);
+            if (!d)
+              continue;
+            uint64_t val = 1 + d;
+            if (best == 0 || val < best)
+              best = val;
+          }
+        }
+      }
+      uint64_t cur = sm.getIndexedValue(T, id);
+      if (best && (cur == 0 || best < cur)) {
+        sm.setIndexedValue(T, id, best);
+        propagate(id);
+      }
+    };
+
+    // Return distances first: the sink distance crosses a call at cost R.
+    // Drain the queue for R, then seed it with the sink's predecessors and
+    // drain it for T.
+    for (Instruction *I : insts) {
+      unsigned id = infos.getInfo(*I).id;
+      if (leavesFrame(I)) {
+        sm.setIndexedValue(R, id, 1);
+        propagate(id);
+      }
     }
-    uint64_t cur = sm.getIndexedValue(stats::minDistToSink, id);
-    if (best && (cur == 0 || best < cur)) {
-      sm.setIndexedValue(stats::minDistToSink, id, best);
-      if (isEntry[id])
-        for (unsigned c : callers[id])
-          enqueue(c);
-      for (unsigned p : preds[id])
-        enqueue(p);
+    while (!wl.empty()) {
+      unsigned id = wl.front();
+      wl.pop_front();
+      queued[id] = 0;
+      relaxReturn(id);
+    }
+    for (Instruction *I : insts)
+      if (isSink(I)) {
+        unsigned id = infos.getInfo(*I).id;
+        sm.setIndexedValue(T, id, 1);
+        propagate(id);
+      }
+    while (!wl.empty()) {
+      unsigned id = wl.front();
+      wl.pop_front();
+      queued[id] = 0;
+      relaxSink(id);
     }
   };
+  solve(sigTargets, stats::minDistToReturn, stats::minDistToSink);
+  solve(slotTargets, stats::minDistToReturnSlot, stats::minDistToSinkSlot);
 
-  unsigned sinks = 0;
+  unsigned reachable = 0, reachableSlot = 0;
+  uint64_t maxSlot = 0;
   for (Instruction *I : insts) {
     unsigned id = infos.getInfo(*I).id;
-    if (isa<ReturnInst>(I)) {
-      sm.setIndexedValue(stats::minDistToReturn, id, 1);
-      for (unsigned p : preds[id])
-        enqueue(p);
-      if (isEntry[id])
-        for (unsigned c : callers[id])
-          enqueue(c);
-    }
-    if (isSink(I)) {
-      ++sinks;
-      sm.setIndexedValue(stats::minDistToSink, id, 1);
-      for (unsigned p : preds[id])
-        enqueue(p);
-      if (isEntry[id])
-        for (unsigned c : callers[id])
-          enqueue(c);
-    }
-  }
-  if (!sinks)
-    klee_warning("nurs:sink found no SINK-REACHED marker");
-
-  // Return distances first: the sink distance crosses a call at cost R.
-  // The queue holds both kinds of seed. Drain it for R, then reseed the
-  // sink predecessors and drain it for T. Reseeding is the sink's own
-  // predecessors, which relaxSink then walks backward.
-  std::vector<unsigned> sinkSeeds;
-  for (Instruction *I : insts)
-    if (isSink(I)) {
-      unsigned id = infos.getInfo(*I).id;
-      for (unsigned p : preds[id])
-        sinkSeeds.push_back(p);
-      if (isEntry[id])
-        for (unsigned c : callers[id])
-          sinkSeeds.push_back(c);
-    }
-  while (!wl.empty()) {
-    unsigned id = wl.front();
-    wl.pop_front();
-    queued[id] = 0;
-    relaxReturn(id);
-  }
-  for (unsigned id : sinkSeeds)
-    enqueue(id);
-  while (!wl.empty()) {
-    unsigned id = wl.front();
-    wl.pop_front();
-    queued[id] = 0;
-    relaxSink(id);
-  }
-
-  unsigned reachable = 0;
-  for (Instruction *I : insts)
-    if (sm.getIndexedValue(stats::minDistToSink, infos.getInfo(*I).id))
+    if (sm.getIndexedValue(stats::minDistToSink, id))
       ++reachable;
-  klee_message("nurs:sink markers %u, instructions that reach one %u", sinks,
-               reachable);
+    if (uint64_t d = sm.getIndexedValue(stats::minDistToSinkSlot, id)) {
+      ++reachableSlot;
+      maxSlot = std::max(maxSlot, d);
+    }
+  }
+  sinkGuideOffset = maxSlot;
+  klee_message("nurs:sink markers %u, instructions that reach one %u "
+               "(by slot %u; indirect calls %u, narrowed %u)",
+               sinks, reachable, reachableSlot, indirect, narrowed);
 }
 
 uint64_t klee::computeMinDistToUncovered(const KInstruction *ki,

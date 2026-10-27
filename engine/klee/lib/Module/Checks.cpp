@@ -18,6 +18,7 @@ DISABLE_WARNING_PUSH
 DISABLE_WARNING_DEPRECATED_DECLARATIONS
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
+#include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
@@ -35,6 +36,15 @@ DISABLE_WARNING_POP
 
 using namespace llvm;
 using namespace klee;
+
+// A call in a function with a subprogram needs a location (IR verifier);
+// optimized code leaves hoisted instructions without one.
+static void locateCheck(IRBuilder<> &B, Instruction *I) {
+  if (I->getDebugLoc())
+    return;
+  if (DISubprogram *SP = I->getFunction()->getSubprogram())
+    B.SetCurrentDebugLocation(DILocation::get(I->getContext(), 0, 0, SP));
+}
 
 char DivCheckPass::ID;
 
@@ -81,6 +91,7 @@ bool DivCheckPass::runOnModule(Module &M) {
 
   for (auto &divInst : divInstruction) {
     llvm::IRBuilder<> Builder(divInst /* Inserts before divInst*/);
+    locateCheck(Builder, divInst);
     auto denominator =
         Builder.CreateIntCast(divInst->getOperand(1), Type::getInt64Ty(ctx),
                               false, /* sign doesn't matter */
@@ -140,6 +151,7 @@ bool OvershiftCheckPass::runOnModule(Module &M) {
 
   for (auto &shiftInst : shiftInstructions) {
     llvm::IRBuilder<> Builder(shiftInst);
+    locateCheck(Builder, shiftInst);
 
     std::vector<llvm::Value *> args;
 

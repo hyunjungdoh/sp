@@ -79,20 +79,27 @@ std::string stripVersion(StringRef name) {
   return (at == StringRef::npos ? name : name.substr(0, at)).str();
 }
 
+} // namespace
+
+// The environment is the target platform's system libraries, listed once in
+// env.syms; the host the model runs on has no say in it.
 bool environmentSymbol(const std::string &name) {
-  static void *libs[4];
-  static bool ready = false;
-  if (!ready) {
-    ready = true;
-    const char *ns[] = {"libc.so.6", "libm.so.6", "libstdc++.so.6", "libgcc_s.so.1"};
-    for (int i = 0; i < 4; ++i)
-      libs[i] = dlopen(ns[i], RTLD_LAZY);
-  }
-  for (void *h : libs)
-    if (h && dlsym(h, name.c_str()))
-      return true;
-  return false;
+  static const std::set<std::string> syms = [] {
+    std::set<std::string> s;
+    std::ifstream in(SP_ENV_SYMS);
+    if (!in) {
+      errs() << "missing environment symbol list " << SP_ENV_SYMS << "\n";
+      std::exit(1);
+    }
+    for (std::string line; std::getline(in, line);)
+      if (!line.empty() && line[0] != '#')
+        s.insert(line);
+    return s;
+  }();
+  return syms.count(name) != 0;
 }
+
+namespace {
 
 // The stored word is the symbol's address plus the addend. A PC-relative slot
 // or a TLS slot is not reconstructed; the object that holds one stays open.

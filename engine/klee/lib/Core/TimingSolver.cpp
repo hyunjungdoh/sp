@@ -130,6 +130,26 @@ bool TimingSolver::getInitialValues(
   return success;
 }
 
+bool TimingSolver::getInitialValues(
+    const ConstraintSet &constraints, const std::vector<const Array *> &objects,
+    std::vector<std::vector<unsigned char>> &result,
+    SolverQueryMetaData &metaData, bool &hasSolution) {
+  ++stats::queries;
+  hasSolution = true;
+  if (objects.empty())
+    return true;
+
+  TimerStatIncrementer timer(stats::solverTime);
+
+  bool success = solver->getInitialValues(
+      Query(constraints, ConstantExpr::alloc(0, Expr::Bool)), objects, result,
+      hasSolution);
+
+  metaData.queryCost += timer.delta();
+
+  return success;
+}
+
 std::pair<ref<Expr>, ref<Expr>>
 TimingSolver::getRange(const ConstraintSet &constraints, ref<Expr> expr,
                        SolverQueryMetaData &metaData) {

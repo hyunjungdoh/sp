@@ -187,9 +187,20 @@ namespace klee {
     // FIXME: This API is lame. We should probably just provide an API which
     // returns an Assignment object, then clients can get out whatever values
     // they want. This also allows us to optimize the representation.
-    bool getInitialValues(const Query&, 
+    bool getInitialValues(const Query&,
                           const std::vector<const Array*> &objects,
                           std::vector< std::vector<unsigned char> > &result);
+
+    /// getInitialValues - As above, but separates the two failures.
+    ///
+    /// \param [out] hasSolution - On success, whether a satisfying assignment
+    /// exists (result holds one if so).
+    ///
+    /// \return True if the solver decided the query (false: it gave up).
+    bool getInitialValues(const Query&,
+                          const std::vector<const Array*> &objects,
+                          std::vector< std::vector<unsigned char> > &result,
+                          bool &hasSolution);
 
     /// getRange - Compute a tight range of possible values for a given
     /// expression.

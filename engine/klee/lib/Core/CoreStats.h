@@ -57,6 +57,10 @@ namespace stats {
   /// 1/stored^2 is the design weight 1/(d+1)^2.
   extern Statistic minDistToSink;
 
+  /// minDistToReturn and minDistToSink over the call graph of slot targets.
+  extern Statistic minDistToReturnSlot;
+  extern Statistic minDistToSinkSlot;
+
   /// Count branch types in execution tree. Inhibited branches are ignored.
   #undef BTYPE
   #define BTYPE(Name,I) extern Statistic branches ## Name;

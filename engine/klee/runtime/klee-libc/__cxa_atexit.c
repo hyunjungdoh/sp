@@ -9,41 +9,40 @@
 
 #include "klee/klee.h"
 
-#define MAX_ATEXIT 128
+#include <stdlib.h>
 
-static struct {
+/* The C++ ABI sets no limit on registrations (one per static object with a
+ * destructor), so the list grows; it runs last registered first. */
+struct AtExitEntry {
   void (*fn)(void*);
   void *arg;
-  void *dso_handle;
-} AtExit[MAX_ATEXIT];
-static unsigned NumAtExit = 0;
+  struct AtExitEntry *next;
+};
+static struct AtExitEntry *AtExit = 0;
 
 static void RunAtExit(void) __attribute__((destructor));
 static void RunAtExit(void) {
-  unsigned i;
+  struct AtExitEntry *e;
 
-  for (i = NumAtExit - 1; i < MAX_ATEXIT; --i)
-    AtExit[i].fn(AtExit[i].arg);
+  for (e = AtExit; e; e = e->next)
+    e->fn(e->arg);
 }
 
 int __cxa_atexit(void (*fn)(void*),
                  void *arg,
                  void *dso_handle) {
+  struct AtExitEntry *e;
+
   klee_warning_once("FIXME: __cxa_atexit being ignored");
-  
-  /* Better to just report an error here than return 1 (the defined
-   * semantics).
-   */
-  if (NumAtExit == MAX_ATEXIT)
-    klee_report_error(__FILE__,
-                      __LINE__,
-                      "__cxa_atexit: no room in array!",
-                      "exec.err");
-  
-  AtExit[NumAtExit].fn = fn;
-  AtExit[NumAtExit].arg = arg;
-  ++NumAtExit;
-  
+
+  e = malloc(sizeof *e);
+  if (!e)
+    return -1;
+  e->fn = fn;
+  e->arg = arg;
+  e->next = AtExit;
+  AtExit = e;
+
   return 0;
 }
 

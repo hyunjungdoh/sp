@@ -34,22 +34,13 @@ KTestObject *SeedInfo::getNextInput(const MemoryObject *mo,
         if (used.insert(obj).second)
           return obj;
     }
-    
-    // If first unused input matches in size then accept that as
-    // well.
-    for (i=0; i<input->numObjects; ++i)
-      if (!used.count(&input->objects[i]))
-        break;
-    if (i<input->numObjects) {
-      KTestObject *obj = &input->objects[i];
-      if (obj->numBytes == mo->size) {
-        used.insert(obj);
-        klee_warning_once(mo, "using seed input %s[%d] for: %s (no name match)",
-                          obj->name, obj->numBytes, mo->name.c_str());
-        return obj;
-      }
-    }
-    
+
+    // A named seed binds only to the object of that name. The old positional
+    // fallback (take the first unused object of matching size) corrupts a
+    // concolic seed that sets some objects by name: an earlier unseeded object
+    // (e.g. null.0) would consume a later named value (e.g. make.N) just
+    // because the sizes match. An unmatched object gets no seed; concolic then
+    // takes its default (0) or, for a data object, its corpus binding.
     klee_warning_once(mo, "no seed input for: %s", mo->name.c_str());
     return 0;
   } else {

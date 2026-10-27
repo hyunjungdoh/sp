@@ -128,6 +128,39 @@ bool isPointer(const DIType *T) {
                D->getTag() == dwarf::DW_TAG_rvalue_reference_type);
 }
 
+// The object a pointer parameter T points to, or null when it is const
+// (the callee may not write it) or T is not a pointer.
+const DIType *writablePointee(const DIType *T) {
+  T = strip(T);
+  if (!isPointer(T))
+    return nullptr;
+  const DIType *U = cast<DIDerivedType>(T)->getBaseType();
+  for (auto *D = dyn_cast_or_null<DIDerivedType>(U); D; D = dyn_cast_or_null<DIDerivedType>(D->getBaseType())) {
+    if (D->getTag() == dwarf::DW_TAG_const_type)
+      return nullptr;
+    if (D->getTag() != dwarf::DW_TAG_typedef && D->getTag() != dwarf::DW_TAG_volatile_type)
+      break;
+  }
+  return strip(U);
+}
+
+// A3 for results: a writable byte pointer slot (T** with T void or a byte)
+// directly followed by a writable integer slot is an out buffer and its
+// length. Returns the integer width, or 0.
+unsigned outBufferPair(const DIType *buf, const DIType *len) {
+  const DIType *P = writablePointee(buf);
+  if (!P || !isPointer(P))
+    return 0;
+  const DIType *E = strip(cast<DIDerivedType>(P)->getBaseType());
+  auto *EB = dyn_cast_or_null<DIBasicType>(E);
+  if (E && !(EB && EB->getSizeInBits() == 8))
+    return 0;
+  auto *L = dyn_cast_or_null<DIBasicType>(writablePointee(len));
+  if (!L || (L->getEncoding() != dwarf::DW_ATE_unsigned && L->getEncoding() != dwarf::DW_ATE_signed))
+    return 0;
+  return (unsigned)L->getSizeInBits();
+}
+
 // Whether a comparison of a pointer with null gives null a meaning: some
 // branch on it sends null to a block from which the function can return.
 // A test whose null side cannot return (an assertion) states that null is
@@ -2580,7 +2613,7 @@ Client::Plan Client::plan(const std::vector<std::pair<std::vector<std::string>, 
   // W의 입력 형식인자(스칼라/바이트/텍스트)에서 전방 데이터흐름으로 전파해, tainted
   // 값이 store되는 필드를 모은다. 상수나 다른 고정 라이브러리 상태만 쓰는 store는
   // 여기 없다 — 그래서 경계 셀의 writer는 실제로 인자가 그 칸에 닿을 때만 인정된다.
-  std::map<Function *, std::set<FieldKey>> taintCache;
+    std::map<std::pair<Function *, int>, std::set<FieldKey>> taintCache;
   for (const auto &[seq, phi] : ws) {
     if (seq.empty())
       continue;
@@ -2665,15 +2698,19 @@ Client::Plan Client::plan(const std::vector<std::pair<std::vector<std::string>, 
     // 클로저를 전방 전파한다: 값 연산(캐스트·산술·GEP·phi 등)은 taint를 잇고, tainted
     // 포인터의 load도 잇고(바이트 버퍼 읽기), 호출 인자는 피호출자 형식인자로 넘긴다.
     // tainted 값이 store되는 (타입,오프셋)을 모은다.
-    std::function<const std::set<FieldKey> &(Function *)> taintWritten = [&](Function *W) -> const std::set<FieldKey> & {
-      auto it = taintCache.find(W);
+    // only >= 0이면 그 형식인자 하나에서만 시작한다(생성자 레버: 어느 인자가 어느
+    // 셀을 정하는지).
+    std::function<const std::set<FieldKey> &(Function *, int)> taintFrom = [&](Function *W, int only) -> const std::set<FieldKey> & {
+      auto it = taintCache.find({W, only});
       if (it != taintCache.end())
         return it->second;
-      std::set<FieldKey> &out = taintCache[W]; // 재귀 차단용으로 먼저 삽입
+      std::set<FieldKey> &out = taintCache[{W, only}]; // 재귀 차단용으로 먼저 삽입
       auto sig = signature(W);
       auto at = irParams(W);
       std::map<Function *, std::set<unsigned>> argT;
       for (unsigned i = 0; i < W->arg_size(); ++i) {
+        if (only >= 0 && (unsigned)only != i)
+          continue;
         Type *T = W->getArg(i)->getType();
         int k = i < at.size() ? at[i] : -1;
         Kind kd = k >= 0 ? sig[k].kind : (T->isIntegerTy() ? Kind::Scalar : Kind::Object);
@@ -2732,6 +2769,7 @@ Client::Plan Client::plan(const std::vector<std::pair<std::vector<std::string>, 
       }
       return out;
     };
+    auto taintWritten = [&](Function *W) -> const std::set<FieldKey> & { return taintFrom(W, -1); };
     // 경계 셀 c의 writer W가 클라이언트 레버를 나르는가: W가 c를 직접 (입력으로) 쓰거나,
     // §3.6 복사의 소스 필드 d를 (입력으로) 쓴다.
     auto carries = [&](Function *W, const Cell &c, Function *En) {
@@ -2925,6 +2963,52 @@ Client::Plan Client::plan(const std::vector<std::pair<std::vector<std::string>, 
         continue;
       P.cellWriters.push_back({c, w});
       writerSet.insert(w.begin(), w.end());
+    }
+    // §3.6 생성자 레버. 보유(불투명) 인자 안의 값 셀 c는 클라이언트가 직접 쓸 수도,
+    // 보유 객체를 받는 writer로 쓸 수도 없는 경우가 있다: 값이 생산자의 입력 인자에서
+    // 흘러든 때(예: fz_new_font_from_memory(..., use_glyph_bbox) → font->use_glyph_bbox).
+    // 그 생산자의 그 형식인자가 c의 레버다. §3.5 투영과 무관하다 — 투영은 클라이언트가
+    // 무엇을 직접 써야 하는가를 말하고, 레버는 클라이언트가 자기 인자를 어떻게 고르는가를
+    // 말한다. 생산자마다 형식인자별 taint로 어느 인자가 c에 닿는지 가른다.
+    for (const Cell &c : phi) {
+      if (c.type.empty() || (c.op != "=" && c.op != "!=") || c.file)
+        continue;
+      if (c.root < 0 || (size_t)c.root >= atE.size() || atE[c.root] < 0)
+        continue;
+      const Param &rp = sigE[atE[c.root]];
+      if (!held(rp) || ownCell(sigE, atE, c))
+        continue;
+      std::vector<int64_t> vs;
+      for (const std::string &v : c.values) {
+        if (auto s = asI64(v))
+          vs.push_back(*s);
+        else if (auto u = asU64(v))
+          vs.push_back((int64_t)*u);
+        else {
+          vs.clear();
+          break;
+        }
+      }
+      if (vs.empty())
+        continue;
+      auto pit = producers.find(rp.type);
+      if (pit == producers.end())
+        continue;
+      for (const Producer &pr : pit->second) {
+        Function *W = pr.fn;
+        for (unsigned i = 0; i < W->arg_size(); ++i) {
+          if (!W->getArg(i)->getType()->isIntegerTy())
+            continue;
+          if (!taintFrom(W, (int)i).count({c.type, c.off}))
+            continue;
+          auto &ls = P.levers[W];
+          bool dup = false;
+          for (const Lever &l : ls)
+            dup = dup || (l.formal == i && l.text == c.text);
+          if (!dup)
+            ls.push_back({i, c.op == "=", vs, c.text});
+        }
+      }
     }
     // This witness alone. A call discharges a cell when it is an interface
     // function other than the witness entry and its closure stores the
@@ -3302,6 +3386,13 @@ void Client::report(const Plan &P, raw_ostream &out) const {
     out << "\n";
   }
   out << "writers " << P.writers.size() << "\n";
+  for (const auto &[W, ls] : P.levers)
+    for (const Lever &l : ls) {
+      out << "lever " << W->getName() << " arg" << l.formal << " " << (l.eq ? "=" : "!=");
+      for (int64_t v : l.values)
+        out << " " << v;
+      out << " : " << l.text << "\n";
+    }
   for (const std::string &v : P.verdicts)
     out << v << "\n";
   for (const std::string &o : P.obligations)
@@ -3350,7 +3441,7 @@ struct Builder {
   FunctionCallee mkSym, silentExit, mallocF, memcpyF;
   GlobalVariable *data = nullptr, *cursor = nullptr;
   unsigned names = 0;
-  std::map<std::pair<FunctionType *, const void *>, Function *> callbacks;
+  std::map<std::tuple<FunctionType *, const void *, const void *>, Function *> callbacks;
 
   Builder(Module &H, const DataLayout &dl, uint64_t n, unsigned L)
       : H(H), ctx(H.getContext()), dl(dl), n(n ? n : 1), textBound(L) {
@@ -3427,9 +3518,11 @@ struct Builder {
   Value *bytes(IRBuilder<> &B, uint64_t elem = 1) {
     uint64_t size = capacity(elem) * elem;
     Value *p = B.CreateCall(mallocF, {B.getInt64(size)});
-    B.CreateCall(mkSym, {p, B.getInt64(size), B.CreateGlobalStringPtr("bytes." + std::to_string(names++))});
+    lastBytes = "bytes." + std::to_string(names++);
+    B.CreateCall(mkSym, {p, B.getInt64(size), B.CreateGlobalStringPtr(lastBytes)});
     return p;
   }
+  std::string lastBytes;
 
   // A fresh object of size bytes, every byte the client's choice.
   Value *object(IRBuilder<> &B, uint64_t size) {
@@ -3444,17 +3537,34 @@ struct Builder {
   // whose declared result is a pointer of source type returns a client
   // value of that type, which 'result' builds (key names the declared
   // type). Another function returning a pointer returns fresh memory as
-  // large as its largest size argument, and writes nothing into memory it
-  // is given.
+  // large as its largest size argument. A callback writes nothing into memory
+  // it is given, except an out buffer and its length (outBufferPair, from
+  // the source type ST): there it stores the input bytes and their count.
   Function *callback(FunctionType *FT, const void *key = nullptr,
-                     const std::function<Value *(IRBuilder<> &)> &result = nullptr) {
-    auto it = callbacks.find({FT, key});
+                     const std::function<Value *(IRBuilder<> &)> &result = nullptr,
+                     const DISubroutineType *ST = nullptr) {
+    auto it = callbacks.find({FT, key, ST});
     if (it != callbacks.end())
       return it->second;
     Function *F = Function::Create(FT, GlobalValue::InternalLinkage, "client.callback." + std::to_string(callbacks.size()), &H);
-    callbacks[{FT, key}] = F;
+    callbacks[{FT, key, ST}] = F;
     auto *BB = BasicBlock::Create(ctx, "entry", F);
     IRBuilder<> B(BB);
+    if (auto ts = ST ? ST->getTypeArray() : DITypeRefArray(); ST && ts.size() == F->arg_size() + 1)
+      for (unsigned i = 0; i + 1 < F->arg_size(); ++i) {
+        unsigned bits = outBufferPair(ts[i + 1], ts[i + 2]);
+        Argument *buf = F->getArg(i), *len = F->getArg(i + 1);
+        if (!bits || !buf->getType()->isPointerTy() || !len->getType()->isPointerTy())
+          continue;
+        auto *put = BasicBlock::Create(ctx, "out", F), *next = BasicBlock::Create(ctx, "out.done", F);
+        B.CreateCondBr(B.CreateOr(B.CreateIsNull(buf), B.CreateIsNull(len)), next, put);
+        B.SetInsertPoint(put);
+        B.CreateStore(data, buf);
+        B.CreateStore(B.getIntN(bits, n), len);
+        B.CreateBr(next);
+        B.SetInsertPoint(next);
+        ++i;
+      }
     Type *R = FT->getReturnType();
     if (R->isPointerTy() && result) {
       B.CreateRet(result(B));
@@ -4374,6 +4484,9 @@ void Client::emit(const Plan &P, Module &H) const {
   // in place. An aggregate the ABI splits into eightbytes is read as
   // formals i, i+1, ...; F is null where no call reads it (a callback's
   // result), and the texts there have no classes.
+  // The data object the last top-level pointer argument built is, when it
+  // is a plain buffer.
+  std::string argBytes;
   struct Where {
     Function *F = nullptr;
     unsigned i = 0;
@@ -4494,14 +4607,15 @@ void Client::emit(const Plan &P, Module &H) const {
       bool record = RC && RC->getTag() != dwarf::DW_TAG_enumeration_type && RC->getTag() != dwarf::DW_TAG_array_type;
       // The callback is a function of its own: it shares no object under
       // construction in the caller.
+      auto *ST = cast<DISubroutineType>(P);
       Function *cb = record ? K.callback(FT, R, [&, R](IRBuilder<> &D) {
         auto outer = std::move(enclosing);
         enclosing.clear();
         Value *v = pointer(D, R, d, false, Where{});
         enclosing = std::move(outer);
         return v;
-      })
-                                       : K.callback(FT);
+      }, ST)
+                                       : K.callback(FT, nullptr, nullptr, ST);
       return nullOr(C, nullable, [cb](IRBuilder<> &) { return cb; });
     }
     if (auto *B = dyn_cast_or_null<DIBasicType>(P))
@@ -4525,7 +4639,10 @@ void Client::emit(const Plan &P, Module &H) const {
       return empty(C, nullable);
     if (!ptrs) {
       uint64_t elem = P ? std::max<uint64_t>(1, P->getSizeInBits() / 8) : 1;
-      return nullOr(C, nullable, [&](IRBuilder<> &D) { return K.bytes(D, elem); });
+      Value *v = nullOr(C, nullable, [&](IRBuilder<> &D) { return K.bytes(D, elem); });
+      if (w.F && w.path.empty())
+        argBytes = K.lastBytes;
+      return v;
     }
     if (d == 0) {
       for (auto it = enclosing.rbegin(); it != enclosing.rend(); ++it)
@@ -4563,6 +4680,11 @@ void Client::emit(const Plan &P, Module &H) const {
     std::vector<Value *> args;
     std::vector<std::pair<AllocaInst *, std::string>> outs;
     Value *storage = nullptr;
+    // The data object a raw buffer argument holds, and each length object
+    // with the buffers it bounds: a length that bounds one data buffer is
+    // the size of the file in it (named length:<data>).
+    std::map<unsigned, std::string> dataArg;
+    std::vector<std::pair<CallInst *, std::vector<unsigned>>> lengths;
     for (unsigned i = 0; i < FT->getNumParams(); ++i) {
       Type *T = FT->getParamType(i);
       if (i < shift) {
@@ -4610,6 +4732,7 @@ void Client::emit(const Plan &P, Module &H) const {
         continue;
       }
       Value *v = nullptr;
+      bool plainArg = false;
       if (T->isPointerTy() && p.va) {
         // The client's own va_list, started in a variadic function of the
         // client that received no further arguments.
@@ -4671,12 +4794,20 @@ void Client::emit(const Plan &P, Module &H) const {
           break;
         }
         default:
-          v = at[i] >= 0 ? pointer(C, declared(at[i]), objectDepth, nullable, Where{F, i})
-                         : nullOr(C, nullable, [&](IRBuilder<> &D) { return K.bytes(D, p.elem); });
+          if (at[i] >= 0) {
+            argBytes.clear();
+            v = pointer(C, declared(at[i]), objectDepth, nullable, Where{F, i});
+            if (!argBytes.empty())
+              dataArg[i] = argBytes;
+            break;
+          }
+          v = nullOr(C, nullable, [&](IRBuilder<> &D) { return K.bytes(D, p.elem); });
+          dataArg[i] = K.lastBytes;
           break;
         }
       } else if (auto bs = lengthOf(F, i); T->isIntegerTy() && !bs.empty()) {
         v = K.symbolic(C, T, "length");
+        lengths.push_back({cast<CallInst>(cast<Instruction>(v)->getPrevNode()), bs});
         // The length counts elements or bytes; either way it stays within
         // a buffer when it is at most the element count: a buffer of N
         // bytes, a text of L characters, or the one object V-Obj builds. It
@@ -4693,9 +4824,49 @@ void Client::emit(const Plan &P, Module &H) const {
           n = std::min(n, nb);
         }
         K.require(C, C.CreateICmpULE(v, ConstantInt::get(T, n)));
-      } else
+      } else {
         v = K.symbolic(C, T, "arg");
+        plainArg = true;
+      }
+      // §3.6 생성자 레버: 이 형식인자가 경로 셀의 값을 정하면 클라이언트는 셀이
+      // 요구하는 값을 고른다 — 설정 가드와 같은 의미로, 경로를 가르지 않고 만족하는
+      // 값 중에서(만족하지 않는 symbolic 값은 대표값으로 접는다).
+      if (T->isIntegerTy())
+        if (auto lit = P.levers.find(F); lit != P.levers.end())
+          for (const Lever &l : lit->second) {
+            if (l.formal != i)
+              continue;
+            if (l.eq && l.values.size() == 1 && plainArg) {
+              v = ConstantInt::get(T, (uint64_t)l.values[0], true);
+              continue;
+            }
+            Value *m = l.eq ? C.getFalse() : C.getTrue();
+            for (int64_t k : l.values) {
+              Value *e = C.CreateICmpEQ(v, ConstantInt::get(T, (uint64_t)k, true));
+              m = l.eq ? C.CreateOr(m, e) : C.CreateAnd(m, C.CreateNot(e));
+            }
+            int64_t canon = 0;
+            if (l.eq)
+              canon = l.values[0];
+            else
+              while (std::find(l.values.begin(), l.values.end(), canon) != l.values.end())
+                ++canon;
+            v = C.CreateSelect(m, v, ConstantInt::get(T, (uint64_t)canon, true));
+          }
       args.push_back(v);
+    }
+    for (auto &[mk, bs] : lengths) {
+      std::set<std::string> data;
+      bool raw = true;
+      for (unsigned b : bs) {
+        auto d = dataArg.find(b);
+        if (d == dataArg.end())
+          raw = false;
+        else
+          data.insert(d->second);
+      }
+      if (raw && data.size() == 1)
+        mk->setArgOperand(2, C.CreateGlobalStringPtr("length:" + *data.begin()));
     }
     // Variadic: the client may pass any further integers.
     if (FT->isVarArg())
@@ -4747,9 +4918,22 @@ void Client::emit(const Plan &P, Module &H) const {
               Value *e = W.CreateICmpEQ(v, ConstantInt::get(IT, (uint64_t)k, true));
               m = g.eq ? W.CreateOr(m, e) : W.CreateAnd(m, W.CreateNot(e));
             }
-            K.require(W, m);
-            if (g.config)
-              W.CreateStore(v, at);
+            if (!g.config) {
+              K.require(W, m);
+              continue;
+            }
+            // §4 설정: 값은 클라이언트의 것이므로 경로를 가르지 않고 만족하는 값
+            // 중에서 고른다 — 만족하지 않는 symbolic 값은 대표값(등식: 첫 값,
+            // 부등식: 제외되지 않은 최소 음이 아닌 값)으로 접는다. 시드 경로가
+            // 설정을 만족한 채 시작하고(§6), 값 공간은 만족 집합 전체다.
+            int64_t canon = 0;
+            if (g.eq)
+              canon = g.values[0];
+            else
+              while (std::find(g.values.begin(), g.values.end(), canon) != g.values.end())
+                ++canon;
+            v = W.CreateSelect(m, v, ConstantInt::get(IT, (uint64_t)canon, true));
+            W.CreateStore(v, at);
           }
         });
       K.oneOf(C, wit, "witness");

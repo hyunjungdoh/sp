@@ -69,6 +69,12 @@ public:
                         std::vector<std::vector<unsigned char>> &result,
                         SolverQueryMetaData &metaData);
 
+  /// True if decided; hasSolution then says whether result is a model.
+  bool getInitialValues(const ConstraintSet &,
+                        const std::vector<const Array *> &objects,
+                        std::vector<std::vector<unsigned char>> &result,
+                        SolverQueryMetaData &metaData, bool &hasSolution);
+
   std::pair<ref<Expr>, ref<Expr>> getRange(const ConstraintSet &,
                                            ref<Expr> query,
                                            SolverQueryMetaData &metaData);
