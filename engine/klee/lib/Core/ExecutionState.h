@@ -262,6 +262,11 @@ public:
   /// it is next selected; the model becomes its seed, or it is discarded.
   bool pendingSeed = false;
 
+  /// @brief Concolic mode: generation of the input this state follows (or,
+  /// when pending, will follow). Seeds are generation 0; a flip of a state of
+  /// generation k is generation k+1.
+  unsigned gen = 0;
+
   /// @brief Concolic mode: times this lineage has flipped each branch
   /// instruction in each seed direction (at most --concolic-flip-bound).
   /// The third key is the constant the branch compares its symbolic operand

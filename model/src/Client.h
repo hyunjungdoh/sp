@@ -1,8 +1,12 @@
 #pragma once
 
 #include "Model.h"
+#include <functional>
+#include <memory>
+#include <optional>
 #include <tuple>
 
+#include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/Transforms/Utils/Cloning.h"
@@ -150,6 +154,14 @@ public:
     std::vector<Realized> cells;
     std::vector<Function *> cover;
     std::vector<std::pair<Function *, Keyed>> keyed;
+    // §3.9 정의 E: per Construct cell established by a store, the store's
+    // position and the may sequence that reaches it.
+    std::vector<std::string> established;
+    // 정의 M: the calls barred from realizing a cell, with the obligation
+    // they leave at a rejected constant.
+    std::vector<std::string> excluded;
+    // The function sequence the plan is for, when it answers a 정의 E query.
+    std::vector<std::string> seq;
     bool pass = false;
   };
   using Witnesses = std::vector<std::pair<std::vector<std::string>, std::vector<Cell>>>;
@@ -188,6 +200,15 @@ public:
 
   // §3.8: the key setters of each witness, aligned with plan()'s witnesses.
   std::vector<std::vector<Keyed>> keyedIn;
+  // §3.9 정의 E: the may layer's first satisfiable sequence from one of the
+  // start functions to a source line, or none.
+  struct Reached {
+    std::vector<std::string> seq;
+    std::vector<Cell> phi;
+    std::vector<Keyed> keyed;
+  };
+  std::function<std::optional<Reached>(const std::string &file, unsigned line, const std::set<std::string> &starts)>
+      reach;
 
   Client(Module &down, Module &up, const fs::path &dir);
   static std::set<std::string> downstreamInterface(const fs::path &dir);
@@ -238,6 +259,11 @@ private:
   FnSet ifaceD, ifaceU;
   FnMap<FnSet> calls;
   FnMap<std::set<std::pair<std::pair<std::string, int64_t>, std::string>>> stores;
+  // Fields a function writes a value that is neither a constant nor a copy
+  // of another field (§3.9 정의 E).
+  FnMap<std::set<std::pair<std::string, int64_t>>> inputStores;
+  // The copies a function's own stores make: destination field to sources.
+  FnMap<std::map<std::pair<std::string, int64_t>, std::set<std::pair<std::string, int64_t>>>> copyStores;
   // Byte ranges memory intrinsics write: (struct, offset) and a length,
   // INT64_MAX when the length is not constant.
   FnMap<std::vector<std::tuple<std::string, int64_t, int64_t>>> ranges;
@@ -383,6 +409,47 @@ private:
   static Field fieldOf(const Cell &c) { return {c.type, c.off}; }
   // The integer values of a cell's atom, false when one is not a constant.
   static bool intValues(const Cell &c, std::vector<int64_t> &vs);
+  // §3.9 정의 M: what a function leaves in fields on every returning path.
+  // A field holds the constant of fixed, else nothing known when it is a
+  // hole, else the value of the last fill covering it ("*": nothing known).
+  struct MustFill {
+    std::string type;
+    int64_t off = 0, len = 0;
+    std::string val;
+    bool operator==(const MustFill &o) const {
+      return type == o.type && off == o.off && len == o.len && val == o.val;
+    }
+  };
+  struct MustState {
+    std::map<Field, std::string> fixed;
+    std::vector<MustFill> fills;
+    std::set<Field> holes;
+    std::string at(const Field &f) const;
+  };
+  // A write through formal `formal` of len bytes (lenFormal >= 0: the
+  // length is that formal) of value val ("0", "*", or "#j" for formal j).
+  struct FormalWrite {
+    unsigned formal = 0;
+    std::string val;
+    int64_t len = 0;
+    int lenFormal = -1;
+    bool operator==(const FormalWrite &o) const {
+      return formal == o.formal && val == o.val && len == o.len && lenFormal == o.lenFormal;
+    }
+  };
+  struct MustSummary {
+    MustState post;
+    std::vector<FormalWrite> writes;
+    std::set<unsigned> clobbers;
+  };
+  mutable FnMap<MustSummary> mustOf;
+  mutable FnSet mustBusy;
+  mutable std::unique_ptr<TargetLibraryInfoImpl> libImpl;
+  mutable std::unique_ptr<TargetLibraryInfo> libSpec;
+  const TargetLibraryInfo &libInfo() const;
+  const MustSummary *mustOnReturn(Function *F) const;
+  // 정의 M: W, once it returns, leaves c's field at a constant φ_c rejects.
+  bool contradicts(Function *W, const Cell &c) const;
   // The held type of argument root of E, or "".
   std::string heldType(Function *E, int root) const;
   // The cell lies in a public object the client passes to E.
@@ -390,6 +457,11 @@ private:
   // §3.6 copy map: the stores in F's inner closure of a value loaded from
   // one field into another, as destination -> sources.
   const std::map<Field, std::set<Field>> &copies(Function *F) const;
+  mutable FnMap<std::map<Field, std::set<Field>>> allCopiesOf;
+  // The same over F's whole closure, the scope storesInput reads.
+  const std::map<Field, std::set<Field>> &allCopies(Function *F) const;
+  // The fields a store copies from: those of the load its value is.
+  std::set<Field> copySources(StoreInst *S) const;
   mutable FnMap<std::map<Field, std::set<Field>>> copiesOf;
   // The interface functions that set a source F copies into c's field.
   std::vector<Function *> copySetters(Function *F, const Cell &c) const;
@@ -403,11 +475,11 @@ private:
   // W stores a value of its arguments to c's field or a field E copies
   // into it.
   bool carries(Function *W, const Cell &c, Function *E) const;
-  // §7: F's inner closure calls an input primitive.
+  // §7: F's closure calls an input primitive.
   bool readsInput(Function *F) const;
   mutable FnMap<bool> readsOf;
-  // Some store F's closure executes writes to the field a non-constant, or
-  // a constant that satisfies c.
+  // Some store F's closure executes writes to the field a value that is
+  // neither a constant nor a copy of another field.
   bool storesInput(Function *F, const Field &f) const;
   bool storesSatisfying(Function *F, const Field &f, const Cell &c) const;
   // §3.5 정리 B(a): every defined function that stores to the field is in U.
@@ -416,7 +488,17 @@ private:
   std::vector<std::pair<Function *, Lever>> leversOf(Function *E, const Cell &c) const;
   bool realizable(Function *E, const Keyed &k) const;
   std::vector<Function *> writeCandidates(Function *E, const std::vector<Function *> &es, const Cell &c) const;
-  bool establishedBy(Function *entry, const Cell &c) const;
+  // §3.9 정의 E. Whether c is established, and when a store establishes it
+  // under Lemma E, the plan of the sequence reaching that store (via).
+  bool establishedBy(Function *E, Function *entry, const Cell &c, const WitnessPlan *&via, std::string &at) const;
+  std::vector<Function *> harnessStarts(Function *E, Function *entry, const Cell &c) const;
+  const WitnessPlan *established(const std::string &file, unsigned line, const std::vector<Function *> &starts) const;
+  // Per query (file, line, starts): absent while computing (a cycle), then
+  // the plan of the reaching sequence when it passes, else null.
+  mutable std::map<std::tuple<std::string, unsigned, std::set<std::string>>, std::unique_ptr<WitnessPlan>> estOf;
+  mutable std::set<std::tuple<std::string, unsigned, std::set<std::string>>> estBusy;
+  // One line per query, for the report: the position and the answer.
+  mutable std::vector<std::string> estLog;
   bool fills(Function *F, const Cell &c) const;
   Function *inputFiller(Function *E, Function *entry, const Cell &c) const;
   WitnessPlan realize(Function *E, const std::vector<Cell> &phi, const std::vector<Keyed> &keyed) const;

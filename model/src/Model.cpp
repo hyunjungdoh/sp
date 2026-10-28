@@ -1217,7 +1217,29 @@ int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, cons
     return v && *v ? (unsigned)std::atoi(v) : dflt;
   };
   client.bounds(bound("CLIENT_K", 2), bound("CLIENT_N", 64), bound("CLIENT_D", 2), bound("CLIENT_L", 2));
+  // §3.9 정의 E: the same may analysis, with a store's line as the target and
+  // the harness calls as the starts.
+  unsigned queries = 0, reached = 0;
+  const std::set<std::string> iface = Client::publicInterface(*down2, *up2, dir);
+  client.reach = [&](const std::string &f, unsigned l, const std::set<std::string> &starts)
+      -> std::optional<Client::Reached> {
+    ++queries;
+    Model m(*down2, *up2, f, l);
+    m.interfaceNames = iface;
+    m.startNames = starts;
+    std::string buf;
+    raw_string_ostream o(buf);
+    m.run(0, o);
+    o.flush();
+    std::istringstream in(buf);
+    Witness w = parseWitness(in);
+    if (w.seq.empty())
+      return std::nullopt;
+    ++reached;
+    return Client::Reached{w.seq, w.phi, w.keyed};
+  };
   Client::Plan plan = client.plan(ws);
+  errs() << "establish queries " << queries << " reached " << reached << "\n";
   std::error_code ec;
   {
     raw_fd_ostream cout((outDir / "client.txt").string(), ec);

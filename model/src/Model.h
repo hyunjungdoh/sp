@@ -443,6 +443,9 @@ class Model {
   // D's interface I: exports an installed header declares. When known,
   // sequences start only at these, the functions a client can call.
   std::set<std::string> interfaceNames;
+  // When set, sequences start only at these interface functions (§3.9
+  // 정의 E: the calls of one harness).
+  std::set<std::string> startNames;
   Model(Module &down, Module &up, StringRef file, unsigned line) : down(down), up(up), dl(down.getDataLayout()), sinkFile(file), sinkLine(line) {}
 
   void run(int seqPick, raw_ostream &out);
@@ -814,6 +817,13 @@ class Model {
 
   // The callee of a direct call, or Res(c) of an indirect call (§3.10).
   std::vector<Function *> targetsOf(CallBase *CB) const;
+
+  // §3.5 정의 R: whether a call can return, the least fixpoint flowReach
+  // uses, and the blocks of F on a path from entry to a return.
+  bool callReturns(CallBase *CB) const;
+  std::unordered_set<const BasicBlock *> returnBlocks(Function *F) const;
+  mutable std::unordered_set<const Function *> returning;
+  mutable bool returningBuilt = false;
 
   // §3.10 Res: the least solution of the function-constant flow over the
   // bodies of D and U, read by targetsOf at every indirect call.

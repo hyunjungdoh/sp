@@ -123,6 +123,7 @@ ExecutionState::ExecutionState(const ExecutionState& state):
     coveredNew(state.coveredNew),
     forkDisabled(state.forkDisabled),
     pendingSeed(state.pendingSeed),
+    gen(state.gen),
     flips(state.flips),
     decisions(state.decisions),
     floor(state.floor),

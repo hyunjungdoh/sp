@@ -1363,6 +1363,74 @@ std::vector<Function *> Model::targetsOf(CallBase *CB) const {
     return it == resolved.end() ? std::vector<Function *>{} : it->second;
   }
 
+static std::unordered_set<const BasicBlock *> blocksToReturn(Function &F, const std::function<bool(CallBase *)> &returns) {
+    auto alive = [&](const BasicBlock *B) {
+      for (const Instruction &I : *B)
+        if (auto *CB = dyn_cast<CallBase>(&I); CB && !returns(const_cast<CallBase *>(CB)))
+          return false;
+      return !isa<UnreachableInst>(B->getTerminator());
+    };
+    std::unordered_set<const BasicBlock *> fwd, out;
+    std::vector<const BasicBlock *> work{&F.getEntryBlock()};
+    while (!work.empty()) {
+      const BasicBlock *B = work.back();
+      work.pop_back();
+      if (!alive(B) || !fwd.insert(B).second)
+        continue;
+      for (const BasicBlock *S : successors(B))
+        work.push_back(S);
+    }
+    for (const BasicBlock *B : fwd)
+      if (isa<ReturnInst>(B->getTerminator()))
+        work.push_back(B);
+    while (!work.empty()) {
+      const BasicBlock *B = work.back();
+      work.pop_back();
+      if (!fwd.count(B) || !out.insert(B).second)
+        continue;
+      for (const BasicBlock *P : predecessors(B))
+        work.push_back(P);
+    }
+    return out;
+  }
+
+bool Model::callReturns(CallBase *CB) const {
+    if (!returningBuilt) {
+      returningBuilt = true;
+      std::vector<Function *> fs;
+      for (Module *M : {&down, &up})
+        for (Function &F : *M)
+          if (!F.isDeclaration())
+            fs.push_back(&F);
+      for (bool changed = true; changed;) {
+        changed = false;
+        for (Function *F : fs)
+          if (!returning.count(F) && !blocksToReturn(*F, [&](CallBase *C) { return callReturns(C); }).empty()) {
+            returning.insert(F);
+            changed = true;
+          }
+      }
+    }
+    if (CB->doesNotReturn())
+      return false;
+    if (const Function *C = klee::calls::callee(*CB)) {
+      if (Function *D = define(C->getName()))
+        return returning.count(D) > 0;
+      return !C->doesNotReturn();
+    }
+    auto ts = targetsOf(CB);
+    if (ts.empty())
+      return true;
+    for (Function *T : ts)
+      if (T->isDeclaration() ? !T->doesNotReturn() : returning.count(T) > 0)
+        return true;
+    return false;
+  }
+
+std::unordered_set<const BasicBlock *> Model::returnBlocks(Function *F) const {
+    return blocksToReturn(*F, [&](CallBase *C) { return callReturns(C); });
+  }
+
 // §3.10 Res: the least solution of one inclusion system in which function
 // constants and abstract objects flow. A cell is an SSA value, the return of
 // a function, an access path, the contents of an object, or the variadic
@@ -1960,7 +2028,7 @@ std::unordered_set<Function *> Model::reachSink() {
 std::vector<Function *> Model::findStarts() {
     std::vector<Function *> v;
     for (Function *E : exports) {
-      if (!cone.count(E))
+      if (!cone.count(E) || (!startNames.empty() && !startNames.count(E->getName().str())))
         continue;
       bool inside = false;
       auto it = interfaceNames.empty() ? callersOf.find(E) : callersOf.end();

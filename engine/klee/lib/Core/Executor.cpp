@@ -1104,10 +1104,8 @@ void Executor::branch(ExecutionState &state,
       if (!seeds.empty())
         parent = std::make_shared<Assignment>(seeds.front().assignment);
       for (unsigned i=0; i<N; ++i)
-        if (result[i] && !seedMap.count(result[i])) {
-          result[i]->pendingSeed = true;
-          result[i]->parentInput = parent;
-        }
+        if (result[i] && !seedMap.count(result[i]))
+          makePending(*result[i], parent);
     }
   }
 
@@ -1377,18 +1375,14 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
       if (trueSeeds.empty()) {
         if (&current == trueState) swapInfo = true;
         seedMap.erase(trueState);
-        if (Concolic) {
-          trueState->pendingSeed = true;
-          trueState->parentInput = parent;
-        }
+        if (Concolic)
+          makePending(*trueState, parent);
       }
       if (falseSeeds.empty()) {
         if (&current == falseState) swapInfo = true;
         seedMap.erase(falseState);
-        if (Concolic) {
-          falseState->pendingSeed = true;
-          falseState->parentInput = parent;
-        }
+        if (Concolic)
+          makePending(*falseState, parent);
       }
       if (swapInfo) {
         std::swap(trueState->coveredNew, falseState->coveredNew);
@@ -1438,7 +1432,7 @@ void Executor::addConstraint(ExecutionState &state, ref<Expr> condition) {
       // A side created without a solver check that is refuted outright: an
       // infeasible flip (ensureSeed sees the false conjunct and drops it).
       seedMap.erase(&state);
-      state.pendingSeed = true;
+      makePending(state, nullptr);
       state.constraints.push_back(condition);
       return;
     }
@@ -1462,11 +1456,11 @@ void Executor::addConstraint(ExecutionState &state, ref<Expr> condition) {
           return !(CE && CE->isFalse());
         });
     if (kept == seeds.begin()) {
+      std::shared_ptr<const Assignment> parent;
       if (!seeds.empty())
-        state.parentInput =
-            std::make_shared<Assignment>(seeds.front().assignment);
+        parent = std::make_shared<Assignment>(seeds.front().assignment);
       seedMap.erase(it);
-      state.pendingSeed = true;
+      makePending(state, parent);
     } else {
       seeds.erase(kept, seeds.end());
     }
@@ -1878,12 +1872,7 @@ void Executor::writeLedger(bool exhausted) {
      << "checkpoints " << ledger.checkpoints << "\n"
      << "checkpoint-at " << ledger.checkpointAt << "\n"
      << "slot-misses " << ledger.slotMisses << "\n"
-     << "gates " << ledger.gates << "\n"
-     << "gates-solved " << ledger.gatesSolved << "\n"
-     << "gate-reached " << ledger.gateReached << "\n"
-     << "gate-sym " << ledger.gateSym << "\n"
-     << "directed " << ledger.directed << "\n"
-     << "directed-solved " << ledger.directedSolved << "\n";
+     << "gates " << ledger.gates << "\n";
   for (auto &kv : ledger.fates)
     *f << "fate:" << kv.first << " " << kv.second << "\n";
 }
@@ -1916,7 +1905,40 @@ uint64_t Executor::sinkOrder(ExecutionState &state) {
                               state.stack.back().minDistToSinkWitOnReturn),
       computeMinDistToSinkSlot(state.pc,
                                state.stack.back().minDistToSinkSlotOnReturn),
-      sinkDistance(state));
+                              sinkDistance(state));
+}
+
+std::pair<unsigned, uint64_t> Executor::orderKey(ExecutionState &state) {
+  if (!statsTracker || !userSearcherRequiresSink() || state.stack.empty())
+    return {state.gen, 1};
+  uint64_t g = sinkOrder(state);
+  return {state.gen, g ? g : ~0ULL};
+}
+
+ExecutionState *Executor::selectConcolic() {
+  if (running && !running->pendingSeed)
+    return running;
+  running = nullptr;
+  std::tuple<unsigned, uint64_t, std::uint32_t> best{~0U, ~0ULL, ~0U};
+  for (ExecutionState *s : states) {
+    auto [gen, g] = orderKey(*s);
+    std::tuple<unsigned, uint64_t, std::uint32_t> k{gen, g, s->getID()};
+    if (!running || k < best) {
+      best = k;
+      running = s;
+    }
+  }
+  return running;
+}
+
+void Executor::makePending(ExecutionState &state,
+                           std::shared_ptr<const Assignment> parent) {
+  if (!state.pendingSeed) {
+    state.pendingSeed = true;
+    ++state.gen;
+  }
+  if (parent)
+    state.parentInput = std::move(parent);
 }
 
 bool Executor::dropUnreachable(ExecutionState *state) {
@@ -1979,62 +2001,20 @@ void Executor::spawnGateFlips(ExecutionState &state, const ref<Expr> &cond,
     executionTree->attach(state.executionTreeNode, gs, &state,
                           BranchType::Conditional);
     ++stats::forks;
-    gs->pendingSeed = true;
-    gs->parentInput = parent;
+    makePending(*gs, parent);
     addConstraint(*gs, gate);
     ++ledger.flips;
     ++ledger.gates;
-    if (dropUnreachable(gs)) // no continuation of gs reaches the sink
-      continue;
-    // Solve the gate now, so it enters the seeded generation and marches to
-    // the installer instead of waiting behind every concrete path for the
-    // pending pool to drain (the generational scheduler solves ordinary flips
-    // only once no seeded state is left, which a large program never reaches).
-    if (!ensureSeed(*gs)) {
-      terminateStateEarlyAlgorithm(*gs, "concolic: infeasible gate",
-                                   StateTerminationType::Replay);
-      continue;
-    }
-    ++ledger.gatesSolved;
+    dropUnreachable(gs); // no continuation of gs reaches the sink
   }
 }
 
-void Executor::promoteDirectedFlip(ExecutionState *a, ExecutionState *b) {
-  if (!Concolic || !statsTracker || !userSearcherRequiresSink() || !a || !b)
-    return;
-  // One side follows the seed; the other is the pending flip of this branch.
-  ExecutionState *seeded = seedMap.count(a) ? a : seedMap.count(b) ? b : nullptr;
-  ExecutionState *flip = (seeded == a) ? b : (seeded == b) ? a : nullptr;
-  if (!seeded || !flip || !flip->pendingSeed || flip->stack.empty() ||
-      seeded->stack.empty())
-    return;
-  // The flip must move strictly closer along the sink-directed order than the
-  // seed does: a finite order (T_st until the installer has run, then the
-  // sink guide) that the seed's side does not beat.
-  uint64_t df = sinkOrder(*flip);
-  if (!df)
-    return;
-  uint64_t ds = sinkOrder(*seeded);
-  if (ds && ds <= df)
-    return;
-  ++ledger.directed;
-  // Solve it now so it runs in the seeded generation toward the installer. On
-  // failure leave it pending: it is still a branch result the caller uses, so
-  // the normal pending path terminates it later rather than freeing it here.
-  if (ensureSeed(*flip))
-    ++ledger.directedSolved;
-  else
-    flip->pendingSeed = true;
-}
-
 void Executor::prunePending() {
-  bool directed = statsTracker && userSearcherRequiresSink();
-  std::vector<std::pair<uint64_t, ExecutionState *>> pending;
+  std::vector<std::pair<std::pair<unsigned, uint64_t>, ExecutionState *>>
+      pending;
   for (ExecutionState *s : states)
-    if (s->pendingSeed) {
-      uint64_t d = directed ? sinkOrder(*s) : 1;
-      pending.emplace_back(d ? d : ~0ULL, s);
-    }
+    if (s->pendingSeed)
+      pending.emplace_back(orderKey(*s), s);
   if (pending.size() <= ConcolicPending)
     return;
   std::sort(pending.begin(), pending.end(),
@@ -2051,13 +2031,8 @@ void Executor::prunePending() {
 }
 
 void Executor::defer(ExecutionState &state) {
-  uint64_t distance = statsTracker && userSearcherRequiresSink()
-                          ? sinkOrder(state)
-                          : 1;
-  if (distance == 0) {
-    dropUnreachable(&state);
+  if (dropUnreachable(&state))
     return;
-  }
   // The inputs of the state: its seeds, or the model of its path.
   std::vector<std::vector<std::vector<unsigned char>>> inputs;
   if (state.pendingSeed) {
@@ -2087,7 +2062,7 @@ void Executor::defer(ExecutionState &state) {
         inputs.push_back(std::move(values));
       }
   }
-  Deferred entry{distance, std::max(state.floor, state.decisions), {},
+  Deferred entry{orderKey(state), std::max(state.floor, state.decisions), {},
                  state.fixed};
   for (auto &values : inputs) {
     KTest *kt = new KTest();
@@ -2116,7 +2091,7 @@ void Executor::defer(ExecutionState &state) {
     deferred.push_back(std::move(entry));
     std::push_heap(deferred.begin(), deferred.end(),
                    [](const Deferred &a, const Deferred &b) {
-                     return a.distance > b.distance;
+                     return a.key > b.key;
                    });
   }
   state.fate = inputs.empty() ? "open:no-input" : "deferred";
@@ -2127,13 +2102,14 @@ void Executor::defer(ExecutionState &state) {
 void Executor::respawn() {
   std::pop_heap(deferred.begin(), deferred.end(),
                 [](const Deferred &a, const Deferred &b) {
-                  return a.distance > b.distance;
+                  return a.key > b.key;
                 });
   Deferred d = deferred.back();
   deferred.pop_back();
   ExecutionState *s = pristine->branch();
   executionTree->attach(pristine->executionTreeNode, s, pristine,
                         BranchType::NONE);
+  s->gen = d.key.first;
   s->floor = d.floor;
   s->fixed = d.fixed; // the inputs already hold these objects' values
   addedStates.push_back(s);
@@ -2185,10 +2161,10 @@ bool Executor::concolicAssume(ExecutionState &state, ref<Expr> e) {
   if (d == 0) {
     // No seed satisfies the assumption: the path continues only for other
     // inputs, which the flip step must produce.
-    state.parentInput =
+    auto parent =
         std::make_shared<Assignment>(seedMap[&state].front().assignment);
     seedMap.erase(&state);
-    state.pendingSeed = true;
+    makePending(state, parent);
   } else if (d == 2) {
     auto &seeds = seedMap[&state];
     seeds.erase(std::remove_if(seeds.begin(), seeds.end(),
@@ -3096,17 +3072,10 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
         // whether or not the seed matched an earlier entry and returned. Done
         // before dropping the unreachable branch so the side is still alive.
         if (auto *cmp = dyn_cast_or_null<ICmpInst>(bi->getCondition());
-            cmp && klee::gateKeys(cmp)) {
-          ++ledger.gateReached;
-          if (!isa<ConstantExpr>(cond))
-            ++ledger.gateSym;
-          if (cmp->getPredicate() == ICmpInst::ICMP_EQ && branches.second &&
-              !branches.second->stInstalled)
-            spawnGateFlips(*branches.second, cond, ki);
-        }
-        // Drive flips that head toward an uninstalled installer (sp.st / T_st)
-        // without waiting for the pending pool to drain.
-        promoteDirectedFlip(branches.first, branches.second);
+            cmp && klee::gateKeys(cmp) &&
+            cmp->getPredicate() == ICmpInst::ICMP_EQ && branches.second &&
+            !branches.second->stInstalled)
+          spawnGateFlips(*branches.second, cond, ki);
         dropUnreachable(branches.first);
         dropUnreachable(branches.second);
       }
@@ -4344,6 +4313,8 @@ void Executor::updateStates(ExecutionState *current) {
       seedMap.find(es);
     if (it3 != seedMap.end())
       seedMap.erase(it3);
+    if (es == running)
+      running = nullptr;
     executionTree->remove(es->executionTreeNode);
     delete es;
   }
@@ -4494,23 +4465,19 @@ bool Executor::checkMemoryUsage() {
   // randomly select states for early termination
   std::vector<ExecutionState *> arr(states.begin(), states.end()); // FIXME: expensive
   if (Concolic) {
-    // Nothing is discarded: states are replaced by their inputs, farthest
-    // from the sink first, pending flips before seeded states.
-    bool directed = statsTracker && userSearcherRequiresSink();
-    std::vector<std::tuple<bool, uint64_t, ExecutionState *>> order;
-    for (ExecutionState *s : arr) {
-      uint64_t d = directed ? sinkOrder(*s) : 1;
-      order.emplace_back(!s->pendingSeed, d ? d : ~0ULL, s);
-    }
-    std::sort(order.begin(), order.end(), [](auto &a, auto &b) {
-      if (std::get<0>(a) != std::get<0>(b))
-        return std::get<0>(a) < std::get<0>(b);
-      return std::get<1>(a) > std::get<1>(b);
-    });
-    // The last state always keeps running, so the search makes progress.
-    for (unsigned i = 0; i < toKill && i + 1 < order.size() && !haltExecution;
+    // Nothing is discarded: states are replaced by their inputs, greatest
+    // order key first. The running state is not deferred, so the search
+    // makes progress.
+    std::vector<std::pair<std::pair<unsigned, uint64_t>, ExecutionState *>>
+        order;
+    for (ExecutionState *s : arr)
+      if (s != running)
+        order.emplace_back(orderKey(*s), s);
+    std::sort(order.begin(), order.end(),
+              [](auto &a, auto &b) { return a.first > b.first; });
+    for (unsigned i = 0; i < toKill && i < order.size() && !haltExecution;
          ++i) {
-      defer(*std::get<2>(order[i]));
+      defer(*order[i].second);
       timers.invoke();
     }
     return false;
@@ -4655,7 +4622,6 @@ void Executor::run(ExecutionState &initialState) {
   searcher->update(0, newStates, std::vector<ExecutionState *>());
 
   // main interpreter loop
-  ExecutionState *lastSeeded = nullptr;
   while ((!states.empty() || (Concolic && !deferred.empty())) &&
          !haltExecution) {
     // A deferred input is a path of P_K waiting to run. Bring it back whenever
@@ -4665,19 +4631,8 @@ void Executor::run(ExecutionState &initialState) {
       updateStates(nullptr);
       continue;
     }
-    ExecutionState *selected = nullptr;
-    if (Concolic && !seedMap.empty()) {
-      // Generational order: states on a concrete input run first (round
-      // robin); flips are solved only when no such state is left, and then
-      // the searcher picks the flip nearest the sink.
-      auto it = seedMap.upper_bound(lastSeeded);
-      if (it == seedMap.end())
-        it = seedMap.begin();
-      lastSeeded = selected = it->first;
-    } else {
-      selected = &searcher->selectState();
-    }
-    ExecutionState &state = *selected;
+    ExecutionState &state =
+        Concolic ? *selectConcolic() : searcher->selectState();
     if (state.pendingSeed && !ensureSeed(state)) {
       // Concolic: the flip is infeasible (or unsolved in the budget).
       terminateStateEarlyAlgorithm(state, "concolic: infeasible flip",
@@ -5974,6 +5929,28 @@ bool Executor::getSymbolicSolution(const ExecutionState &state,
     if (ConstantExpr *CE = dyn_cast<ConstantExpr>(c))
       if (CE->isFalse())
         return false;
+
+  // Concolic: a seed that satisfies the path condition is its input (H1);
+  // the solver is asked only when no seed is a checked model.
+  if (auto it = seedMap.find(const_cast<ExecutionState *>(&state));
+      Concolic && it != seedMap.end())
+    for (SeedInfo &si : it->second) {
+      if (!si.assignment.satisfies(state.constraints.begin(),
+                                   state.constraints.end()))
+        continue;
+      std::vector<std::pair<std::string, std::vector<unsigned char>>> out;
+      for (auto &s : state.symbolics) {
+        auto b = si.assignment.bindings.find(s.second);
+        if (b == si.assignment.bindings.end())
+          break;
+        out.emplace_back(s.first->name, b->second);
+      }
+      if (out.size() == state.symbolics.size()) {
+        res = std::move(out);
+        return true;
+      }
+    }
+
   solver->setTimeout(coreSolverTimeout);
 
   ConstraintSet extendedConstraints(state.constraints);

@@ -25,6 +25,8 @@
 #include "Client.h"
 #include "Close.h"
 
+#include "llvm/ADT/PostOrderIterator.h"
+#include "llvm/Analysis/MemoryBuiltins.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/TargetParser/Triple.h"
 
@@ -874,12 +876,21 @@ void Client::buildStores() {
   for (const auto &kv : bodies) {
     Function *F = kv.second;
     auto &out = stores[F];
+    auto &in = inputStores[F];
+    auto &cp = copyStores[F];
     for (Instruction &I : instructions(*F)) {
       Value *P = nullptr;
       std::string v = "*";
+      bool copy = false;
       if (auto *S = dyn_cast<StoreInst>(&I)) {
         P = S->getPointerOperand();
         v = abstractValue(S->getValueOperand());
+        std::set<Field> src = copySources(S);
+        copy = !src.empty();
+        for (const Field &d : fieldsOf(P))
+          for (const Field &s : src)
+            if (d != s)
+              cp[d].insert(s);
       } else if (auto *MS = dyn_cast<MemSetInst>(&I)) {
         P = MS->getRawDest();
         auto *b = dyn_cast<ConstantInt>(MS->getValue());
@@ -888,8 +899,11 @@ void Client::buildStores() {
         P = MI->getRawDest();
       if (!P)
         continue;
-      for (const auto &f : fieldsOf(P))
+      for (const auto &f : fieldsOf(P)) {
         out.insert({f, v});
+        if (v == "*" && !copy)
+          in.insert(f);
+      }
       if (auto *MI = dyn_cast<MemIntrinsic>(&I)) {
         auto *L = dyn_cast<ConstantInt>(MI->getLength());
         int64_t len = L && L->getBitWidth() <= 64 ? L->getSExtValue() : INT64_MAX;
@@ -2497,22 +2511,33 @@ const std::map<Client::Field, std::set<Client::Field>> &Client::copies(Function 
     return it->second;
   auto &out = copiesOf[F];
   for (Function *G : innerClosure(F))
-    for (Instruction &I : instructions(*G)) {
-      auto *S = dyn_cast<StoreInst>(&I);
-      if (!S)
-        continue;
-      Value *V = S->getValueOperand();
-      while (auto *C = dyn_cast<CastInst>(V))
-        V = C->getOperand(0);
-      auto *L = dyn_cast<LoadInst>(V);
-      if (!L)
-        continue;
-      for (const Field &d : fieldsOf(S->getPointerOperand()))
-        for (const Field &s : fieldsOf(L->getPointerOperand()))
-          if (d != s)
-            out[d].insert(s);
-    }
+    if (auto it = copyStores.find(G); it != copyStores.end())
+      for (const auto &[d, src] : it->second)
+        out[d].insert(src.begin(), src.end());
   return out;
+}
+
+const std::map<Client::Field, std::set<Client::Field>> &Client::allCopies(Function *F) const {
+  auto it = allCopiesOf.find(F);
+  if (it != allCopiesOf.end())
+    return it->second;
+  auto &out = allCopiesOf[F];
+  for (Function *G : closureOf(F))
+    if (auto it = copyStores.find(G); it != copyStores.end())
+      for (const auto &[d, src] : it->second)
+        out[d].insert(src.begin(), src.end());
+  return out;
+}
+
+std::set<Client::Field> Client::copySources(StoreInst *S) const {
+  Value *V = S->getValueOperand();
+  while (auto *C = dyn_cast<CastInst>(V))
+    V = C->getOperand(0);
+  auto *L = dyn_cast<LoadInst>(V);
+  if (!L)
+    return {};
+  auto fs = fieldsOf(L->getPointerOperand());
+  return {fs.begin(), fs.end()};
 }
 
 std::vector<Function *> Client::copySetters(Function *F, const Cell &c) const {
@@ -2672,7 +2697,7 @@ bool Client::readsInput(Function *F) const {
                                       "recv",   "recvfrom", "recvmsg",       "fread",   "fread_unlocked",
                                       "fgetc",  "getc",     "getc_unlocked", "getchar", "fgets",
                                       "fgetws", "getline",  "getdelim",      "mmap",    "mmap64"};
-  for (Function *G : innerClosure(F))
+  for (Function *G : closureOf(F))
     for (Instruction &I : instructions(*G))
       if (auto *CB = dyn_cast<CallBase>(&I))
         if (Function *C = CB->getCalledFunction())
@@ -2683,10 +2708,8 @@ bool Client::readsInput(Function *F) const {
 
 bool Client::storesInput(Function *F, const Field &f) const {
   for (Function *G : closureOf(F))
-    if (auto it = stores.find(G); it != stores.end())
-      for (auto s = it->second.lower_bound({f, ""}); s != it->second.end() && s->first == f; ++s)
-        if (s->second == "*")
-          return true;
+    if (auto it = inputStores.find(G); it != inputStores.end() && it->second.count(f))
+      return true;
   return false;
 }
 
@@ -2745,6 +2768,288 @@ bool Client::realizable(Function *E, const Keyed &k) const {
   return k.tag < 0 || ((size_t)k.tag < aw.size() && aw[k.tag] >= 0);
 }
 
+const TargetLibraryInfo &Client::libInfo() const {
+  if (!libSpec) {
+    libImpl = std::make_unique<TargetLibraryInfoImpl>(Triple(down.getTargetTriple()));
+    libSpec = std::make_unique<TargetLibraryInfo>(*libImpl);
+  }
+  return *libSpec;
+}
+
+std::string Client::MustState::at(const Field &f) const {
+  if (auto it = fixed.find(f); it != fixed.end())
+    return it->second;
+  if (holes.count(f))
+    return "";
+  for (auto it = fills.rbegin(); it != fills.rend(); ++it)
+    if (it->type == f.first && f.second >= it->off && f.second - it->off < it->len)
+      return it->val == "*" ? "" : it->val;
+  return "";
+}
+
+// 정의 M: a forward must analysis over the fields, the greatest fixed point
+// of the meet that keeps a field only where both sides give one constant.
+const Client::MustSummary *Client::mustOnReturn(Function *F) const {
+  if (auto it = mustOf.find(F); it != mustOf.end())
+    return &it->second;
+  if (!F || F->isDeclaration() || !mustBusy.insert(F).second)
+    return nullptr;
+  struct Flow {
+    MustState s;
+    std::vector<FormalWrite> writes;
+    std::set<unsigned> clobbers;
+  };
+  auto meet = [](const Flow &a, const Flow &b) {
+    Flow r;
+    if (a.s.fills == b.s.fills)
+      r.s.fills = a.s.fills;
+    r.s.holes = a.s.holes;
+    r.s.holes.insert(b.s.holes.begin(), b.s.holes.end());
+    for (const auto *side : {&a.s.fixed, &b.s.fixed})
+      for (const auto &[f, v] : *side) {
+        std::string x = a.s.at(f), y = b.s.at(f);
+        if (!x.empty() && x == y)
+          r.s.fixed[f] = x;
+        else
+          r.s.holes.insert(f);
+      }
+    if (!r.s.fills.empty())
+      for (const auto &[f, v] : r.s.fixed)
+        r.s.holes.erase(f);
+    r.clobbers = a.clobbers;
+    r.clobbers.insert(b.clobbers.begin(), b.clobbers.end());
+    if (a.writes == b.writes)
+      r.writes = a.writes;
+    else
+      for (const auto *side : {&a.writes, &b.writes})
+        for (const FormalWrite &w : *side)
+          r.clobbers.insert(w.formal);
+    return r;
+  };
+  // A slot every store to which stores one value reads that value.
+  auto through = [this](Value *V) {
+    for (int n = 0; n < 8; ++n) {
+      V = fieldAddress(V);
+      if (auto *C = dyn_cast<CastInst>(V)) {
+        V = C->getOperand(0);
+        continue;
+      }
+      auto *L = dyn_cast<LoadInst>(V);
+      auto *Al = L ? dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts()) : nullptr;
+      if (!Al)
+        break;
+      Value *one = nullptr;
+      for (User *U : Al->users())
+        if (auto *S = dyn_cast<StoreInst>(U); S && S->getPointerOperand()->stripPointerCasts() == Al) {
+          if (one && one != S->getValueOperand())
+            return V;
+          one = S->getValueOperand();
+        }
+      if (!one)
+        break;
+      V = one;
+    }
+    return V;
+  };
+  auto token = [&](Value *V) -> std::string {
+    V = through(V);
+    if (auto *A = dyn_cast<Argument>(V))
+      return "#" + std::to_string(A->getArgNo());
+    return abstractValue(V);
+  };
+  auto setField = [](MustState &s, const Field &f, const std::string &v) {
+    if (v == "*") {
+      s.fixed.erase(f);
+      s.holes.insert(f);
+    } else {
+      s.fixed[f] = v;
+      s.holes.erase(f);
+    }
+  };
+  auto fill = [](MustState &s, const std::vector<Field> &at, int64_t len, const std::string &v) {
+    for (const auto &[T, o] : at) {
+      auto in = [&](const Field &f) { return f.first == T && f.second >= o && f.second - o < len; };
+      for (auto it = s.fixed.begin(); it != s.fixed.end();)
+        it = in(it->first) ? s.fixed.erase(it) : std::next(it);
+      for (auto it = s.holes.begin(); it != s.holes.end();)
+        it = in(*it) ? s.holes.erase(it) : std::next(it);
+      s.fills.push_back({T, o, len, v});
+    }
+  };
+  // A write of len bytes of v through pointer P: to the fields P addresses,
+  // or recorded against the formal P is.
+  auto write = [&](Flow &fl, Value *P, int64_t len, int lenFormal, const std::string &v) {
+    Value *R = through(P);
+    if (auto *A = dyn_cast<Argument>(R)) {
+      fl.s = MustState{};
+      fl.writes.push_back({A->getArgNo(), v, len, lenFormal});
+      return;
+    }
+    auto at = fieldsOf(R);
+    if (!at.empty())
+      fill(fl.s, at, lenFormal >= 0 ? INT64_MAX : len, v);
+  };
+  auto byteValue = [&](Value *B) -> std::string {
+    std::string t = token(B);
+    return t == "0" || t[0] == '#' ? t : "*";
+  };
+  auto lengthOf = [&](Value *N, int &lf) -> int64_t {
+    std::string t = token(N);
+    lf = -1;
+    if (!t.empty() && t[0] == '#') {
+      lf = std::stoi(t.substr(1));
+      return INT64_MAX;
+    }
+    auto k = asI64(t);
+    return k && *k >= 0 ? *k : INT64_MAX;
+  };
+  auto call = [&](Flow &fl, CallBase *CB, Function *D) {
+    if (!D || D->isDeclaration()) {
+      if (D && D->onlyReadsMemory())
+        return;
+      LibFunc lf;
+      bool frees = D && libInfo().getLibFunc(*D, lf) && isLibFreeFunction(D, lf);
+      for (unsigned j = 0; j < CB->arg_size(); ++j) {
+        Value *A = CB->getArgOperand(j);
+        if (!A->getType()->isPointerTy() || (frees && j == 0))
+          continue;
+        if (D && j < D->arg_size() && (D->hasParamAttribute(j, Attribute::ReadOnly) || D->hasParamAttribute(j, Attribute::ReadNone)))
+          continue;
+        write(fl, A, INT64_MAX, -1, "*");
+      }
+      return;
+    }
+    const MustSummary *S = mustOnReturn(D);
+    if (!S) {
+      fl.s = MustState{};
+      return;
+    }
+    auto actual = [&](const std::string &t) -> std::string {
+      if (t.empty() || t[0] != '#')
+        return t;
+      unsigned j = std::stoul(t.substr(1));
+      return j < CB->arg_size() ? byteValue(CB->getArgOperand(j)) : "*";
+    };
+    for (const FormalWrite &w : S->writes) {
+      if (w.formal >= CB->arg_size())
+        continue;
+      int lf = -1;
+      int64_t len = w.lenFormal >= 0 && (unsigned)w.lenFormal < CB->arg_size()
+                        ? lengthOf(CB->getArgOperand(w.lenFormal), lf)
+                        : w.len;
+      write(fl, CB->getArgOperand(w.formal), len, lf, actual(w.val));
+    }
+    for (unsigned j : S->clobbers)
+      if (j < CB->arg_size())
+        write(fl, CB->getArgOperand(j), INT64_MAX, -1, "*");
+    for (Function *G : closureOf(D))
+      if (auto m = mods.find(G); m != mods.end())
+        for (const Field &f : m->second)
+          setField(fl.s, f, "*");
+    for (const MustFill &x : S->post.fills)
+      fill(fl.s, {{x.type, x.off}}, x.len, x.val);
+    for (const Field &f : S->post.holes)
+      setField(fl.s, f, "*");
+    for (const auto &[f, v] : S->post.fixed)
+      setField(fl.s, f, v);
+  };
+  auto step = [&](Flow &fl, Instruction &I) {
+    if (auto *S = dyn_cast<StoreInst>(&I)) {
+      Value *R = through(S->getPointerOperand());
+      std::string v = abstractValue(through(S->getValueOperand()));
+      if (isa<Argument>(R)) {
+        fl.s = MustState{};
+        fl.clobbers.insert(cast<Argument>(R)->getArgNo());
+        return;
+      }
+      for (const Field &f : fieldsOf(R))
+        setField(fl.s, f, v);
+      return;
+    }
+    auto *CB = dyn_cast<CallBase>(&I);
+    if (!CB || CB->isInlineAsm())
+      return;
+    if (auto *MS = dyn_cast<MemSetInst>(CB)) {
+      int lf = -1;
+      int64_t len = lengthOf(MS->getLength(), lf);
+      write(fl, MS->getRawDest(), len, lf, byteValue(MS->getValue()));
+      return;
+    }
+    if (auto *MT = dyn_cast<MemTransferInst>(CB)) {
+      int lf = -1;
+      int64_t len = lengthOf(MT->getLength(), lf);
+      write(fl, MT->getRawDest(), len, lf, "*");
+      return;
+    }
+    if (isa<IntrinsicInst>(CB))
+      return;
+    if (const Function *C = klee::calls::callee(*CB)) {
+      Function *B = body(C->getName().str());
+      call(fl, CB, B ? B : const_cast<Function *>(C));
+      return;
+    }
+    std::optional<Flow> out;
+    for (Function *T : targets.of(*CB)) {
+      Flow one = fl;
+      Function *B = body(T->getName().str());
+      call(one, CB, B ? B : T);
+      out = out ? meet(*out, one) : one;
+    }
+    if (out)
+      fl = std::move(*out);
+  };
+  std::map<BasicBlock *, Flow> outOf;
+  std::vector<BasicBlock *> order;
+  for (BasicBlock *BB : ReversePostOrderTraversal<Function *>(F))
+    order.push_back(BB);
+  bool changed = true;
+  for (unsigned round = 0; changed && round < 64; ++round) {
+    changed = false;
+    for (BasicBlock *BB : order) {
+      std::optional<Flow> in;
+      if (BB == &F->getEntryBlock())
+        in = Flow{};
+      for (BasicBlock *P : predecessors(BB))
+        if (auto it = outOf.find(P); it != outOf.end())
+          in = in ? meet(*in, it->second) : it->second;
+      if (!in)
+        continue;
+      for (Instruction &I : *BB)
+        step(*in, I);
+      auto it = outOf.find(BB);
+      if (it == outOf.end() || !(it->second.s.fixed == in->s.fixed && it->second.s.holes == in->s.holes &&
+                                 it->second.s.fills == in->s.fills && it->second.writes == in->writes &&
+                                 it->second.clobbers == in->clobbers)) {
+        outOf[BB] = std::move(*in);
+        changed = true;
+      }
+    }
+  }
+  std::optional<Flow> ret;
+  for (BasicBlock *BB : order)
+    if (isa<ReturnInst>(BB->getTerminator()))
+      if (auto it = outOf.find(BB); it != outOf.end())
+        ret = ret ? meet(*ret, it->second) : it->second;
+  mustBusy.erase(F);
+  MustSummary &S = mustOf[F];
+  if (ret && !changed) {
+    S.post = std::move(ret->s);
+    S.writes = std::move(ret->writes);
+    S.clobbers = std::move(ret->clobbers);
+  }
+  return &S;
+}
+
+bool Client::contradicts(Function *W, const Cell &c) const {
+  if (c.op != "=" && c.op != "!=" && c.op != "has" && c.op != "lacks")
+    return false;
+  const MustSummary *S = mustOnReturn(W);
+  if (!S)
+    return false;
+  std::string v = S->post.at(fieldOf(c));
+  return !v.empty() && !satisfies(v, c);
+}
+
 // Wr(c): writers of c and, for a boundary cell, setters of what the entry
 // copies into it. A candidate is an interface function of D, not an entry,
 // that takes the cell's held root, and for a boundary or prefix cell
@@ -2775,37 +3080,170 @@ std::vector<Function *> Client::writeCandidates(Function *E, const std::vector<F
   return {out.begin(), out.end()};
 }
 
-// Construct: no function stores the field, or only U does (정리 B(a)), or
-// the entry stores only constants that satisfy the atom, directly or into
-// a field it copies from.
-bool Client::establishedBy(Function *entry, const Cell &c) const {
+// The calls of the harness that can write c before or inside the entry: the
+// entry, the producers of c's held root, and the calls they depend on.
+std::vector<Function *> Client::harnessStarts(Function *E, Function *entry, const Cell &c) const {
+  std::vector<Function *> out{entry};
+  auto pit = producers.find(heldType(E, c.root));
+  if (pit != producers.end())
+    for (const Producer &pr : pit->second) {
+      out.push_back(pr.fn);
+      for (Function *D : dependences(pr.fn, heldType(E, c.root)))
+        out.push_back(D);
+    }
+  return out;
+}
+
+// §3.9 정의 E. The plan of the may sequence from starts to the line, if one
+// is satisfiable and its plan passes. A query met again while it is being
+// computed is a cycle and does not establish (least fixed point).
+const Client::WitnessPlan *Client::established(const std::string &file, unsigned line,
+                                               const std::vector<Function *> &starts) const {
+  std::set<std::string> names;
+  for (Function *F : starts)
+    names.insert(F->getName().str());
+  auto key = std::make_tuple(file, line, names);
+  if (auto it = estOf.find(key); it != estOf.end())
+    return it->second.get();
+  if (!reach || !estBusy.insert(key).second)
+    return nullptr;
+  std::unique_ptr<WitnessPlan> plan;
+  std::string log = file + ":" + std::to_string(line);
+  if (auto w = reach(file, line, names); w && !w->seq.empty()) {
+    for (const std::string &n : w->seq)
+      log += " " + n;
+    if (Function *S = body(w->seq.front())) {
+      plan = std::make_unique<WitnessPlan>(realize(S, w->phi, w->keyed));
+      std::string open;
+      for (const Realized &r : plan->cells)
+        if (r.how == Realize::Open)
+          open += " " + r.cell.type + "+" + std::to_string(r.cell.off) + " " + r.cell.op + " " +
+                  (r.cell.values.empty() ? "-" : r.cell.values[0]);
+      log += plan->pass ? " : pass" : " : open" + open;
+      if (!plan->pass)
+        plan.reset();
+      else
+        plan->seq = w->seq;
+    }
+  } else {
+    log += " : none";
+  }
+  estLog.push_back(log);
+  estBusy.erase(key);
+  return (estOf[key] = std::move(plan)).get();
+}
+
+// Construct: no function stores the field, or Definition E. Under Lemma E
+// (no non-constant store, 0 does not satisfy) a store of S+ must run, so the
+// cell is established only through the passing plan of a sequence reaching
+// one. Otherwise the earlier inference: only U stores the field (정리 B(a)),
+// or a store of S+ exists.
+bool Client::establishedBy(Function *E, Function *entry, const Cell &c, const WitnessPlan *&via,
+                           std::string &at) const {
+  via = nullptr;
   Field f = fieldOf(c);
-  if (!everStored(f.first, f.second) || upOnly(f))
+  if (!everStored(f.first, f.second))
     return true;
-  if (!entry || !(c.boundary || c.prefix))
+  bool up = upOnly(f);
+  if (!entry || (!up && !(c.boundary || c.prefix)))
     return false;
-  if (storesSatisfying(entry, f, c))
-    return true;
-  const auto &cm = copies(entry);
-  if (auto it = cm.find(f); it != cm.end())
-    for (const Field &d : it->second)
-      if (storesSatisfying(entry, d, c))
-        return true;
+  std::set<Field> fs{f};
+  if (c.boundary)
+    if (auto it = copies(entry).find(f); it != copies(entry).end())
+      fs.insert(it->second.begin(), it->second.end());
+  std::vector<Function *> starts = harnessStarts(E, entry, c);
+  FnSet scope;
+  for (Function *F : starts)
+    scope.insert(closureOf(F).begin(), closureOf(F).end());
+  bool nonConst = false, anySat = false;
+  std::vector<std::pair<std::string, unsigned>> plus;
+  auto touches = [&](Function *G) {
+    if (auto it = stores.find(G); it != stores.end())
+      for (const Field &d : fs)
+        if (auto s = it->second.lower_bound({d, ""}); s != it->second.end() && s->first == d)
+          return true;
+    if (auto it = ranges.find(G); it != ranges.end())
+      for (const auto &r : it->second)
+        for (const Field &d : fs)
+          if (std::get<0>(r) == d.first && std::get<1>(r) <= d.second &&
+              d.second - std::get<1>(r) < std::get<2>(r))
+            return true;
+    return false;
+  };
+  for (size_t seen = 0; seen != fs.size();) {
+    seen = fs.size();
+    nonConst = anySat = false;
+    plus.clear();
+    for (Function *G : scope) {
+      if (!touches(G))
+        continue;
+      for (Instruction &I : instructions(*G)) {
+        bool hit = false;
+        std::string v = "*";
+        if (auto *S = dyn_cast<StoreInst>(&I)) {
+          for (const Field &g : fieldsOf(S->getPointerOperand()))
+            hit = hit || fs.count(g);
+          if (!hit)
+            continue;
+          std::set<Field> src = copySources(S);
+          if (!src.empty()) {
+            fs.insert(src.begin(), src.end());
+            continue;
+          }
+          v = abstractValue(S->getValueOperand());
+        } else if (auto *MI = dyn_cast<MemIntrinsic>(&I)) {
+          auto *L = dyn_cast<ConstantInt>(MI->getLength());
+          int64_t len = L && L->getBitWidth() <= 64 ? L->getSExtValue() : INT64_MAX;
+          for (const Field &g : fieldsOf(MI->getRawDest()))
+            for (const Field &d : fs)
+              hit = hit || (g.first == d.first && g.second <= d.second && d.second - g.second < len);
+          if (!hit)
+            continue;
+          auto *MS = dyn_cast<MemSetInst>(MI);
+          auto *b = MS ? dyn_cast<ConstantInt>(MS->getValue()) : nullptr;
+          v = b && b->isZero() ? "0" : "*";
+        } else
+          continue;
+        const DebugLoc &dl = I.getDebugLoc();
+        if (v == "*" || (satisfies(v, c) && !dl))
+          nonConst = true; // a satisfying store with no position cannot be queried
+        else if (satisfies(v, c)) {
+          anySat = true;
+          plus.push_back({dl->getFilename().str(), dl.getLine()});
+        }
+      }
+    }
+  }
+  if (nonConst || satisfies("0", c) || !reach)
+    return up || anySat;
+  std::sort(plus.begin(), plus.end());
+  plus.erase(std::unique(plus.begin(), plus.end()), plus.end());
+  for (const auto &[file, line] : plus)
+    if ((via = established(file, line, starts))) {
+      at = file + ":" + std::to_string(line);
+      return true;
+    }
   return false;
 }
 
-// File: F reads the input and stores a non-constant to the field, to a
-// field copied into it, or, for a bound, to the field the bound names.
+// File: F reads the input and stores an input value to the field, to a
+// field copied into it transitively, or, for a bound, to the field the
+// bound names.
 bool Client::fills(Function *F, const Cell &c) const {
   if (!F || !readsInput(F))
     return false;
-  if (storesInput(F, fieldOf(c)))
-    return true;
-  const auto &cm = copies(F);
-  if (auto it = cm.find(fieldOf(c)); it != cm.end())
-    for (const Field &d : it->second)
-      if (storesInput(F, d))
-        return true;
+  const auto &cm = allCopies(F);
+  std::set<Field> seen{fieldOf(c)};
+  for (std::vector<Field> work{fieldOf(c)}; !work.empty();) {
+    Field d = work.back();
+    work.pop_back();
+    if (storesInput(F, d))
+      return true;
+    if (auto it = cm.find(d); it != cm.end())
+      for (const Field &s : it->second)
+        if (seen.insert(s).second)
+          work.push_back(s);
+  }
   static const std::set<std::string> bound{"ult", "ule", "ugt", "uge", "slt", "sle",
                                            "sgt", "sge", "<",   ">",   "<=",  ">="};
   if (!bound.count(c.op) || c.values.empty())
@@ -2844,12 +3282,56 @@ Client::WitnessPlan Client::realize(Function *E, const std::vector<Cell> &phi, c
   Function *entry = W.entries.empty() ? nullptr : W.entries[0];
   W.iface = entry && ifaceD.count(entry);
   W.direct = W.entries.size() == 1 && entry == E;
+  std::vector<const Cell *> ob;
+  for (const Cell &c : phi)
+    if (!c.type.empty() && !c.op.empty() && !(c.crossing && !c.boundary && !c.prefix && !(W.direct && own(E, c))))
+      ob.push_back(&c);
+  // 정의 M: a call the plan adds before the entry must not leave an
+  // obligation at a value its atom rejects.
+  std::set<Function *> barred;
+  auto admitted = [&](Function *F) {
+    if (!F)
+      return false;
+    if (barred.count(F))
+      return false;
+    for (const Cell *c : ob)
+      if (contradicts(F, *c)) {
+        barred.insert(F);
+        W.excluded.push_back(F->getName().str() + " " + c->type + "+" + std::to_string(c->off) + " " +
+                             mustOnReturn(F)->post.at(fieldOf(*c)));
+        return false;
+      }
+    return true;
+  };
+  auto admittedWriters = [&](const Cell &c) {
+    std::vector<Function *> out;
+    for (Function *F : writeCandidates(E, W.entries, c))
+      if (admitted(F))
+        out.push_back(F);
+    return out;
+  };
   std::vector<Keyed> kw;
   for (const Keyed &k : keyed)
-    if (realizable(E, k))
+    if (realizable(E, k) && admitted(body(k.fn)))
       kw.push_back(k);
   auto valueAtom = [](const Cell &c) { return c.op == "=" || c.op == "!=" || c.op == "has" || c.op == "lacks"; };
   std::map<size_t, std::vector<Function *>> cand;
+  std::map<size_t, std::pair<const WitnessPlan *, std::string>> vias;
+  auto addKeyed = [&](Function *F, const Keyed &k) {
+    for (const auto &[G, o] : W.keyed)
+      if (G == F && o.tag == k.tag && o.tagV == k.tagV && o.preds == k.preds)
+        return;
+    W.keyed.push_back({F, k});
+  };
+  // 정의 M: Key select that only excludes (≠, lacks) yields to File.
+  auto excludesOnly = [](const Keyed &x) {
+    if (!x.va || x.preds.empty())
+      return false;
+    for (const auto &[op, _] : x.preds)
+      if (op != "!=" && op != "lacks")
+        return false;
+    return true;
+  };
   for (const Cell &c : phi) {
     if (c.type.empty() || c.op.empty())
       continue;
@@ -2866,31 +3348,38 @@ Client::WitnessPlan Client::realize(Function *E, const std::vector<Cell> &phi, c
     if (mine && c.file)
       W.files.push_back(c);
     Realized r{c};
+    std::string at;
     const Keyed *k = nullptr;
     for (const Keyed &x : kw)
       if (!k && x.covers(c))
         k = &x;
     std::vector<Function *> wr;
+    Function *fileBy = (!c.file && (c.boundary || c.prefix)) ? inputFiller(E, entry, c) : nullptr;
     if (mine) {
       r.how = Realize::Own;
     } else if (!lv.empty()) {
       r.how = Realize::Lever;
       r.by = lv.front().first;
+    } else if (k && !(excludesOnly(*k) && fileBy)) {
+      r.how = Realize::Key;
+      r.by = body(k->fn);
+      addKeyed(r.by, *k);
+    } else if (valueAtom(c) && !(wr = admittedWriters(c)).empty()) {
+      r.how = Realize::Write;
+      cand[W.cells.size()] = wr;
+    } else if (const WitnessPlan *via = nullptr; !c.file && establishedBy(E, entry, c, via, at)) {
+      r.how = Realize::Construct;
+      if (via) {
+        vias[W.cells.size()] = {via, c.type + "+" + std::to_string(c.off) + " at " + at};
+        r.by = body(via->seq.back());
+      }
+    } else if (fileBy) {
+      r.how = Realize::File;
+      r.by = fileBy;
     } else if (k) {
       r.how = Realize::Key;
       r.by = body(k->fn);
-      bool dup = false;
-      for (const auto &[F, o] : W.keyed)
-        dup = dup || (F == r.by && o.tag == k->tag && o.tagV == k->tagV && o.preds == k->preds);
-      if (!dup)
-        W.keyed.push_back({r.by, *k});
-    } else if (valueAtom(c) && !(wr = writeCandidates(E, W.entries, c)).empty()) {
-      r.how = Realize::Write;
-      cand[W.cells.size()] = wr;
-    } else if (!c.file && establishedBy(entry, c)) {
-      r.how = Realize::Construct;
-    } else if (!c.file && (c.boundary || c.prefix) && (r.by = inputFiller(E, entry, c))) {
-      r.how = Realize::File;
+      addKeyed(r.by, *k);
     }
     W.cells.push_back(r);
   }
@@ -2927,6 +3416,28 @@ Client::WitnessPlan Client::realize(Function *E, const std::vector<Cell> &phi, c
   }
   for (size_t i : left)
     W.cells[i].how = Realize::Open;
+  // 정의 E: a cell a store establishes brings the calls the reaching
+  // sequence's plan realizes; the merged cover stays within the K slots.
+  for (const auto &[i, v] : vias) {
+    const auto &[via, where] = v;
+    std::vector<Function *> cover = W.cover;
+    for (Function *F : via->cover)
+      if (std::find(cover.begin(), cover.end(), F) == cover.end())
+        cover.push_back(F);
+    if (cover.size() > writerSlots) {
+      W.cells[i].how = Realize::Open;
+      continue;
+    }
+    W.cover = cover;
+    for (const auto &[F, k] : via->keyed)
+      addKeyed(F, k);
+    W.levers.insert(W.levers.end(), via->levers.begin(), via->levers.end());
+    std::string line = where + " via";
+    for (const std::string &n : via->seq)
+      line += " " + n;
+    W.established.push_back(line);
+    W.established.insert(W.established.end(), via->established.begin(), via->established.end());
+  }
   W.pass = W.iface;
   for (const Realized &r : W.cells)
     W.pass = W.pass && r.how != Realize::Open;
@@ -3229,9 +3740,16 @@ void Client::report(const Plan &P, raw_ostream &out) const {
       out << "  cell " << r.cell.type << "+" << r.cell.off << " " << r.cell.op << " "
           << (r.cell.values.empty() ? "-" : r.cell.values[0]) << " " << realizeName(r.how)
           << (r.by ? " " + r.by->getName().str() : "") << "\n";
+    for (const std::string &e : W.established)
+      out << "  established " << e << "\n";
+    for (const std::string &e : W.excluded)
+      out << "  excluded " << e << "\n";
   }
   for (const std::string &o : P.obligations)
     out << o << "\n";
+  out << "establish " << estLog.size() << "\n";
+  for (const std::string &e : estLog)
+    out << "establish " << e << "\n";
   out << "st-installers " << P.stInstallers.size() << "\n";
   for (const std::string &n : P.stInstallers)
     out << "st-installer " << n << "\n";
@@ -4864,8 +5382,9 @@ void Client::emit(const Plan &P, Module &H) const {
     K.oneOf(B, alts, "write");
   }
   // §3.8 정의 3.8.4 키 세터 레버: entry를 부르기 직전, 보유 핸들 h 위에서 키 세터
-  // W(h, 태그, v)를 호출한다. h는 make_T가 메모한 그 핸들이므로 entry가 받는 핸들과
-  // 같다. v는 심볼릭 정수에서 may 계층이 준 조건(preds)을 만족하는 값으로 접는다.
+  // W(h, 태그, v)를 호출하거나 건너뛴다(§4 (κ | skip)). h는 make_T가 메모한 그 핸들이므로
+  // entry가 받는 핸들과 같다. v는 심볼릭 정수에서 may 계층이 준 조건(preds)을 만족하는
+  // 값으로 접는다.
   auto keySet = [&](IRBuilder<> &C, Function *W, const Keyed &k) {
     FunctionType *FT = W->getFunctionType();
     auto sig = signature(W);
@@ -4915,7 +5434,7 @@ void Client::emit(const Plan &P, Module &H) const {
         auto kit = P.keyed.find(E);
         if (kit != P.keyed.end())
           for (const auto &[W, k] : kit->second)
-            keySet(C, W, k);
+            K.oneOf(C, {[&, W = W, &k = k](IRBuilder<> &A) { keySet(A, W, k); }, [](IRBuilder<> &) {}}, "key");
         auto g = P.guards.find(E);
         auto f = P.files.find(E);
         call(C, E, "", -1, g == P.guards.end() ? nullptr : &g->second, f == P.files.end() ? nullptr : &f->second);

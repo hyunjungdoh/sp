@@ -801,7 +801,9 @@
     // the outcomes that are the only successor of a return. A pointer the
     // path dereferences is a cell; its pointee stays symbolic.
     {
-      std::unordered_set<const Function *> didCallee;
+      // A descent is one per callee and goal set: a return constraint makes
+      // a different goal, so a different condition (§3.5 반환 제약 하강).
+      std::set<std::pair<const Function *, std::set<const Instruction *>>> didCallee;
       // A bool object holds 0 or 1, so a test of its value is the equation
       // of its cell with 1, or with 0 on the false side.
       auto boolLoad = [&](Value *V) -> LoadInst * {
@@ -867,14 +869,25 @@
         res.pointee = R.pointee;
         return res;
       };
-      std::unordered_map<const Function *, std::vector<ModAt>> modSum, modWide;
-      std::unordered_set<const Function *> modBusy;
-      std::function<void(CallBase *, Mem &, std::vector<ModAt> &)> callModsRel;
-      std::function<const std::vector<ModAt> &(Function *)> summaryOf = [&](Function *D) -> const std::vector<ModAt> & {
-        if (auto it = modSum.find(D); it != modSum.end())
+      // §3.5 정의 R: a summary is the cells written on the paths that return
+      // (ret) or on every path (all, what a setjmp landing sees again).
+      using ModKey = std::pair<const Function *, bool>;
+      std::map<ModKey, std::vector<ModAt>> modSum, modWide;
+      std::set<ModKey> modBusy;
+      std::function<void(CallBase *, Mem &, std::vector<ModAt> &, bool)> callModsRel;
+      auto landsJump = [](Function *D) {
+        for (Instruction &I : instructions(*D))
+          if (auto *CB = dyn_cast<CallBase>(&I))
+            if (CB->hasFnAttr(Attribute::ReturnsTwice))
+              return true;
+        return false;
+      };
+      std::function<const std::vector<ModAt> &(Function *, bool)> summaryOf = [&](Function *D, bool all) -> const std::vector<ModAt> & {
+        ModKey key{D, all};
+        if (auto it = modSum.find(key); it != modSum.end())
           return it->second;
-        if (!modBusy.insert(D).second) {
-          auto &w = modWide[D];
+        if (!modBusy.insert(key).second) {
+          auto &w = modWide[key];
           if (w.empty())
             for (Argument &A : D->args())
               if (A.getType()->isPointerTy())
@@ -887,14 +900,22 @@
         Mem dm;
         bindFormals(dm, D, self);
         propagateObject(dm, D);
+        bool every = all || landsJump(D);
+        std::unordered_set<const BasicBlock *> onRet;
+        if (!every)
+          onRet = returnBlocks(D);
         std::vector<ModAt> got;
-        for (Instruction &I : instructions(*D)) {
-          Loc c;
-          if (auto *S = dyn_cast<StoreInst>(&I)) {
-            if (objectLoc(dm, S->getPointerOperand(), c))
-              got.push_back({c, false});
-          } else if (auto *CB = dyn_cast<CallBase>(&I))
-            callModsRel(CB, dm, got);
+        for (BasicBlock &BB : *D) {
+          if (!every && !onRet.count(&BB))
+            continue;
+          for (Instruction &I : BB) {
+            Loc c;
+            if (auto *S = dyn_cast<StoreInst>(&I)) {
+              if (objectLoc(dm, S->getPointerOperand(), c))
+                got.push_back({c, false});
+            } else if (auto *CB = dyn_cast<CallBase>(&I))
+              callModsRel(CB, dm, got, every);
+          }
         }
         // A use reads every entry as "anything under it", so MOD is closed
         // upward in the prefix order of cell keys and is its antichain of
@@ -920,10 +941,10 @@
           if (!below)
             uniq.push_back(*x);
         }
-        modBusy.erase(D);
-        return modSum[D] = std::move(uniq);
+        modBusy.erase(key);
+        return modSum[key] = std::move(uniq);
       };
-      callModsRel = [&](CallBase *CB, Mem &cm, std::vector<ModAt> &out) {
+      callModsRel = [&](CallBase *CB, Mem &cm, std::vector<ModAt> &out, bool all) {
         if (ignorable(CB->getCalledFunction()) && !isa<MemIntrinsic>(CB))
           return;
         if (CB->onlyReadsMemory())
@@ -944,7 +965,9 @@
         for (Function *T : targetsOf(CB))
           if (T && !T->isDeclaration()) {
             body = true;
-            const std::vector<ModAt> &sum = summaryOf(T);
+            if (!all && !returning.count(T))
+              continue; // the state after the call is not this target's
+            const std::vector<ModAt> &sum = summaryOf(T, all);
             for (const ModAt &x : sum)
               if (x.at.arg >= 0 && (size_t)x.at.arg < in.size() && in[x.at.arg])
                 out.push_back({composeLoc(*in[x.at.arg], x.at), x.under});
@@ -955,8 +978,21 @@
           if (in[a] && !CB->onlyReadsMemory(a))
             out.push_back({*in[a], true});
       };
+      // A cell on a step path is the step's entry value ('e'), a known
+      // constant ('k'), or a value the step produced ('a'), each under the
+      // equations and disequations the path's branches impose.
+      struct Val {
+        char kind = 'e';
+        std::string v;
+        std::set<std::string> ne;
+      };
+      using State = std::map<std::string, Val>;
+      std::map<size_t, std::pair<Function *, std::unordered_set<const BasicBlock *>>> stepChoice;
+      // §3.5 정의 P: need is the requirement on the cells at the goal (the
+      // entry of the next step). On a path that meets it, need becomes the
+      // requirement at this step's entry.
       auto feasiblePath = [&](Function *F, const std::unordered_set<Instruction *> &goals, Mem &m,
-                              const std::unordered_set<const BasicBlock *> &shortest)
+                              const std::unordered_set<const BasicBlock *> &shortest, State *need)
           -> std::unordered_set<const BasicBlock *> {
         auto spellLoc = [](const Loc &c) {
           std::string k = std::to_string(c.arg);
@@ -1117,21 +1153,18 @@
             for (const Atom &a : as)
               tested.insert(a.key);
           }
+        if (need)
+          for (const auto &kv : *need)
+            tested.insert(kv.first);
         if (tested.empty() && !memoOnShortest)
           return shortest;
-        // A cell is the entry value under equations and disequations, a
-        // known value, or unknown.
-        struct Val {
-          char kind = 'e';
-          std::string v;
-          std::set<std::string> ne;
-        };
-        using State = std::map<std::string, Val>;
         auto under = [](const std::string &k, const std::string &p) {
           return k == p || (k.size() > p.size() && k.compare(0, p.size(), p) == 0 && k[p.size()] == '|');
         };
-        auto effects = [&](const BasicBlock *B, State &st) {
+        auto effects = [&](const BasicBlock *B, State &st, bool toGoal) {
           for (Instruction &I : *const_cast<BasicBlock *>(B)) {
+            if (toGoal && goals.count(&I))
+              return;
             if (auto *S = dyn_cast<StoreInst>(&I)) {
               std::string k;
               if (!keyOf(S->getPointerOperand(), k))
@@ -1151,7 +1184,7 @@
               continue;
             std::set<std::string> ks;
             std::vector<ModAt> ms;
-            callModsRel(CB, m, ms);
+            callModsRel(CB, m, ms, false);
             for (const ModAt &x : ms) {
               Loc c;
               if (x.under)
@@ -1165,15 +1198,13 @@
                   st[t] = Val{'a', "", {}};
           }
         };
+        // A value a call or a store left unknown is constrained by the
+        // branches after it like the entry value: the same equations and
+        // disequations on one path.
         auto apply = [](State &st, const Atom &a) {
           Val &x = st[a.key];
           if (x.kind == 'k')
             return (x.v == a.v) == a.eq;
-          if (x.kind == 'a') {
-            if (a.eq)
-              x = Val{'k', a.v, {}};
-            return true;
-          }
           if (a.eq) {
             if ((!x.v.empty() && x.v != a.v) || x.ne.count(a.v))
               return false;
@@ -1195,7 +1226,26 @@
           }
           return s;
         };
-        auto search = [&](const std::unordered_set<const BasicBlock *> &allowed) {
+        // The state at the goal meets the requirement there; what remains
+        // on entry values is the requirement at the step's entry.
+        auto meets = [&](State st, const State *req, State &at) {
+          if (req)
+            for (const auto &[k, r] : *req) {
+              bool ok = true;
+              if (!r.v.empty())
+                ok = apply(st, Atom{k, true, r.v});
+              for (const std::string &n : r.ne)
+                ok = ok && apply(st, Atom{k, false, n});
+              if (!ok)
+                return false;
+            }
+          at.clear();
+          for (const auto &[k, x] : st)
+            if (x.kind == 'e' && (!x.v.empty() || !x.ne.empty()))
+              at[k] = x;
+          return true;
+        };
+        auto search = [&](const std::unordered_set<const BasicBlock *> &allowed, const State *req, State &at) {
           std::unordered_set<const BasicBlock *> path;
           const BasicBlock *entry = &F->getEntryBlock();
           if (!allowed.count(entry))
@@ -1212,12 +1262,16 @@
             int n = q.front();
             q.pop_front();
             if (goalB.count(nodes[n].bb)) {
+              State st = nodes[n].st;
+              effects(nodes[n].bb, st, true);
+              if (!meets(st, req, at))
+                continue;
               for (int i = n; i >= 0; i = nodes[i].prev)
                 path.insert(nodes[i].bb);
               return path;
             }
             State st = nodes[n].st;
-            effects(nodes[n].bb, st);
+            effects(nodes[n].bb, st, false);
             std::vector<const BasicBlock *> succs;
             for (const BasicBlock *S : successors(nodes[n].bb))
               if (allowed.count(S))
@@ -1241,9 +1295,25 @@
           }
           return path;
         };
-        if (!search(shortest).empty())
+        State at;
+        if (need) {
+          if (!search(shortest, need, at).empty()) {
+            *need = at;
+            return shortest;
+          }
+          if (auto found = search(back, need, at); !found.empty()) {
+            *need = at;
+            return found;
+          }
+        }
+        if (!search(shortest, nullptr, at).empty()) {
+          if (need)
+            *need = at;
           return shortest;
-        auto found = search(back);
+        }
+        auto found = search(back, nullptr, at);
+        if (need)
+          *need = found.empty() ? State{} : at;
         return found.empty() ? shortest : found;
       };
       std::function<void(Function *, const std::vector<std::optional<Loc>> &, const std::unordered_set<Instruction *> &, bool, Function *)>
@@ -1279,7 +1349,11 @@
         bindFormals(m, F, args);
         propagateObject(m, F);
         if (F == seq[curStep]) {
-          auto witness = feasiblePath(F, goals, m, reach);
+          auto pre = stepChoice.find(curStep);
+          auto witness = pre != stepChoice.end() && pre->second.first == F ? pre->second.second
+                                                                            : feasiblePath(F, goals, m, reach, nullptr);
+          if (pre != stepChoice.end())
+            stepChoice.erase(pre);
           if (witness != reach) {
             reach = std::move(witness);
             stepPath[curStep] = reach;
@@ -1336,6 +1410,103 @@
         // that load. A local is the store that dominates the branch. A call
         // that returns one argument is that argument. Any other call stays
         // the call, so the comparison is a constraint on its result.
+        // A cell load reads the store of that cell that dominates it when no
+        // instruction between them may write the cell: a store of a related
+        // cell, or a call whose return-path MOD (정의 R) reaches it.
+        auto cellWriter = [&](LoadInst *L, const Loc &cell) -> Value * {
+          auto spell = [](const Loc &c) {
+            std::string k = std::to_string(c.arg);
+            for (const Step &s : c.suf)
+              k += "|" + s.type + "@" + std::to_string(s.off) + (s.deref ? "*" : "");
+            return k;
+          };
+          auto related = [](const std::string &a, const std::string &b) {
+            auto under = [](const std::string &k, const std::string &p) {
+              return k == p || (k.size() > p.size() && k.compare(0, p.size(), p) == 0 && k[p.size()] == '|');
+            };
+            return under(a, b) || under(b, a);
+          };
+          const std::string key = spell(cell);
+          auto storeKey = [&](StoreInst *S, std::string &k) {
+            Loc c;
+            if (!objectLoc(m, S->getPointerOperand(), c) || !cellAt(c, c))
+              return false;
+            k = spell(c);
+            return true;
+          };
+          StoreInst *best = nullptr;
+          for (Instruction &I : instructions(*F))
+            if (auto *S = dyn_cast<StoreInst>(&I)) {
+              std::string k;
+              if (!storeKey(S, k) || k != key || !dominatesBefore(S, L))
+                continue;
+              if (!best || dominatesBefore(best, S))
+                best = S;
+            }
+          if (!best)
+            return nullptr;
+          const BasicBlock *SB = best->getParent(), *LB = L->getParent();
+          std::unordered_set<const BasicBlock *> fwd, mid;
+          std::vector<const BasicBlock *> work(succ_begin(SB), succ_end(SB));
+          while (!work.empty()) {
+            const BasicBlock *B = work.back();
+            work.pop_back();
+            if (fwd.insert(B).second)
+              work.insert(work.end(), succ_begin(B), succ_end(B));
+          }
+          work.assign(pred_begin(LB), pred_end(LB));
+          std::unordered_set<const BasicBlock *> bwd;
+          while (!work.empty()) {
+            const BasicBlock *B = work.back();
+            work.pop_back();
+            if (bwd.insert(B).second)
+              work.insert(work.end(), pred_begin(B), pred_end(B));
+          }
+          for (const BasicBlock *B : fwd)
+            if (bwd.count(B))
+              mid.insert(B);
+          auto writes = [&](Instruction &I) {
+            if (&I == best)
+              return false;
+            if (auto *S = dyn_cast<StoreInst>(&I)) {
+              std::string k;
+              return !storeKey(S, k) || related(k, key);
+            }
+            auto *CB = dyn_cast<CallBase>(&I);
+            if (!CB)
+              return false;
+            std::vector<ModAt> ms;
+            callModsRel(CB, m, ms, false);
+            for (const ModAt &x : ms) {
+              Loc c;
+              if (x.under ? related(spell(x.at), key) : cellAt(x.at, c) && related(spell(c), key))
+                return true;
+            }
+            return false;
+          };
+          bool after = false;
+          for (Instruction &I : *const_cast<BasicBlock *>(SB)) {
+            if (SB == LB && &I == L)
+              break;
+            if (after || mid.count(SB))
+              if (writes(I))
+                return nullptr;
+            after = after || &I == best;
+          }
+          for (const BasicBlock *B : mid)
+            if (B != SB && B != LB)
+              for (Instruction &I : *const_cast<BasicBlock *>(B))
+                if (writes(I))
+                  return nullptr;
+          if (LB != SB || mid.count(LB))
+            for (Instruction &I : *const_cast<BasicBlock *>(LB)) {
+              if (&I == L && !mid.count(LB))
+                break;
+              if (writes(I))
+                return nullptr;
+            }
+          return best->getValueOperand();
+        };
         auto mustVal = [&](Value *V) -> Value * {
           std::unordered_set<Value *> seen;
           std::function<Value *(Value *)> go = [&](Value *V) -> Value * {
@@ -1345,8 +1516,11 @@
               V = C->getOperand(0);
             if (auto *L = dyn_cast<LoadInst>(V)) {
               Loc cell;
-              if (locate(L, cell))
+              if (locate(L, cell)) {
+                if (Value *W = cellWriter(L, cell); W && isa<CallBase>(W->stripPointerCasts()))
+                  return go(W);
                 return L;
+              }
               auto *A = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts());
               if (!A || !factAt)
                 return L;
@@ -1583,8 +1757,30 @@
               ev.vals.insert(k);
             stepEv[curStep].push_back(std::move(ev));
           };
+          auto unequal = [&](const Loc &cell, const std::string &k) {
+            keep(cell);
+            noteFact(cell, 'n', k);
+            stepNe[curStep][{cell.arg, cell.suf}].insert(k);
+            neq[{cell.arg, cell.suf}].insert(k);
+          };
           if (lc && rc && !CL && !CR) {
             push(L, 'p', pred, "", &R);
+            return;
+          }
+          // 정의 A: c ⋈ v with v neither cell nor constant carries ∃a. c ⋈ a.
+          if (lc != rc && !CL && !CR && Cmp->getOperand(0)->getType()->isIntegerTy()) {
+            ICmpInst::Predicate p = lc ? pred : ICmpInst::getSwappedPredicate(pred);
+            APInt k;
+            switch (p) {
+            case ICmpInst::ICMP_ULT: k = APInt::getMaxValue(bits); break;
+            case ICmpInst::ICMP_UGT: k = APInt::getZero(bits); break;
+            case ICmpInst::ICMP_SLT: k = APInt::getSignedMaxValue(bits); break;
+            case ICmpInst::ICMP_SGT: k = APInt::getSignedMinValue(bits); break;
+            default: return;
+            }
+            SmallVector<char, 32> buf;
+            k.toString(buf, 10, true);
+            unequal(lc ? L : R, std::string(buf.begin(), buf.end()));
             return;
           }
           Loc cell;
@@ -1611,12 +1807,9 @@
           std::string k = dec(cast<ConstantInt>(C));
           if (use == ICmpInst::ICMP_EQ)
             equation(cell, k);
-          else if (use == ICmpInst::ICMP_NE) {
-            keep(cell);
-            noteFact(cell, 'n', k);
-            stepNe[curStep][{cell.arg, cell.suf}].insert(k);
-            neq[{cell.arg, cell.suf}].insert(k);
-          } else
+          else if (use == ICmpInst::ICMP_NE)
+            unequal(cell, k);
+          else
             push(cell, 'r', use, k, nullptr);
         };
         for (const BasicBlock *CBB : reachOrd) {
@@ -1804,7 +1997,7 @@
               } else
                 down.push_back(std::nullopt);
             }
-            if (!touch || !didCallee.insert(D).second)
+            if (!touch)
               continue;
             // 피호출자 안의 목표는 반환이다. 이 호출의 결과에 경로가 반환 제약을
             // 걸었으면(위 retCons), 목표는 그 제약을 만족할 수 있는 반환값의
@@ -1869,6 +2062,8 @@
             }
             if (rets.empty())
               rets = allRets;
+            if (!didCallee.insert({D, std::set<const Instruction *>(rets.begin(), rets.end())}).second)
+              continue;
             Instruction *savedA = evAnchor;
             bool savedM = evCallMust;
             if (F == seq[curStep]) {
@@ -1881,7 +2076,7 @@
             evCallMust = savedM;
           }
       };
-      for (size_t si = 0; si < mapped && si < seq.size(); ++si) {
+      auto stepGoals = [&](size_t si) {
         std::unordered_set<Instruction *> goals;
         if (si + 1 < seq.size())
           for (Instruction &I : instructions(*seq[si])) {
@@ -1895,6 +2090,25 @@
         for (Instruction &I : instructions(*seq[si]))
           if (sinkHere(I, sinkFile, sinkLine))
             goals.insert(&I);
+        return goals;
+      };
+      // §3.5 정의 P: the step paths are chosen from the sink back, each one
+      // meeting the requirement the later steps put on its goal.
+      State need;
+      for (size_t si = std::min(mapped, seq.size()); si-- > 0;) {
+        Function *F = seq[si];
+        auto goals = stepGoals(si);
+        if (!F || F->isDeclaration() || goals.empty()) {
+          need.clear();
+          continue;
+        }
+        Mem m;
+        bindFormals(m, F, frames[si]);
+        propagateObject(m, F);
+        stepChoice[si] = {F, feasiblePath(F, goals, m, chosenPath(F, goals), &need)};
+      }
+      for (size_t si = 0; si < mapped && si < seq.size(); ++si) {
+        auto goals = stepGoals(si);
         curStep = si;
         evAnchor = nullptr;
         evCallMust = true;

@@ -707,7 +707,7 @@ void KleeHandler::processTestCase(const ExecutionState &state,
       }
     }
 
-    if (m_numGeneratedTests == MaxTests)
+    if (MaxTests && m_numGeneratedTests == MaxTests)
       m_interpreter->setHaltExecution(true);
 
     if (WriteTestInfo) {

@@ -1,132 +1,136 @@
 \section{Design of \sys}
 \label{sec:design}
 
-In this section, we describe how \sys assesses whether a vulnerability in an upstream library $U$ remains triggerable through a downstream library $D$.
-Given closed LLVM bitcode for $D \cup U$, the exported interface $I$ of $D$, and a sink location $s$ in $U$, \sys synthesizes a client of $D$ and searches for an explicit input under which that client reaches $s$.
-When no such client exists, it reports the unrealizable obligations that block synthesis.
-The remainder of this section develops the three phases that address Challenges~1--3 from \autoref{sec:moti}.
+In this section, we describe the design of \sys, which assesses vulnerability exploitability through downstream applications by recovering the calls and runtime state needed to trigger vulnerable behavior and finding inputs that trigger it.
 
-\PP{Overview}
-\autoref{fig:overview} summarizes the workflow.
-In P1, \sys recovers witness sequences---call chains from an export in $I$ to a function containing $s$---by resolving indirect calls with a slot-sensitive call relation and retaining only paths whose formulas are satisfiable.
-In P2, it projects each witness onto client obligations over entry-rooted cells, determines how those obligations can be realized through $D$'s interface, and produces either a configuration-complete call plan or a set of open obligations.
-In P3, it searches for concrete inputs under that plan using distance-guided concolic execution.
-Throughout, the three phases share the same resolved call relation, so planning and exploration do not invent callees that sequence recovery has already ruled out.
+\PP{Overview.}
+\autoref{fig:overview} shows the workflow of \sys, which consists of three phases: \textit{trigger path recovery} (P1), \textit{harness generation} (P2), and \textit{concolic execution} (P3).
 
-As a running example, we reuse the libtiff--libjpeg-turbo case from \autoref{sec:moti}, where strip decoding enters through \texttt{TIFFReadEncodedStrip} and the sink lies under JPEG decompression.
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{./design/overview_HJ_simple.pdf}
+\caption{Overview of \sys.}
+\label{fig:overview}
+\end{figure}
 
-% \begin{figure}[t]
-%   \centering
-%   \includegraphics[width=\linewidth]{./imgs/overview.pdf}
-%   \caption{Overview of \sys.}
-%   \label{fig:overview}
-% \end{figure}
+In P1, \sys recovers a call sequence from a public API of the downstream application to the vulnerable code in the upstream library, along with the conditions required to reach it.
+In P2, \sys generates a harness that invokes the downstream application's public APIs in the recovered sequence and establishes the required arguments and runtime state.
+Together, P1 and P2 recover how the downstream application can reach the vulnerable code and prepare the state needed to trigger it.
+In P3, \sys performs concolic execution on the generated harness to find inputs that trigger the vulnerability.
 
-\subsection{Recovering Call Sequences with Slots (P1)}
+
+\subsection{Recovering Trigger Path (P1)}
 \label{subsec:p1}
 
-P1 recovers the call sequences through which a client of $D$ can reach $s$ under conditions that can install the vulnerability's trigger.
-At the $D$--$U$ boundary, the decisive transfers are often indirect: callback fields, registry-selected handlers, and C++ virtual calls.
-Following only direct edges therefore misses sequences that arise in practice, whereas treating every signature-compatible function as a callee invents sequences that no client can install.
-P1 accordingly resolves each indirect call not merely by type, but by the dispatch slot from which the callee is read.
+The goal of P1 is to recover how a client of the downstream application $D$ can reach a sink $s$ in the upstream library $U$.
+A client never calls $U$ by name.
+It may invoke only $D$'s interface $I$---the functions that $D$ both exports and declares in its headers---and control reaches $U$ only after $D$ has installed the callees that cross the boundary.
+What P1 recovers is therefore a \emph{trigger path}: a call sequence
+\[
+\pi = f_0 \rightarrow f_1 \rightarrow \cdots \rightarrow f_n
+\]
+together with a path condition $\varphi$ under which that sequence can run.
+Here $f_0 \in I$, each step $f_i \rightarrow f_{i+1}$ is a resolved call, and $f_n$ contains $s$.
+P2 establishes $\varphi$ through $D$'s APIs, and P3 searches for concrete bytes on the harness that P2 builds.
+P1 itself is a \emph{may} analysis: a retained $(\pi, \varphi)$ is a candidate that install-resolved edges and a satisfiable condition at $f_0$ make plausible, not a proof that some client execution reaches $s$.
+Spurious candidates are discarded when P2 cannot establish $\varphi$ or when P3 finds no concrete witness.
 
-\subsubsection{Slot-Sensitive Call Relation}
-\label{subsubsec:slots}
+Tracking $\pi$ takes three analyses.
+The call graph must expose the steps $f_i \rightarrow f_{i+1}$, including indirect ones.
+The start $f_0$ must be a client-visible root in $I$.
+The sequence must then survive a check that $\varphi$ is satisfiable at $f_0$.
+Indirect calls dominate the $D$--$U$ boundary, so a graph of direct edges alone misses real steps, while signature matching invents steps that no install wrote.
+Even on a careful graph, $\pi$ may still be unrealizable because of branches or missing installs.
+P1 answers the first issue with field-sensitive points-to analysis of function-pointer installs, and the second by solving $\varphi$ at $f_0$.
 
-\sys first constructs a call relation over all defined functions of $D \cup U$.
-Direct calls contribute a single edge.
-For an indirect call $c$, it computes two target sets.
-The signature layer $T_{\mathrm{sig}}(c)$ contains every address-taken function whose LLVM type matches $c$; under the C calling convention this set over-approximates every well-typed callee, and P3 later uses it for conservative unreachability proofs.
-The slot layer $T_{\mathrm{slot}}(c)$ refines that set by a field- and object-sensitive flow of function constants in the style of multi-layer type analysis~\cite{lu2019where}.
-Addresses are named either by source field paths derived from DWARF and LLVM struct layouts, or by abstract objects for allocas, globals, and opaque allocator results.
-Stores and loads move function tokens through these locations; SSA operations (\texttt{phi}, \texttt{select}, casts, and GEPs) copy them; and calls transfer them among actuals, formals, and returns.
-Virtual calls are handled by class-hierarchy analysis on the receiver's static class and stored vtables, rather than by merging the vptr into the object's data cell.
-When dispatch is keyed by a symbolic name---as in codec registries---\sys also records the constant strings that select a handler.
-The slot of $c$ is the cell or vtable entry that $c$ reads, and $T_{\mathrm{slot}}(c)$ retains only functions that can flow into that slot.
-An empty slot set means no function constant reaches $c$; such calls are excluded from sequence search, so signature-compatible but never-installed callees do not appear as phantom edges.
+The input is closed LLVM bitcode for $D$ linked with $U$, plus the source location of $s$, mapped to an IR instruction by debug information.
+$I$ is the intersection of dynamically exported symbols and header-declared names.
 
-\subsubsection{Witness Extraction}
-\label{subsubsec:sequences}
+\PP{Phase overview.}
+P1 recovers $\pi$ in order.
+Call-target resolution builds the edges $f \rightarrow g$ of the call graph~(\autoref{subsubsec:resolve}).
+Entry extraction chooses admissible starts $f_0$~(\autoref{subsubsec:entries}).
+Path enumeration extends $f_0$ toward $s$ into a full sequence and retains $(\pi, \varphi)$ when $\varphi$ is satisfiable at $f_0$~(\autoref{subsubsec:enumerate}).
+The resolved edges are reused by P2 and P3, so later phases do not re-analyze calls.
 
-Let $G$ be the graph whose edges are the direct callees together with every $t \in T_{\mathrm{slot}}(c)$.
-\sys restricts $G$ to the cone of functions that can reach $s$ and then enumerates simple paths from interface starts in $I$, preferring fewer indirect edges and shorter length.
-After accepting a path, it bans that path's final edge into the sink before searching again, so successive witnesses differ.
+\subsubsection{Resolving Call Targets}
+\label{subsubsec:resolve}
 
-For a candidate sequence $\pi = f_0 \cdots f_n$, \sys does not retain the full CFG of each $f_i$.
-Inside $f_i$ it first collects the \texttt{BasicBlock}s that can reach the call of $f_{i+1}$---or the sink instruction, when $f_i$ is last---by walking predecessors from those goals.
-Within this slice it selects the shortest entry-to-goal path among blocks that still reach a goal, breaking ties by block name.
-The conjunction of the branch conditions on that path, together with dispatch equalities that bind each indirect slot to the next function of $\pi$, forms the path formula $\varphi_\pi$.
+The first analysis recovers the steps of $\pi$: for every call site in a function $f$, which callees $g$ that site may enter, so that each consecutive pair in $\pi$ is an edge $f \rightarrow g$ on the call graph.
+Direct calls name $g$ in the IR and contribute that edge immediately.
+Indirect calls do not: they load a location and jump to the function constant stored there.
+Downstream code often reaches upstream code through exactly those sites---a setup path stores a handler into an object field, and a later path loads that field---so the possible $g$'s are what this analysis must compute.
+Ignoring the site drops a real step of $\pi$.
+Filling it with every address-taken function of matching type invents steps that no store created.
+P1 therefore computes $g$ from pointer installs.
 
-\sys then solves $\varphi_\pi$ against the export cells of $f_0$.
-The solver walks the sequence under a memory map from SSA values to cells, resolves local allocas through their reaching stores, and folds summarizable callees---functions whose stores into the export object occur only at constant offsets---so that residual analysis begins at the first step that cannot be folded.
-Only sequences for which this solve succeeds are emitted as witnesses; graph-reachable but value-infeasible candidates are discarded.
+\PP{Points-to analysis of function-pointer installs.}
+P1 runs a field-sensitive, flow-insensitive points-to analysis restricted to function pointers~\cite{lu2019where,cheng2000access}.
+It tracks each function constant $g$ defined in $D \cup U$ through the abstract locations that may hold it.
+A location $\ell$ is a root (a global, an argument, or a heap object keyed by allocation site) refined by an access path of struct-field indices and constant offsets when the layout is known---so a store into one field never updates another---and the same paths are recovered from TBAA tags when IR uses byte GEPs.
+Flow insensitivity means one tracked set per $\ell$ for the whole module: every IR transfer that moves a function pointer updates that set, and the analysis keeps the least fixed point of those updates.
 
-In the libtiff example, one retained witness begins at \texttt{TIFFReadEncodedStrip}, crosses into JPEG decoding, and records the decode slots that must already hold the JPEG handlers.
-Those slots, rather than a call to \texttt{jpeg\_skip\_scanlines}, are what a downstream client must establish.
+Tracking begins at stores of a function constant: if $g$ is written into $\ell$, $g$ is tracked at $\ell$.
+A cast, phi, select, or GEP from $u$ to $v$ carries every tracked $g$ at $u$ over to $v$.
+A store of a pointer into address $a$ carries the tracked set into every cell of $a$, and a load carries those cells' sets into the loaded value; tokens also move between a field path and every suffix of that path, so the same field is shared under outer and inner addressing.
+At a call, tracked values move from actuals into formals of every type-compatible callee already tracked at the callee operand, and from that callee's return into the call result; as the operand's tracked set grows, new callees are admitted until the fixed point.
 
-\PP{Output of P1}
-P1 yields the set of satisfiable witnesses and the shared map $T_{\mathrm{slot}}$, which is serialized for the executor.
-P2 consumes the witnesses; P3 reuses $T_{\mathrm{slot}}$ when ranking states by sink distance.
+At a non-virtual indirect call in $f$, P1 reads the tracked set of the loaded location and keeps every $g$ from $D \cup U$ whose type matches the call.
+Each such $g$ becomes an edge $f \rightarrow g$.
+If nothing is tracked there, the site contributes no library edge: P1 does not invent steps from signature matches alone.
 
-\subsection{Recovering Arguments and State with Cells (P2)}
+Virtual calls are not resolved by the same tracking.
+Untyped object contents erase field offsets, so a vptr cannot share that cell with ordinary data without merging unrelated values.
+P1 therefore takes vtable methods of classes derived from the receiver's static type (from debug inheritance) and retains those that match the call type.
+
+\PP{Completing the call-graph edges.}
+The tracked installs above recover stores performed inside $D$ and $U$.
+The same loaded location may still receive a function pointer from outside the closed bitcode---a client callback or a runtime hook---so P1 also records those external callees and treats an edge that exists only that way as an obligation for the harness or the environment.
+The edges used when extending $\pi$ are the tracked callees together with those external ones, restricted to address-taken functions of matching type.
+P2 and P3 read this same edge relation and do not re-resolve calls.
+
+\subsubsection{Selecting Entry Points}
+\label{subsubsec:entries}
+
+The call graph supplies possible steps $f_i \rightarrow f_{i+1}$, but not yet the first function $f_0$ of $\pi$.
+P1 next chooses that start.
+
+It performs a reverse reachability search from the function that contains $s$, walking edges backward, and obtains the cone of every function that can reach $s$.
+Intersecting the cone with $I$ yields the exports that can appear on some path to the sink.
+Some of those exports appear in the cone only because another interface function already called them.
+They can be an $f_i$ for $i>0$, but not $f_0$: treating them as starts would force the harness to invent a prefix that $\pi$ never records.
+P1 therefore keeps only cone roots inside $I$---functions $f_0 \in I$ that reach $s$ and have no caller inside the cone.
+Every retained $\pi$ begins at such an $f_0$.
+
+\subsubsection{Enumerating Feasible Paths}
+\label{subsubsec:enumerate}
+
+P1 finally builds full sequences $\pi = f_0 \rightarrow \cdots \rightarrow f_n$ on the call graph, where $f_n$ contains $s$.
+From each admissible $f_0$ it searches for simple paths to $f_n$, ranking candidates by fewer indirect edges and then by shorter length.
+After a path is accepted, its last edge into $f_n$ is banned and the search resumes, so later paths enter the sink at a different call site.
+
+A path returned by this search is still only a syntactic $\pi$.
+Inside some $f_i$, branches may refuse the route to the call of $f_{i+1}$, and an indirect step $f_i \rightarrow f_{i+1}$ succeeds only when the loaded location already holds $f_{i+1}$.
+P1 therefore materializes a path condition $\varphi$ for each candidate and retains $(\pi, \varphi)$ only when a solver finds a model at $f_0$.
+
+\PP{Forming and checking the path condition.}
+For a candidate $\pi$, P1 builds the intraprocedural CFG of each $f_i$, collects the basic blocks that can reach the call to $f_{i+1}$ (or the sink instruction when $i=n$), and selects one short route from $f_i$'s entry across that slice.
+Branch predicates on those routes become control constraints.
+Each indirect step $f_i \rightarrow f_{i+1}$ contributes a dispatch constraint that the loaded location holds $f_{i+1}$.
+$\varphi$ is the conjunction of those control and dispatch constraints.
+P1 asks an SMT solver for a model of $\varphi$ over the arguments and fields of $f_0$, following stores into locals and summarizing callees that only write constant offsets into export-visible objects.
+If $\varphi$ is satisfiable at $f_0$, P1 retains $(\pi, \varphi)$ for P2 and P3.
+Otherwise the candidate is discarded, while another route through the same functions may still succeed.
+
+\PP{Output of P1.}
+P1 emits the retained pairs $(\pi, \varphi)$ and the resolved call-graph edges.
+If nothing is retained, no sequence $f_0 \rightarrow \cdots \rightarrow f_n$ with $f_0 \in I$ explains how a client of $D$ reaches $s$.
+A non-empty result is still only a may set of trigger paths for P2 and P3 to discharge.
+
+
+\subsection{Generating Harness (P2)}
 \label{subsec:p2}
 
-Even a satisfiable witness does not yet say what a client of $D$ must supply.
-Its formula constrains many locations that $U$ allocates and initializes only after control crosses from $D$ into $U$, and treating those locations as client duties either over-constrains the harness or obscures why synthesis fails.
-P2 therefore projects each witness onto obligations that are visible at $D$'s interface, and plans interface calls that realize them.
 
-\subsubsection{Cells and Alias Identity}
-\label{subsubsec:cells}
-
-\sys represents each obligation site as a \emph{cell}: the alias class of memory locations named by an access path rooted at an argument of the witness entry $f_0$ (or at a global when required).
-The path suffix is a sequence of source struct types and constant byte offsets.
-Two IR pointers denote the same cell when the location analysis maps them to the same path.
-Accesses through a variable struct-field index are rejected, because they do not name a unique cell; variable array indices collapse to a single element cell.
-Cells thus give each obligation a stable, client-visible identity instead of an ephemeral SSA value.
-
-\subsubsection{Boundary Projection}
-\label{subsubsec:projection}
-
-Along a witness $\pi$, a crossing edge is a call from a function defined in $D$ into one defined in $U$.
-The crossing roots are the cells of the pointer actuals at those calls, when those actuals are expressible from $f_0$.
-A constrained cell of $\varphi_\pi$ is a boundary cell if it lies inside some crossing root---that is, if it shares the root and has a suffix for which the crossing actual is a prefix.
-A prefix cell is a constrained cell of a client-owned object argument that the $D$ prefix must satisfy in order to reach the crossing.
-Client obligations comprise the boundary cells, the prefix cells, and the own cells of $\varphi_\pi$; cells that $U$ writes only after crossing are dropped.
-Structural obligations, such as a cell that carries a file name, are retained even when no concrete value has been fixed.
-
-\subsubsection{Realizability by Taint and Writers}
-\label{subsubsec:realize}
-
-For every defined function, \sys records the fields it stores and loads, as well as its control references---the fields read by branch and \texttt{switch} conditions, recovered by a backward SSA slice of the condition in which a field load ends the slice and an \texttt{alloca} load continues through the stores into that slot.
-
-Given a cell $c$, the writers of $c$ are the callable exports of $D$ whose inner closures---calls that do not re-enter another callable export---contain a store that can satisfy $c$'s constraint.
-Whether a writer carries $c$ is decided by interprocedural taint from its formals along SSA edges, local store/reload pairs, loads through derived pointers, and call/return summaries.
-Only writers that carry $c$ are admitted for boundary and prefix cells.
-When the entry fills $c$ solely by copying from a source field, the obligation is rewritten onto the setters of that source.
-Opaque held objects may be realized through constructor levers: integer formals of producers that taint-reach the constrained field.
-Cells written under a tag selected by a constant key from P1 are realized by the corresponding key setters.
-Finally, if the entry or a producer it expands reads input while writing $c$ with a non-constant, $c$ may be treated as a file-content lever.
-
-\subsubsection{Plan Synthesis}
-\label{subsubsec:plan}
-
-Each obligation is assigned the first matching realization among own writes into public fields, producer levers, key setters, interface writers, library-determined construction, file-derived writes, and---when none apply---an open residual.
-Write obligations are covered by a greedy set cover of at most $K$ writers, matching the harness grammar that offers $K$ writer choices before the entry; uncovered write cells remain open.
-The resulting plan unions, over witnesses, the chosen entries, guards, levers, keyed setters, and writers, together with an AND--OR grammar over producers of held handle types, ordered by production cost.
-Indirect edges of a passing witness must likewise be realized---by a registry key with file input, by an installer reached while reading input, or by a planned writer or key setter---or they are reported open.
-
-In the libtiff witness, projection retains the strip-buffer cell of \texttt{TIFFReadEncodedStrip} and the decode-state cells that cross into JPEGDecode, while discarding libjpeg-internal upsampler fields initialized after the crossing.
-A \texttt{NULL} strip buffer then appears as an argument obligation of the plan: the trigger lever discussed in \autoref{sec:moti}, rather than a claim about how typical TIFF clients behave.
-
-\PP{Output of P2}
-When every obligation of some witness is realized, P2 emits a configuration-complete harness plan whose remaining unknowns are explicit inputs for P3.
-When a required cell or dispatch edge remains open, it reports a configuration failure, distinct from a later failure to find an input.
-
-\subsection{Searching Explicit Inputs with Concolic Execution (P3)}
+\subsection{Concolic Execution (P3)}
 \label{subsec:p3}
-
-Once the plan has no open obligations, the remaining task is to search the harness input domain---files, byte buffers, and related scalars---for an input that drives execution to $s$.
-Full symbolic execution tends to exhaust its budget in the solver before leaving parser prefixes.
-\sys therefore runs a generational concolic search in which a concrete seed decides branches, addresses, and allocation sizes without invoking the solver, and untaken sides become pending flips that are solved only when selected.
-States are ranked by a sink distance computed on the same $T_{\mathrm{slot}}$ relation as P1, so signature-only phantom callees do not steer exploration; unreachability claims, conversely, rely only on the coarser $T_{\mathrm{sig}}$ layer.
-We defer the remaining search machinery and its evaluation to \autoref{sec:eval}.

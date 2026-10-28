@@ -451,9 +451,7 @@ private:
     uint64_t flips = 0, bounded = 0, respawned = 0;
     uint64_t checkpoints = 0, checkpointAt = 0; // pristine moves, last count
     uint64_t slotMisses = 0; // executed indirect targets the slot rule omits
-    uint64_t gates = 0, gatesSolved = 0; // Π_I gate flips spawned and solved
-    uint64_t gateReached = 0, gateSym = 0; // gate branches hit / hit symbolic
-    uint64_t directed = 0, directedSolved = 0; // T_st-reducing flips promoted
+    uint64_t gates = 0; // Π_I gate flips spawned
     std::map<std::string, uint64_t> fates, open;
   } ledger;
   void concolicAccount(ExecutionState &state, StateTerminationType reason);
@@ -465,12 +463,12 @@ private:
   /// again. Nothing is
   /// discarded for lack of memory.
   struct Deferred {
-    uint64_t distance;
+    std::pair<unsigned, uint64_t> key; // orderKey of the deferred state
     unsigned floor;
     std::vector<KTest *> inputs; // the state's seeds, re-run together
     std::set<std::string> fixed;
   };
-  std::vector<Deferred> deferred; // min-heap on distance
+  std::vector<Deferred> deferred; // min-heap on key
   std::vector<std::unique_ptr<KTest, void (*)(KTest *)>> deferredInputs;
   ExecutionState *pristine = nullptr;
   std::set<std::string> programFunctions; // defined in the input module
@@ -516,8 +514,24 @@ private:
   /// falling back to T. Zero exactly when sinkDistance is.
   uint64_t sinkOrder(ExecutionState &state);
 
+  /// Concolic mode (DESIGN-D §6, order). The order key k = (gen, g) of a
+  /// state: its generation, then its sink order g (sinkOrder, or 1 without a
+  /// sink guide; an unreachable state sorts last). Selection takes the least
+  /// key, deferral the greatest.
+  std::pair<unsigned, uint64_t> orderKey(ExecutionState &state);
+
+  /// Concolic mode. The input-carrying state now running: it runs until it
+  /// ends, is deferred, or loses its input; then the state of least key runs.
+  ExecutionState *running = nullptr;
+  ExecutionState *selectConcolic();
+
+  /// Concolic mode. Turn a seeded state into a pending flip of the next
+  /// generation; parent is the input it followed (kept if null).
+  void makePending(ExecutionState &state,
+                   std::shared_ptr<const Assignment> parent);
+
   /// Concolic mode. Keep at most --concolic-pending flips in memory; the
-  /// farthest from the sink are deferred first.
+  /// greatest keys are deferred first.
   void prunePending();
 
   /// Concolic mode. End a state (seeded or pending) whose sink distance is
@@ -533,14 +547,6 @@ private:
   /// memory cap.
   void spawnGateFlips(ExecutionState &state, const ref<Expr> &cond,
                       KInstruction *ki);
-
-  /// Concolic mode. When a conditional branch's two sides are a seeded path
-  /// and a pending flip, and the flip moves strictly closer to an uninstalled
-  /// input-dispatch installer (smaller finite T_st, from sp.st -- DESIGN-D
-  /// §3.7 D item 2), solve the flip now so it joins the seeded generation and
-  /// drives toward the installer, instead of waiting for the pending pool to
-  /// drain.
-  void promoteDirectedFlip(ExecutionState *a, ExecutionState *b);
 
   /// Bind a constant value for e to the given target. NOTE: This
   /// function may fork state if the state has multiple seeds.
