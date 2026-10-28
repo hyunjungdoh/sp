@@ -85,6 +85,23 @@ public:
     // are client obligations. Without a crossing the projection is undefined
     // and every cell stays an obligation.
     bool crossing = false;
+    // §3.8 정리 B 보정: 첫 교차 이하의 D 함수가 경로 조건에서 읽은 셀(Φ_pre).
+    bool prefix = false;
+  };
+  // §3.8 정의 3.8.4 키 세터 레버: 인터페이스 W(…, 태그 = tag, …, 가변 인자)가 셀
+  // target을 쓴다. 가변 인자의 값은 preds를 만족하는 값 중에서 고른다.
+  struct Keyed {
+    std::string fn;
+    unsigned obj = 0;
+    int tag = -1;
+    int64_t tagV = 0;
+    bool va = false;
+    std::vector<std::pair<std::string, int64_t>> preds;
+    std::string target;
+    int root = -1;
+    std::vector<std::string> path;
+    int64_t off = -1;
+    bool covers(const Cell &c) const { return root == c.root && off == c.off && path == c.path; }
   };
   // A constraint on an integer field embedded in an entry argument: the
   // field at byte offset off of argument root, width bits wide.
@@ -108,6 +125,34 @@ public:
     std::vector<int64_t> values;
     std::string text;
   };
+  // §3.9: how the plan establishes one obligation cell, first that applies.
+  enum class Realize { Own, Lever, Key, Write, Construct, File, Open };
+  static const char *realizeName(Realize r);
+  struct Realized {
+    Cell cell;
+    Realize how = Realize::Open;
+    // The call the realization relies on: the producer of a lever, the key
+    // setter, the covering writer, or the call that reads the input.
+    Function *by = nullptr;
+  };
+  struct WitnessPlan {
+    Function *first = nullptr;
+    std::vector<Function *> entries;
+    bool iface = false;
+    // Steering: the configuration and guards at the first function (when
+    // it is the entry), the producer levers, and the input name fields.
+    bool direct = false;
+    std::vector<Guard> guards;
+    std::vector<std::pair<Function *, Lever>> levers;
+    std::vector<Cell> files;
+    // Realization: one per obligation cell, the write cover, and the key
+    // setter calls the Key cells use.
+    std::vector<Realized> cells;
+    std::vector<Function *> cover;
+    std::vector<std::pair<Function *, Keyed>> keyed;
+    bool pass = false;
+  };
+  using Witnesses = std::vector<std::pair<std::vector<std::string>, std::vector<Cell>>>;
   struct Plan {
     // Per entry, a disjunction over its witnesses of the conjunction of
     // their frozen constraints. An entry with an unguarded witness has none.
@@ -117,25 +162,32 @@ public:
     std::vector<Function *> firsts;
     std::vector<Function *> entries;
     std::vector<std::pair<std::string, std::vector<Producer>>> handles;
-    std::vector<Cell> clientCells;
     // Per entry, the public fields of its arguments that name the input
     // file; the client writes the input's name into them before the call.
     FnMap<std::vector<Cell>> files;
     // §2.4 Key: the names the witnesses' indirect targets are registered
     // under. The input file may carry one as its extension.
     std::vector<std::string> keys;
-    std::vector<std::pair<Cell, std::vector<Function *>>> cellWriters;
+    // §3.9: the union of the write covers of the witnesses that pass.
     std::vector<Function *> writers;
-    // One line per witness: whether its library cells are discharged by at
-    // most four interface calls that are not the entry itself.
-    std::vector<std::string> verdicts;
+    // §3.9: per witness, the realization of each obligation cell.
+    std::vector<WitnessPlan> witnesses;
     // §3.7: per witness, its indirect edges and how Definition D realizes
     // each, and the number left open.
     std::vector<std::string> obligations;
+    // §3.7 D item 2 / H3: first input-dispatch installer per witness
+    // (`input:F`). The search approaches these before the sink (Π_I gate).
+    std::vector<std::string> stInstallers;
     // Per producer of a held type, the calls that can establish the state
     // it reads before it can produce.
     std::map<std::pair<Function *, std::string>, std::vector<Function *>, FnOrder> deps;
+    // §3.8 정의 3.8.4: per entry, the key setter calls that realize a cell of
+    // a witness that passes, in the order the may layer found them.
+    FnMap<std::vector<std::pair<Function *, Keyed>>> keyed;
   };
+
+  // §3.8: the key setters of each witness, aligned with plan()'s witnesses.
+  std::vector<std::vector<Keyed>> keyedIn;
 
   Client(Module &down, Module &up, const fs::path &dir);
   static std::set<std::string> downstreamInterface(const fs::path &dir);
@@ -146,7 +198,7 @@ public:
   // Every symbol, function or data, exported or local, a library the closure
   // installs defines.
   static std::set<std::string> installedExports(const fs::path &dir);
-  Plan plan(const std::vector<std::pair<std::vector<std::string>, std::vector<Cell>>> &witnesses) const;
+  Plan plan(const Witnesses &ws) const;
   void report(const Plan &P, raw_ostream &out) const;
   void emit(const Plan &P, Module &H) const;
   // Bounds of the client search: writer calls before the entry, and the
@@ -299,10 +351,10 @@ private:
   std::string constructs(Function *F) const;
   bool isPublic(const std::string &key) const;
   Kind classify(const DIType *T, std::string &key) const;
-  std::map<std::pair<std::string, int64_t>, FnSet> fnField;
   Value *fieldAddress(Value *P) const;
   std::vector<std::pair<std::string, int64_t>> fieldsOf(Value *P) const;
-  void constFields(Constant *C, Type *T, std::string S, int64_t at, const DIType *D);
+  // §3.10 the call relation the may layer resolved, read from the marks.
+  klee::calls::Targets targets;
   void buildCalls();
   void buildStores();
   void buildReleases();
@@ -325,6 +377,52 @@ private:
   bool everStored(const std::string &type, int64_t off) const;
   mutable std::set<std::pair<std::string, int64_t>> storedFields;
   mutable bool storedBuilt = false;
+
+  // §3.9 facts. A field is the last (struct type, offset) step of a cell.
+  using Field = std::pair<std::string, int64_t>;
+  static Field fieldOf(const Cell &c) { return {c.type, c.off}; }
+  // The integer values of a cell's atom, false when one is not a constant.
+  static bool intValues(const Cell &c, std::vector<int64_t> &vs);
+  // The held type of argument root of E, or "".
+  std::string heldType(Function *E, int root) const;
+  // The cell lies in a public object the client passes to E.
+  bool own(Function *E, const Cell &c) const;
+  // §3.6 copy map: the stores in F's inner closure of a value loaded from
+  // one field into another, as destination -> sources.
+  const std::map<Field, std::set<Field>> &copies(Function *F) const;
+  mutable FnMap<std::map<Field, std::set<Field>>> copiesOf;
+  // The interface functions that set a source F copies into c's field.
+  std::vector<Function *> copySetters(Function *F, const Cell &c) const;
+  // §3.8 taint (iii): F returns a value derived from its formal j.
+  bool returnsArg(Function *F, unsigned j) const;
+  mutable std::map<std::pair<Function *, unsigned>, bool> returnsOf;
+  // §3.6 lever: the fields W's closure stores a value derived from its
+  // scalar, byte or text formals (only that formal when only >= 0).
+  const std::set<Field> &argStores(Function *W, int only = -1) const;
+  mutable std::map<std::pair<Function *, int>, std::set<Field>> argStoresOf;
+  // W stores a value of its arguments to c's field or a field E copies
+  // into it.
+  bool carries(Function *W, const Cell &c, Function *E) const;
+  // §7: F's inner closure calls an input primitive.
+  bool readsInput(Function *F) const;
+  mutable FnMap<bool> readsOf;
+  // Some store F's closure executes writes to the field a non-constant, or
+  // a constant that satisfies c.
+  bool storesInput(Function *F, const Field &f) const;
+  bool storesSatisfying(Function *F, const Field &f, const Cell &c) const;
+  // §3.5 정리 B(a): every defined function that stores to the field is in U.
+  bool upOnly(const Field &f) const;
+  // §3.9 realizations, in their order.
+  std::vector<std::pair<Function *, Lever>> leversOf(Function *E, const Cell &c) const;
+  bool realizable(Function *E, const Keyed &k) const;
+  std::vector<Function *> writeCandidates(Function *E, const std::vector<Function *> &es, const Cell &c) const;
+  bool establishedBy(Function *entry, const Cell &c) const;
+  bool fills(Function *F, const Cell &c) const;
+  Function *inputFiller(Function *E, Function *entry, const Cell &c) const;
+  WitnessPlan realize(Function *E, const std::vector<Cell> &phi, const std::vector<Keyed> &keyed) const;
+  // The grammar the harness carries, and §3.7 for its indirect edges.
+  void grammar(Plan &P) const;
+  void dispatch(const Witnesses &ws, Plan &P) const;
   static std::string abstractValue(Value *V);
   static std::string bareName(const std::string &n);
   static bool satisfies(const std::string &v, const Cell &c);

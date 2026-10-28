@@ -20,7 +20,8 @@
 #include "klee/Statistics/Statistics.h"
 #include "klee/Support/ErrorHandling.h"
 #include "klee/Support/ModuleUtil.h"
-#include "klee/Support/SlotTargets.h"
+#include "klee/Support/CallTargets.h"
+#include "klee/Support/StructKey.h"
 #include "klee/System/MemoryUsage.h"
 
 #include "CallPathManager.h"
@@ -41,6 +42,7 @@ DISABLE_WARNING_DEPRECATED_DECLARATIONS
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Metadata.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
@@ -52,6 +54,9 @@ DISABLE_WARNING_POP
 
 #include <deque>
 #include <fstream>
+#include <functional>
+#include <map>
+#include <set>
 #include <unordered_map>
 #include <vector>
 #include <unistd.h>
@@ -425,6 +430,12 @@ void StatsTracker::framePushed(ExecutionState &es, StackFrame *parentFrame) {
     uint64_t slotAtRA = parentFrame ? parentFrame->minDistToSinkSlotOnReturn : 0;
     sf.minDistToSinkSlotOnReturn =
         sf.caller ? computeMinDistToSinkSlot(sf.caller, slotAtRA) : 0;
+    uint64_t witAtRA = parentFrame ? parentFrame->minDistToSinkWitOnReturn : 0;
+    sf.minDistToSinkWitOnReturn =
+        sf.caller ? computeMinDistToSinkWit(sf.caller, witAtRA) : 0;
+    uint64_t stAtRA = parentFrame ? parentFrame->minDistToStOnReturn : 0;
+    sf.minDistToStOnReturn =
+        sf.caller ? computeMinDistToSt(sf.caller, stAtRA) : 0;
   }
 }
 
@@ -878,12 +889,98 @@ uint64_t klee::computeMinDistToSinkSlot(const KInstruction *ki,
       minDistAtRA);
 }
 
-uint64_t klee::sinkGuideOffset = 0;
+uint64_t klee::computeMinDistToSinkWit(const KInstruction *ki,
+                                       uint64_t minDistAtRA) {
+  StatisticManager &sm = *theStatisticManager;
+  return foldMinDist(
+      sm.getIndexedValue(stats::minDistToSinkWit, ki->info->id),
+      sm.getIndexedValue(stats::minDistToReturnSlot, ki->info->id),
+      minDistAtRA);
+}
 
-uint64_t klee::sinkGuide(uint64_t slot, uint64_t sig) {
+uint64_t klee::computeMinDistToSt(const KInstruction *ki,
+                                  uint64_t minDistAtRA) {
+  StatisticManager &sm = *theStatisticManager;
+  return foldMinDist(
+      sm.getIndexedValue(stats::minDistToSt, ki->info->id),
+      sm.getIndexedValue(stats::minDistToReturnSlot, ki->info->id),
+      minDistAtRA);
+}
+
+uint64_t klee::sinkGuideWitOffset = 0;
+uint64_t klee::sinkGuideOffset = 0;
+uint64_t klee::sinkGuideStOffset = 0;
+static calls::Targets callRelation;
+
+bool klee::slotAdmits(const CallBase &cb, const Function *f) {
+  const auto &ts = callRelation.of(cb);
+  return std::find(ts.begin(), ts.end(), f) != ts.end();
+}
+
+// Π_I gate keys per comparison instruction, filled by computeSinkDistance.
+static std::unordered_map<const Instruction *, std::vector<std::uint64_t>>
+    gateKeyMap;
+
+const std::vector<std::uint64_t> *klee::gateKeys(const Instruction *cmp) {
+  auto it = gateKeyMap.find(cmp);
+  return it == gateKeyMap.end() ? nullptr : &it->second;
+}
+
+// The innermost struct type and field index a value loads, through zext / sext
+// / trunc then a GEP that selects a constant struct field (`gep S, p, 0, k`),
+// or {nullptr, 0}. Field-based: the dispatch table is named by
+// its struct type and field, not the object the pointer walks over, so the
+// codec-scan idiom (a cursor incremented across the array) still resolves.
+static std::pair<StructType *, unsigned> loadedStructField(const Value *v) {
+  while (const auto *C = dyn_cast<CastInst>(v)) {
+    if (isa<ZExtInst>(C) || isa<SExtInst>(C) || isa<TruncInst>(C))
+      v = C->getOperand(0);
+    else
+      break;
+  }
+  const auto *L = dyn_cast<LoadInst>(v);
+  if (!L)
+    return {nullptr, 0};
+  const auto *G = dyn_cast<GEPOperator>(L->getPointerOperand());
+  if (!G)
+    return {nullptr, 0};
+  Type *T = G->getSourceElementType();
+  StructType *S = nullptr;
+  unsigned field = 0;
+  auto it = G->idx_begin();
+  for (++it; it != G->idx_end(); ++it) {
+    if (auto *ST = dyn_cast<StructType>(T)) {
+      const auto *CI = dyn_cast<ConstantInt>(it->get());
+      if (!CI || CI->getZExtValue() >= ST->getNumElements())
+        return {nullptr, 0};
+      field = CI->getZExtValue();
+      S = ST;
+      T = ST->getElementType(field);
+    } else if (auto *AT = dyn_cast<ArrayType>(T)) {
+      T = AT->getElementType();
+    } else {
+      return {nullptr, 0};
+    }
+  }
+  return {S, field};
+}
+
+uint64_t klee::sinkGuide(uint64_t wit, uint64_t slot, uint64_t sig) {
+  if (wit)
+    return wit;
   if (slot)
-    return slot;
-  return sig ? sinkGuideOffset + sig : 0;
+    return sinkGuideWitOffset + slot;
+  return sig ? sinkGuideWitOffset + sinkGuideOffset + sig : 0;
+}
+
+// Before an input-dispatch installer has run, approach it (T_st). Afterward
+// (or if T_st is infinite), fall back to sinkGuide past every finite T_st.
+uint64_t klee::sinkOrder(bool stInstalled, uint64_t st, uint64_t wit,
+                         uint64_t slot, uint64_t sig) {
+  if (!stInstalled && st)
+    return st;
+  uint64_t g = sinkGuide(wit, slot, sig);
+  return g ? sinkGuideStOffset + g : 0;
 }
 
 // A frame is left by a return, by resume, or by a call that unwinds through
@@ -896,13 +993,13 @@ static bool leavesFrame(const Instruction *I) {
          !isa<InlineAsm>(ci->getCalledOperand());
 }
 
-// Minimum fixpoint of the design distance, over two call graphs. A call
-// costs the callee's distance to return. In the first graph an indirect
-// call reaches every address-taken function of its type (T, the
-// over-approximation that proves a state cannot reach the sink). In the
-// second it reaches only the functions its callee slot admits (T_slot,
-// the order of the search, §6 slot targets). Stored distances are d+1; 0
-// is unreachable.
+// Minimum fixpoint of the design distance, over the two layers of the call
+// relation (klee/Support/CallTargets.h). A call costs the callee's distance
+// to return. In layer 1 an indirect call reaches every address-taken
+// function of its type (T, the over-approximation that proves a state
+// cannot reach the sink). In the refined layer it reaches the targets the
+// may layer resolved (T_slot, the order of the search). Stored distances
+// are d+1; 0 is unreachable.
 void StatsTracker::computeSinkDistance() {
   KModule *km = executor.kmodule.get();
   Module *m = km->module.get();
@@ -915,12 +1012,8 @@ void StatsTracker::computeSinkDistance() {
   std::vector<Function *> directTarget(n, nullptr);
   std::vector<const std::vector<Function *> *> sigTargets(n, nullptr),
       slotTargets(n, nullptr);
-  std::vector<std::vector<Function *>> slotOwn(n);
-  std::unordered_map<FunctionType *, std::vector<Function *>> byType;
-  for (Function *f : km->escapingFunctions)
-    byType[f->getFunctionType()].push_back(f);
-  slots::Targets slot;
-  slot.build(*m);
+  callRelation = calls::Targets();
+  callRelation.index(*m);
 
   std::vector<char> isEntry(n, 0);
   unsigned narrowed = 0, indirect = 0;
@@ -941,20 +1034,10 @@ void StatsTracker::computeSinkDistance() {
         directTarget[id] = direct;
         continue;
       }
-      auto it = byType.find(cb->getFunctionType());
-      if (it == byType.end())
-        continue;
-      sigTargets[id] = slotTargets[id] = &it->second;
+      sigTargets[id] = &callRelation.signature(*cb);
+      slotTargets[id] = &callRelation.of(*cb);
       ++indirect;
-      if (!slots::calleeSlot(*cb))
-        continue;
-      for (Function *f : it->second)
-        if (slot.admits(*cb, f))
-          slotOwn[id].push_back(f);
-      if (slotOwn[id].size() < it->second.size()) {
-        slotTargets[id] = &slotOwn[id];
-        ++narrowed;
-      }
+      narrowed += slotTargets[id]->size() < sigTargets[id]->size();
     }
   }
   for (Instruction *I : insts) {
@@ -972,8 +1055,48 @@ void StatsTracker::computeSinkDistance() {
   if (!sinks)
     klee_warning("nurs:sink found no SINK-REACHED marker");
 
+  // Witness edges E_W (DESIGN-D §6b): function p of witness k carries
+  // sp.wit !{k, p}. Toward the sink, a call in a may enter a witness
+  // function c when (a, c) is in E_W or c heads a witness, and a non-witness
+  // function only when a is not a witness function.
+  std::map<unsigned, std::map<unsigned, std::vector<Function *>>> chains;
+  for (Function &F : *m) {
+    SmallVector<MDNode *, 2> mds;
+    F.getMetadata("sp.wit", mds);
+    for (MDNode *md : mds) {
+      auto *k = mdconst::dyn_extract<ConstantInt>(md->getOperand(0));
+      auto *p = mdconst::dyn_extract<ConstantInt>(md->getOperand(1));
+      if (k && p)
+        chains[k->getZExtValue()][p->getZExtValue()].push_back(&F);
+    }
+  }
+  std::set<const Function *> witFns, witHeads;
+  std::set<std::pair<const Function *, const Function *>> witEdges;
+  unsigned witGaps = 0;
+  for (auto &[k, chain] : chains) {
+    for (auto &[p, fs] : chain) {
+      witFns.insert(fs.begin(), fs.end());
+      if (p == 0)
+        witHeads.insert(fs.begin(), fs.end());
+      auto next = chain.find(p + 1);
+      if (next != chain.end())
+        for (Function *a : fs)
+          for (Function *c : next->second)
+            witEdges.insert({a, c});
+    }
+    witGaps += chain.size() != chain.rbegin()->first + 1;
+  }
+  auto witDescends = [&](unsigned id, const Function *c) {
+    const Function *a = byId[id]->getFunction();
+    if (witFns.count(c))
+      return witHeads.count(c) || witEdges.count({a, c});
+    return !witFns.count(a);
+  };
+  auto anyDescends = [](unsigned, const Function *) { return true; };
+
   auto solve = [&](const std::vector<const std::vector<Function *> *> &targets,
-                   Statistic &R, Statistic &T) {
+                   Statistic &R, Statistic &T, auto descends,
+                   bool withReturn, auto isTarget) {
     auto forTargets = [&](unsigned id, auto body) {
       if (directTarget[id])
         body(directTarget[id]);
@@ -1054,13 +1177,13 @@ void StatsTracker::computeSinkDistance() {
     };
     auto relaxSink = [&](unsigned id) {
       Instruction *I = byId[id];
-      uint64_t best = isSink(I) ? 1 : 0;
-      if (!isSink(I)) {
+      uint64_t best = isTarget(I) ? 1 : 0;
+      if (!isTarget(I)) {
         if (const auto *cb = dyn_cast<CallBase>(I);
             cb && !isa<InlineAsm>(cb->getCalledOperand())) {
           uint64_t bestCallee = 0;
           forTargets(id, [&](Function *c) {
-            uint64_t d = calleeSink(c);
+            uint64_t d = descends(id, c) ? calleeSink(c) : 0;
             if (d && (best == 0 || 1 + d < best))
               best = 1 + d;
             d = calleeReturn(c);
@@ -1097,21 +1220,23 @@ void StatsTracker::computeSinkDistance() {
     // Return distances first: the sink distance crosses a call at cost R.
     // Drain the queue for R, then seed it with the sink's predecessors and
     // drain it for T.
-    for (Instruction *I : insts) {
-      unsigned id = infos.getInfo(*I).id;
-      if (leavesFrame(I)) {
-        sm.setIndexedValue(R, id, 1);
-        propagate(id);
+    if (withReturn) {
+      for (Instruction *I : insts) {
+        unsigned id = infos.getInfo(*I).id;
+        if (leavesFrame(I)) {
+          sm.setIndexedValue(R, id, 1);
+          propagate(id);
+        }
+      }
+      while (!wl.empty()) {
+        unsigned id = wl.front();
+        wl.pop_front();
+        queued[id] = 0;
+        relaxReturn(id);
       }
     }
-    while (!wl.empty()) {
-      unsigned id = wl.front();
-      wl.pop_front();
-      queued[id] = 0;
-      relaxReturn(id);
-    }
     for (Instruction *I : insts)
-      if (isSink(I)) {
+      if (isTarget(I)) {
         unsigned id = infos.getInfo(*I).id;
         sm.setIndexedValue(T, id, 1);
         propagate(id);
@@ -1123,11 +1248,101 @@ void StatsTracker::computeSinkDistance() {
       relaxSink(id);
     }
   };
-  solve(sigTargets, stats::minDistToReturn, stats::minDistToSink);
-  solve(slotTargets, stats::minDistToReturnSlot, stats::minDistToSinkSlot);
+  solve(sigTargets, stats::minDistToReturn, stats::minDistToSink, anyDescends,
+        true, isSink);
+  solve(slotTargets, stats::minDistToReturnSlot, stats::minDistToSinkSlot,
+        anyDescends, true, isSink);
+  if (!chains.empty())
+    solve(slotTargets, stats::minDistToReturnSlot, stats::minDistToSinkWit,
+          witDescends, false, isSink);
 
-  unsigned reachable = 0, reachableSlot = 0;
-  uint64_t maxSlot = 0;
+  // §3.7 D item 2 / H3: distance to input-dispatch installers (sp.st).
+  std::set<const Function *> stFns;
+  for (Function &F : *m)
+    if (!F.isDeclaration() && F.getMetadata("sp.st"))
+      stFns.insert(&F);
+  auto isSt = [&](Instruction *I) {
+    const Function *F = I->getFunction();
+    return stFns.count(F) && I == &F->getEntryBlock().front();
+  };
+  if (!stFns.empty())
+    solve(slotTargets, stats::minDistToReturnSlot, stats::minDistToSt,
+          anyDescends, false, isSt);
+
+  // Π_I gate keys. A dispatch table is a global whose entries pair a key
+  // constant with a function pointer (e.g. `_TIFFBuiltinCODECS` pairs the
+  // compression scheme 7 with `TIFFInitJPEG`). When a function in that table
+  // reaches an input-dispatch installer (finite T_st, or is one), its key is
+  // the value that selects the installer. Keyed by (struct type, key field) so
+  // a scan over any object of that type resolves. At a comparison that reads
+  // such a key field, the
+  // engine can assert the key directly as a solver query (DESIGN-D §6).
+  gateKeyMap.clear();
+  if (!stFns.empty()) {
+    auto reaches = [&](const Function *F) {
+      if (!F || F->isDeclaration())
+        return false;
+      if (stFns.count(F))
+        return true;
+      return sm.getIndexedValue(stats::minDistToSt,
+                                infos.getInfo(F->getEntryBlock().front()).id) !=
+             0;
+    };
+    std::map<std::pair<std::string, unsigned>, std::vector<std::uint64_t>>
+        byField;
+    std::function<void(const Constant *)> scan = [&](const Constant *C) {
+      if (const auto *CA = dyn_cast<ConstantArray>(C)) {
+        for (unsigned i = 0; i < CA->getNumOperands(); ++i)
+          scan(CA->getOperand(i));
+        return;
+      }
+      const auto *CS = dyn_cast<ConstantStruct>(C);
+      if (!CS)
+        return;
+      StructType *ST = CS->getType();
+      for (unsigned ff = 0; ff < CS->getNumOperands(); ++ff) {
+        const auto *F =
+            dyn_cast<Function>(CS->getOperand(ff)->stripPointerCasts());
+        if (!reaches(F))
+          continue;
+        for (unsigned kf = 0; kf < CS->getNumOperands(); ++kf)
+          if (const auto *CI = dyn_cast<ConstantInt>(CS->getOperand(kf)))
+            byField[{structKey(ST), kf}].push_back(CI->getZExtValue());
+      }
+      for (unsigned i = 0; i < CS->getNumOperands(); ++i)
+        scan(CS->getOperand(i));
+    };
+    for (const GlobalVariable &G : m->globals())
+      if (G.hasInitializer())
+        scan(G.getInitializer());
+    unsigned gates = 0;
+    if (!byField.empty())
+      for (Instruction *I : insts) {
+        auto *IC = dyn_cast<ICmpInst>(I);
+        if (!IC)
+          continue;
+        for (unsigned o = 0; o < 2; ++o) {
+          auto [S, kf] = loadedStructField(IC->getOperand(o));
+          if (!S)
+            continue;
+          auto bit = byField.find({structKey(S), kf});
+          if (bit == byField.end())
+            continue;
+          auto &dst = gateKeyMap[IC];
+          dst.insert(dst.end(), bit->second.begin(), bit->second.end());
+        }
+        if (auto it = gateKeyMap.find(IC); it != gateKeyMap.end()) {
+          auto &v = it->second;
+          std::sort(v.begin(), v.end());
+          v.erase(std::unique(v.begin(), v.end()), v.end());
+          ++gates;
+        }
+      }
+    klee_message("nurs:sink gate comparisons %u", gates);
+  }
+
+  unsigned reachable = 0, reachableSlot = 0, reachableWit = 0, reachableSt = 0;
+  uint64_t maxSlot = 0, maxWit = 0, maxSt = 0;
   for (Instruction *I : insts) {
     unsigned id = infos.getInfo(*I).id;
     if (sm.getIndexedValue(stats::minDistToSink, id))
@@ -1136,11 +1351,28 @@ void StatsTracker::computeSinkDistance() {
       ++reachableSlot;
       maxSlot = std::max(maxSlot, d);
     }
+    if (uint64_t d = sm.getIndexedValue(stats::minDistToSinkWit, id)) {
+      ++reachableWit;
+      maxWit = std::max(maxWit, d);
+    }
+    if (uint64_t d = sm.getIndexedValue(stats::minDistToSt, id)) {
+      ++reachableSt;
+      maxSt = std::max(maxSt, d);
+    }
   }
   sinkGuideOffset = maxSlot;
+  sinkGuideWitOffset = maxWit;
+  sinkGuideStOffset = maxSt;
   klee_message("nurs:sink markers %u, instructions that reach one %u "
-               "(by slot %u; indirect calls %u, narrowed %u)",
-               sinks, reachable, reachableSlot, indirect, narrowed);
+               "(by slot %u; indirect calls %u, narrowed %u, empty %u)",
+               sinks, reachable, reachableSlot, indirect, narrowed,
+               callRelation.empty);
+  klee_message("nurs:sink witnesses %zu, functions %zu, edges %zu, gaps %u, "
+               "instructions that reach along them %u",
+               chains.size(), witFns.size(), witEdges.size(), witGaps,
+               reachableWit);
+  klee_message("nurs:sink installers %zu, instructions that reach one %u",
+               stFns.size(), reachableSt);
 }
 
 uint64_t klee::computeMinDistToUncovered(const KInstruction *ki,

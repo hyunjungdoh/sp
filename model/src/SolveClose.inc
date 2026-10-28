@@ -1506,6 +1506,40 @@
       for (const Step &st : c.second)
         out << " " << st.type << "+" << st.off;
     };
+    // §3.8 정리 B 보정 + Lemma W(정초된 첫 확립): 첫 교차 단계 이하에서 D 함수의
+    // 경로 조건이 읽은 셀(전위 셀)이 의무다. 단, 엔트리 자신의 클로저가 그 셀을
+    // 교차 전에 확실히(must) 쓴다면(자기 확립), 그 읽기는 클라이언트 값이 아니라
+    // 엔트리가 세운 값을 읽는 것이므로 전위 의무가 아니다(Lemma W). 그런 셀은
+    // 제외한다.
+    {
+      std::set<Cell> pre, selfWritten;
+      for (const auto &[si, evs] : stepEv) {
+        if (si > crossStep)
+          continue;
+        for (const Ev &e : evs) {
+          if (!e.fn || e.fn->getParent() != &down)
+            continue;
+          if (e.kind == 'e' || e.kind == 'n' || e.kind == 'r' || e.kind == 'b' || e.kind == 'g')
+            pre.insert(e.cell);
+          else if (e.kind == 'p') {
+            pre.insert(e.cell);
+            pre.insert(e.src);
+          } else if (e.kind == 's' && e.mustExit && e.callMust) {
+            // 엔트리 클로저의 반환을 지배하는 store: 자기 확립.
+            selfWritten.insert(e.cell);
+          } else if (e.kind == 'd') {
+            selfWritten.insert(e.cell);
+          }
+        }
+      }
+      for (const Cell &c : pre) {
+        if (selfWritten.count(c))
+          continue;
+        out << "prefixcell";
+        writeCell(c);
+        out << "\n";
+      }
+    }
     auto rankOf = [&](Instruction *I) {
       int level = 0;
       int idx = 0;
@@ -1536,6 +1570,8 @@
       s.uloV = nodes[id].uloV;
       s.uhiV = nodes[id].uhiV;
       s.ordBytes = nodes[id].ordBytes;
+      s.oneBits = nodes[id].oneBits;
+      s.zeroBits = nodes[id].zeroBits;
       return s;
     };
     struct Node {
@@ -1548,6 +1584,7 @@
       int64_t sloV = 0, shiV = 0;
       uint64_t uloV = 0, uhiV = 0;
       unsigned ordBytes = 0;
+      uint64_t oneBits = 0, zeroBits = 0;
     };
     std::vector<Node> nodes;
     auto make = [&]() {
@@ -1611,8 +1648,17 @@
         tr.conflict = true;
       if (n.ulo && n.uhi && n.uloV > n.uhiV)
         tr.conflict = true;
+      if (n.oneBits & n.zeroBits)
+        tr.conflict = true;
       if (!n.has)
         return;
+      if (n.oneBits || n.zeroBits) {
+        auto u = asU64(n.val);
+        auto s = asI64(n.val);
+        uint64_t k = u ? *u : s ? (uint64_t)*s : 0;
+        if ((!u && !s) || (k & n.oneBits) != n.oneBits || (k & n.zeroBits))
+          tr.conflict = true;
+      }
       if (n.slo || n.shi) {
         auto s = asI64(n.val);
         if (!s || (n.slo && *s < n.sloV) || (n.shi && *s > n.shiV))
@@ -1795,6 +1841,9 @@
         hiU(a, nodes[b].uhiV);
       if (nodes[b].ordBytes && !nodes[a].ordBytes)
         nodes[a].ordBytes = nodes[b].ordBytes;
+      nodes[a].oneBits |= nodes[b].oneBits;
+      nodes[a].zeroBits |= nodes[b].zeroBits;
+      violate(a);
       auto retarget = [&](int &id) {
         if (id == b)
           id = a;
@@ -2079,6 +2128,19 @@
           out << "\n";
           ensure(e->cell);
           allow(cur[e->cell], e->vals);
+        } else if (e->kind == 'b') {
+          out << "bits " << si;
+          writeCell(e->cell);
+          out << (e->pred ? " has" : " lacks");
+          for (const std::string &v : e->vals)
+            out << " " << v;
+          out << "\n";
+          ensure(e->cell);
+          int x = find(cur[e->cell]);
+          for (const std::string &v : e->vals)
+            if (auto m = asU64(v))
+              (e->pred ? nodes[x].oneBits : nodes[x].zeroBits) |= *m;
+          violate(x);
         } else if (e->kind == 'r') {
           out << "bound " << si;
           writeCell(e->cell);
@@ -2232,7 +2294,7 @@
         s.ban = it->second.ban;
       }
     }
-    auto bounded = [](const SlotVal &s) { return s.slo || s.shi || s.ulo || s.uhi; };
+    auto bounded = [](const SlotVal &s) { return s.slo || s.shi || s.ulo || s.uhi || s.oneBits || s.zeroBits; };
     auto writeOrd = [&](const SlotVal &s) {
       if (s.slo)
         out << " sge " << s.sloV;
@@ -2242,6 +2304,10 @@
         out << " uge " << s.uloV;
       if (s.uhi)
         out << " ule " << s.uhiV;
+      if (s.oneBits)
+        out << " has " << s.oneBits;
+      if (s.zeroBits)
+        out << " lacks " << s.zeroBits;
     };
     auto inRel = [&](const Cell &c) {
       for (const Rel &r : rels)
@@ -2426,6 +2492,8 @@
           if (fact.ulo && u < fact.uloV)
             return false;
           if (fact.uhi && u > fact.uhiV)
+            return false;
+          if ((u & fact.oneBits) != fact.oneBits || (u & fact.zeroBits))
             return false;
           return true;
         };
@@ -2637,6 +2705,10 @@
                   out << " vararg uge " << fact.uloV;
                 if (fact.uhi)
                   out << " vararg ule " << fact.uhiV;
+                if (fact.oneBits)
+                  out << " vararg has " << fact.oneBits;
+                if (fact.zeroBits)
+                  out << " vararg lacks " << fact.zeroBits;
               }
             }
             out << "\n";

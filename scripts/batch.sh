@@ -17,7 +17,7 @@ printf '%s\n' "${jobs[@]}" | xargs -P "$P" -L 1 bash -c '
   if [ $tag = gen ]; then
     k="--concolic --concolic-data=input,bytes --max-solver-time=10s --seed-dir=/w/dataset/$c/concolic_seed --named-seed-matching --allow-seed-extension --allow-seed-truncation --always-output-seeds=false"
   else k=""; fi
-  docker run --rm --name "$tag-$c" -v "'"$ROOT"'":/w -e TAG=$tag -e H=$H -e MEM=1600 -e KOPTS="$k" \
-    klee-sink bash /w/scripts/klee.sh '"$N $T"' "$c" >/dev/null 2>&1
+  docker run --rm --name "$tag-$c" --platform linux/amd64 -v "'"$ROOT"'":/w -e TAG=$tag -e H=$H -e MEM=1600 -e KOPTS="$k" \
+    ${KLEE_IMAGE:-klee-sink:wit} bash /w/scripts/klee.sh '"$N $T"' "$c" >/dev/null 2>&1
   echo "$(date +%T) done $tag $c"
 '

@@ -72,7 +72,9 @@
 // paths. Index k is that path in the graph that no longer contains the last
 // edge of any earlier path.
 
+#include "Calls.h"
 #include "Source.h"
+#include "../../engine/klee/include/klee/Support/CallTargets.h"
 
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/Demangle/Demangle.h"
@@ -219,6 +221,8 @@ struct SlotVal {
   int64_t sloV = 0, shiV = 0;
   uint64_t uloV = 0, uhiV = 0;
   unsigned ordBytes = 0;
+  // §3.8 비트 원자: 1이어야 하는 비트(oneBits)와 0이어야 하는 비트(zeroBits).
+  uint64_t oneBits = 0, zeroBits = 0;
 };
 
 struct Transition {
@@ -442,6 +446,8 @@ class Model {
   Model(Module &down, Module &up, StringRef file, unsigned line) : down(down), up(up), dl(down.getDataLayout()), sinkFile(file), sinkLine(line) {}
 
   void run(int seqPick, raw_ostream &out);
+  // §3.10: targetsOf at every indirect call site of D and U, after run.
+  calls::Table indirectTargets() const;
 
 
  private:
@@ -451,7 +457,6 @@ class Model {
   StringRef sinkFile;
   unsigned sinkLine;
   std::vector<Function *> sinks;
-  std::map<Suffix, std::vector<Function *>> fnAt;
   std::map<Suffix, std::vector<Suffix>> besidePtr;
   std::map<Suffix, std::vector<Function *>> builderOf;
   std::map<Function *, std::vector<std::pair<unsigned, Suffix>>> argStored;
@@ -470,8 +475,6 @@ class Model {
   // object and scalars, without those whose every caller is an initializer.
   std::vector<InitSite> initializers(const std::string &type, const std::set<int64_t> &cells) const;
   mutable std::map<std::pair<std::string, std::set<int64_t>>, std::vector<InitSite>> initMemo;
-  mutable std::map<Suffix, std::vector<Function *>> slotAt;
-  mutable bool slotReady = false;
   // The reaching-definition resolution of a pointer a local holds (slotHeld)
   // is a property the harness needs at sequence-solving time, not in the
   // eager index passes that only map operands to formals. It is off during
@@ -590,8 +593,6 @@ class Model {
   };
   std::map<Function *, std::set<std::string>> regKeys;
   std::unordered_map<const Function *, std::map<unsigned, int64_t>> keyArgCache;
-  std::map<std::pair<Function *, unsigned>, std::vector<Function *>> argFn;
-  std::unordered_map<const CallBase *, std::vector<Function *>> argCallTargets;
   std::vector<Function *> exports;
   Function *entry = nullptr;
   std::vector<Solved> solvedCells;
@@ -687,16 +688,6 @@ class Model {
   Suffix suffix(Value *V) const;
 
 
-  // A private struct often begins with a public struct at offset zero. A call
-  // through the public type reads the same slot the private store wrote.
-  void ensureSlots() const;
-  // The functions the program places in the field a path ends at: those
-  // stored at the path inside the last loaded object, else at its innermost
-  // struct fields, whatever object encloses them.
-  std::vector<Function *> storedAt(const Suffix &s) const;
-
-
-  void addFn(const Suffix &s, Function *F);
 
 
   static std::string dec(const ConstantInt *CI);
@@ -719,6 +710,8 @@ class Model {
   void noteZero(Type *Ty, const Suffix &suf);
 
 
+  void eachLeaf(Constant *C, Type *Ty, const Suffix &suf, const DIType *D,
+                const std::function<void(Constant *, const Suffix &)> &leaf);
   void walkInit(Constant *C, Type *Ty, const Suffix &suf, bool scalars, const DIType *D = nullptr);
 
 
@@ -819,8 +812,17 @@ class Model {
   std::vector<Function *> vtableReads(CallBase *CB) const;
 
 
+  // The callee of a direct call, or Res(c) of an indirect call (§3.10).
   std::vector<Function *> targetsOf(CallBase *CB) const;
 
+  // §3.10 Res: the least solution of the function-constant flow over the
+  // bodies of D and U, read by targetsOf at every indirect call.
+  void buildResolve();
+  std::unordered_map<const CallBase *, std::vector<Function *>> resolved;
+  // The same solution at a formal and at a struct field (type, offset).
+  std::unordered_map<const Argument *, std::vector<Function *>> formalFns;
+  std::map<std::pair<std::string, int64_t>, std::vector<Function *>> fieldFns;
+  const std::vector<Function *> &fnsOf(const Argument *A) const;
 
   static bool exported(const Function &F);
 
@@ -1062,6 +1064,11 @@ class Model {
   // is eligible; the shortest such path is chosen, with the earlier block
   // name breaking ties. The witness formula is the condition of this path.
   std::unordered_set<const BasicBlock *> chosenPath(Function *F, const std::unordered_set<Instruction *> &goals) const;
+
+  // §3.8 정의 3.8.2–3.8.3: 분기 조건 Cond가 이 간선(onTrue)에서 한 비트 β+(c,b)를
+  // 요구하고, 그 비트의 확립자 Est(f,b)가 정의된 함수 하나뿐이면 그 함수다.
+  Function *memoEstablisher(Value *Cond, bool onTrue) const;
+  mutable std::map<std::tuple<std::string, int64_t, uint64_t>, Function *> estCache;
 
 
   bool solve(const std::vector<Function *> &seq, raw_ostream &out);

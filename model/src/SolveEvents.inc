@@ -29,6 +29,9 @@
     // export에서 도달하지 않으면(loc=⊥) 셀이 아니라 미해결 근으로 센다.
     std::set<std::pair<int, Suffix>> boundaryRoots;
     unsigned boundaryUnresolved = 0;
+    // §3.8 정리 B 보정: 첫 D→U 교차 간선의 단계. 이 단계 이하의 D 함수가 읽은 셀은
+    // 전위 셀이다. 교차가 없으면 모든 단계가 전위다.
+    size_t crossStep = seq.size();
     struct Ev {
       Instruction *at = nullptr;
       Instruction *anchor = nullptr;
@@ -272,6 +275,7 @@
       // 그 포인터 실인자의 셀이 경계 근이다. loc이 풀리지 않은 포인터 실인자는
       // export에서 도달하지 않는 D-로컬 객체이므로 미해결 근으로 센다.
       if (F->getParent() == &down && Next->getParent() == &up) {
+        crossStep = std::min(crossStep, si);
         for (unsigned i = 0; i < edge->arg_size(); ++i) {
           if (!edge->getArgOperand(i)->getType()->isPointerTy())
             continue;
@@ -1059,6 +1063,51 @@
           for (const BasicBlock *P : predecessors(B))
             work.push_back(P);
         }
+        // §3.8 정의 3.8.3: 정초 간선. 비트 원자 β+(c,b)를 요구하는 간선인데, 그 비트의
+        // 확립자가 정의된 함수 g 하나뿐이고 반대쪽 후계자에서 목표로 가는 모든 경로가 g를
+        // 부르면, β+ 쪽은 g의 앞선 성공을 전제하는 지름길이다(보조정리 W). 경로 선택은
+        // 그 간선을 금지한다.
+        std::set<std::pair<const BasicBlock *, const BasicBlock *>> memo;
+        for (const BasicBlock *B : back) {
+          auto *BR = dyn_cast<BranchInst>(B->getTerminator());
+          if (!BR || !BR->isConditional() || BR->getSuccessor(0) == BR->getSuccessor(1))
+            continue;
+          for (unsigned t = 0; t < 2; ++t) {
+            const BasicBlock *S = BR->getSuccessor(t);
+            const BasicBlock *Sm = BR->getSuccessor(1 - t);
+            if (!back.count(S) || !back.count(Sm))
+              continue;
+            if (Function *g = memoEstablisher(BR->getCondition(), t == 0)) {
+              std::unordered_set<const BasicBlock *> cut;
+              for (const BasicBlock &BB : *F)
+                for (const Instruction &I : BB)
+                  if (auto *CB = dyn_cast<CallBase>(&I))
+                    if (Function *C = CB->getCalledFunction())
+                      if (C == g || define(C->getName()) == g)
+                        cut.insert(&BB);
+              std::unordered_set<const BasicBlock *> seen;
+              std::vector<const BasicBlock *> st{Sm};
+              bool escapes = false;
+              while (!st.empty() && !escapes) {
+                const BasicBlock *X = st.back();
+                st.pop_back();
+                if (cut.count(X) || !back.count(X) || !seen.insert(X).second)
+                  continue;
+                if (goalB.count(X)) {
+                  escapes = true;
+                  break;
+                }
+                for (const BasicBlock *Y : successors(X))
+                  st.push_back(Y);
+              }
+              if (!escapes)
+                memo.insert({B, S});
+            }
+          }
+        }
+        bool memoOnShortest = false;
+        for (const auto &e : memo)
+          memoOnShortest = memoOnShortest || (shortest.count(e.first) && shortest.count(e.second));
         // The cells some branch tests; only their state decides a path.
         std::set<std::string> tested;
         for (const BasicBlock *B : back)
@@ -1068,7 +1117,7 @@
             for (const Atom &a : as)
               tested.insert(a.key);
           }
-        if (tested.empty())
+        if (tested.empty() && !memoOnShortest)
           return shortest;
         // A cell is the entry value under equations and disequations, a
         // known value, or unknown.
@@ -1176,6 +1225,8 @@
             std::sort(succs.begin(), succs.end(),
                       [](const BasicBlock *A, const BasicBlock *B) { return A->getName() < B->getName(); });
             for (const BasicBlock *S : succs) {
+              if (memo.count({nodes[n].bb, S}))
+                continue;
               std::vector<Atom> as;
               edge(nodes[n].bb, S, as);
               State next = st;
@@ -1413,7 +1464,75 @@
           }
           stepEv[curStep].push_back(std::move(ev));
         };
+        // §3.8 정의 3.8.1: 비트 원자. (c & m) = 0은 lacks m, 한 비트 m의 (c & m) ≠ 0과
+        // (c & m) = m은 has m이다. 여러 비트의 (c & m) ≠ 0은 논리합이라 제약이 아니다.
+        auto bitFact = [&](const Loc &cell, bool set, uint64_t m) {
+          if (!factAt || !m)
+            return;
+          keep(cell);
+          Ev ev;
+          ev.at = factAt;
+          ev.fn = F;
+          ev.anchor = F == seq[curStep] ? nullptr : myAnchor;
+          ev.callMust = myMust;
+          ev.mustExit = F == seq[curStep] || dominatesReturns(factAt);
+          ev.kind = 'b';
+          ev.pred = set ? 1 : 0;
+          ev.cell = {cell.arg, cell.suf};
+          ev.vals.insert(std::to_string(m));
+          stepEv[curStep].push_back(std::move(ev));
+        };
+        auto maskedCell = [&](Value *V, Loc &cell, uint64_t &m) {
+          while (auto *C = dyn_cast<CastInst>(V))
+            V = C->getOperand(0);
+          auto *BO = dyn_cast<BinaryOperator>(V);
+          if (!BO || BO->getOpcode() != Instruction::And)
+            return false;
+          for (unsigned s = 0; s < 2; ++s) {
+            auto *K = dyn_cast<ConstantInt>(BO->getOperand(1 - s));
+            if (!K || K->isZero() || K->getBitWidth() > 64)
+              continue;
+            if (locate(mustVal(BO->getOperand(s)), cell)) {
+              m = K->getZExtValue();
+              return true;
+            }
+          }
+          return false;
+        };
+        auto onBits = [&](ICmpInst *Cmp, ICmpInst::Predicate pred) {
+          if (pred != ICmpInst::ICMP_EQ && pred != ICmpInst::ICMP_NE)
+            return false;
+          for (unsigned s = 0; s < 2; ++s) {
+            Loc cell;
+            uint64_t m = 0;
+            if (!maskedCell(Cmp->getOperand(s), cell, m))
+              continue;
+            Value *O = Cmp->getOperand(1 - s);
+            while (auto *C = dyn_cast<CastInst>(O))
+              O = C->getOperand(0);
+            auto *K = dyn_cast<ConstantInt>(O);
+            if (!K || K->getBitWidth() > 64)
+              return true;
+            uint64_t k = K->getZExtValue();
+            bool one = (m & (m - 1)) == 0;
+            if (k == 0) {
+              if (pred == ICmpInst::ICMP_EQ)
+                bitFact(cell, false, m);
+              else if (one)
+                bitFact(cell, true, m);
+            } else if (k == m) {
+              if (pred == ICmpInst::ICMP_EQ)
+                bitFact(cell, true, m);
+              else if (one)
+                bitFact(cell, false, m);
+            }
+            return true;
+          }
+          return false;
+        };
         auto onCmp = [&](ICmpInst *Cmp, ICmpInst::Predicate pred) {
+          if (onBits(Cmp, pred))
+            return;
           Value *lhs = mustVal(Cmp->getOperand(0));
           Value *rhs = mustVal(Cmp->getOperand(1));
           if (auto *CB = dyn_cast<CallBase>(lhs)) {
@@ -2900,7 +3019,6 @@
         byteOf[F] = b;
         return b;
       };
-      ensureSlots();
       auto addFns = [&](int arg, Suffix full, const std::vector<Function *> &fns) {
         if (fns.empty() || full.empty())
           return;
@@ -3021,15 +3139,7 @@
                   continue;
                 }
                 Suffix slot = suffix(IC->getCalledOperand());
-                std::vector<Function *> fns;
-                auto sit = slotAt.find(slot);
-                if (sit != slotAt.end())
-                  fns = sit->second;
-                if (fns.empty()) {
-                  auto fit = fnAt.find(slot);
-                  if (fit != fnAt.end())
-                    fns = fit->second;
-                }
+                std::vector<Function *> fns = targetsOf(IC);
                 Suffix full = hold.second;
                 full.insert(full.end(), slot.begin(), slot.end());
                 addFns(hold.first, full, fns);

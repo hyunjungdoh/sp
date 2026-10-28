@@ -27,6 +27,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <tuple>
 #include <vector>
 
 namespace klee {
@@ -60,6 +61,8 @@ struct StackFrame {
   /// minDistToUncoveredOnReturn, for the sink-directed searcher.
   unsigned minDistToSinkOnReturn;
   unsigned minDistToSinkSlotOnReturn;
+  unsigned minDistToSinkWitOnReturn;
+  unsigned minDistToStOnReturn;
 
   // For vararg functions: arguments not passed via parameter are
   // stored (packed tightly) in a local (alloca) memory object. This
@@ -261,7 +264,12 @@ public:
 
   /// @brief Concolic mode: times this lineage has flipped each branch
   /// instruction in each seed direction (at most --concolic-flip-bound).
-  std::map<std::pair<const KInstruction *, bool>, unsigned> flips;
+  /// The third key is the constant the branch compares its symbolic operand
+  /// against (0 when there is none). A table scan such as `scheme == 1`,
+  /// `scheme == 7` tests one branch instruction against different constants,
+  /// so each fact flips once; a byte loop compares a changing byte against
+  /// the same constant, keeps one key, and stays bounded.
+  std::map<std::tuple<const KInstruction *, bool, uint64_t>, unsigned> flips;
 
   /// @brief Concolic mode: symbolic decisions the seeds made on this path so
   /// far, and the first one this state may flip. The decisions before floor
@@ -280,6 +288,10 @@ public:
   /// path is committed to: a constraint reads them or a corpus value was
   /// bound (Executor::bindCorpus). Names, so that a re-run keeps them.
   std::set<std::string> fixed;
+
+  /// @brief An input-dispatch installer (sp.st) has run on this path, so
+  /// the search may switch from approaching St to approaching the sink.
+  bool stInstalled = false;
 
   /// @brief Concolic mode: an input of the state this pending state was split
   /// from. Its model keeps these bytes wherever the path condition does not

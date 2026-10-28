@@ -1,6 +1,203 @@
 #include "Model.h"
 #include "llvm/IR/CFG.h"
 
+namespace {
+
+std::string bareStruct(const StructType *ST) {
+  if (!ST->hasName())
+    return "";
+  StringRef s = ST->getName();
+  size_t dot = s.rfind('.');
+  if (dot != StringRef::npos && dot + 1 < s.size() &&
+      s.drop_front(dot + 1).find_first_not_of("0123456789") == StringRef::npos)
+    s = s.take_front(dot);
+  return s.str();
+}
+
+// The field a pointer addresses: the innermost struct its constant field
+// indices select and the byte offset there. A variable array index names the
+// array's one element cell, as cells do.
+std::optional<std::pair<std::string, int64_t>> fieldKey(const Value *P, const DataLayout &dl) {
+  P = P->stripPointerCasts();
+  while (auto *G = dyn_cast<GEPOperator>(P)) {
+    if (isa<StructType>(G->getSourceElementType()))
+      break;
+    P = G->getPointerOperand()->stripPointerCasts();
+  }
+  auto *G = dyn_cast<GEPOperator>(P);
+  if (!G)
+    return std::nullopt;
+  auto *ST = dyn_cast<StructType>(G->getSourceElementType());
+  if (!ST || ST->isOpaque())
+    return std::nullopt;
+  Type *cur = ST;
+  StructType *inner = nullptr;
+  int64_t off = 0;
+  auto I = G->idx_begin();
+  if (I == G->idx_end())
+    return std::nullopt;
+  for (++I; I != G->idx_end(); ++I) {
+    if (auto *S = dyn_cast<StructType>(cur)) {
+      auto *C = dyn_cast<ConstantInt>(*I);
+      if (!C)
+        return std::nullopt;
+      unsigned idx = (unsigned)C->getZExtValue();
+      inner = S;
+      off = (int64_t)dl.getStructLayout(S)->getElementOffset(idx);
+      cur = S->getElementType(idx);
+    } else if (auto *AT = dyn_cast<ArrayType>(cur)) {
+      cur = AT->getElementType();
+    } else
+      return std::nullopt;
+  }
+  if (!inner)
+    return std::nullopt;
+  return std::make_pair(bareStruct(inner), off);
+}
+
+bool containsStruct(Type *T, const std::string &name, std::set<Type *> &seen) {
+  if (!T || !seen.insert(T).second)
+    return false;
+  if (auto *S = dyn_cast<StructType>(T)) {
+    if (bareStruct(S) == name)
+      return true;
+    for (Type *E : S->elements())
+      if (containsStruct(E, name, seen))
+        return true;
+    return false;
+  }
+  if (auto *A = dyn_cast<ArrayType>(T))
+    return containsStruct(A->getElementType(), name, seen);
+  return false;
+}
+
+} // namespace
+
+// §3.8 정의 3.8.2: 값 V를 필드 key에 쓰면 비트 m이 오를 수 있는가(↑_b). 상수는 그
+// 비트로, key 자신의 적재는 항등 갱신으로, or는 한쪽, and는 양쪽, 캐스트·phi·select는
+// 들어오는 값의 합으로 정한다. -O0의 지역 슬롯 적재는 그 슬롯에 저장된 값들의 합이다.
+// 그 밖의 값은 오를 수 있다(보수적).
+static bool raisesBit(const Value *V, uint64_t m, const std::pair<std::string, int64_t> &key, const DataLayout &dl,
+                      std::set<const Value *> &seen) {
+  if (!seen.insert(V).second)
+    return false;
+  if (auto *C = dyn_cast<CastInst>(V))
+    return raisesBit(C->getOperand(0), m, key, dl, seen);
+  if (auto *K = dyn_cast<ConstantInt>(V))
+    return K->getBitWidth() <= 64 && (K->getZExtValue() & m) != 0;
+  if (isa<ConstantPointerNull>(V))
+    return false;
+  if (auto *L = dyn_cast<LoadInst>(V)) {
+    const Value *P = L->getPointerOperand()->stripPointerCasts();
+    if (auto fk = fieldKey(P, dl); fk && *fk == key)
+      return false;
+    if (auto *A = dyn_cast<AllocaInst>(P)) {
+      for (const User *U : A->users())
+        if (auto *S = dyn_cast<StoreInst>(U))
+          if (S->getPointerOperand()->stripPointerCasts() == A && raisesBit(S->getValueOperand(), m, key, dl, seen))
+            return true;
+      return false;
+    }
+    return true;
+  }
+  if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+    if (BO->getOpcode() == Instruction::Or)
+      return raisesBit(BO->getOperand(0), m, key, dl, seen) || raisesBit(BO->getOperand(1), m, key, dl, seen);
+    if (BO->getOpcode() == Instruction::And)
+      return raisesBit(BO->getOperand(0), m, key, dl, seen) && raisesBit(BO->getOperand(1), m, key, dl, seen);
+    return true;
+  }
+  if (auto *P = dyn_cast<PHINode>(V)) {
+    for (const Value *In : P->incoming_values())
+      if (raisesBit(In, m, key, dl, seen))
+        return true;
+    return false;
+  }
+  if (auto *S = dyn_cast<SelectInst>(V))
+    return raisesBit(S->getTrueValue(), m, key, dl, seen) || raisesBit(S->getFalseValue(), m, key, dl, seen);
+  return true;
+}
+
+Function *Model::memoEstablisher(Value *Cond, bool onTrue) const {
+  while (auto *C = dyn_cast<CastInst>(Cond))
+    Cond = C->getOperand(0);
+  auto *Cmp = dyn_cast<ICmpInst>(Cond);
+  if (!Cmp)
+    return nullptr;
+  auto pred = onTrue ? Cmp->getPredicate() : Cmp->getInversePredicate();
+  if (pred != ICmpInst::ICMP_EQ && pred != ICmpInst::ICMP_NE)
+    return nullptr;
+  for (unsigned s = 0; s < 2; ++s) {
+    Value *A = Cmp->getOperand(s);
+    while (auto *C = dyn_cast<CastInst>(A))
+      A = C->getOperand(0);
+    auto *BO = dyn_cast<BinaryOperator>(A);
+    if (!BO || BO->getOpcode() != Instruction::And)
+      continue;
+    Value *O = Cmp->getOperand(1 - s);
+    while (auto *C = dyn_cast<CastInst>(O))
+      O = C->getOperand(0);
+    auto *k = dyn_cast<ConstantInt>(O);
+    if (!k || k->getBitWidth() > 64)
+      return nullptr;
+    for (unsigned t = 0; t < 2; ++t) {
+      auto *K = dyn_cast<ConstantInt>(BO->getOperand(1 - t));
+      if (!K || K->getBitWidth() > 64)
+        continue;
+      uint64_t m = K->getZExtValue();
+      if (!m || (m & (m - 1)))
+        return nullptr;
+      bool set = (pred == ICmpInst::ICMP_NE && k->isZero()) || (pred == ICmpInst::ICMP_EQ && k->getZExtValue() == m);
+      if (!set)
+        return nullptr;
+      Value *X = BO->getOperand(t);
+      while (auto *C = dyn_cast<CastInst>(X))
+        X = C->getOperand(0);
+      auto *L = dyn_cast<LoadInst>(X);
+      if (!L)
+        return nullptr;
+      auto key = fieldKey(L->getPointerOperand(), dl);
+      if (!key)
+        return nullptr;
+      auto ck = std::make_tuple(key->first, key->second, m);
+      if (auto it = estCache.find(ck); it != estCache.end())
+        return it->second;
+      std::set<Function *> est;
+      for (Module *M : {&down, &up})
+        for (Function &F : *M) {
+          if (F.isDeclaration())
+            continue;
+          for (Instruction &I : instructions(F)) {
+            if (auto *S = dyn_cast<StoreInst>(&I)) {
+              auto fk = fieldKey(S->getPointerOperand(), dl);
+              std::set<const Value *> seen;
+              if (fk && *fk == *key && raisesBit(S->getValueOperand(), m, *key, dl, seen))
+                est.insert(&F);
+            } else if (auto *MI = dyn_cast<MemIntrinsic>(&I)) {
+              if (auto *MS = dyn_cast<MemSetInst>(MI))
+                if (auto *B = dyn_cast<ConstantInt>(MS->getValue()); B && B->isZero())
+                  continue;
+              Value *D = MI->getRawDest()->stripPointerCasts();
+              std::set<Type *> tseen;
+              if (auto *G = dyn_cast<GEPOperator>(D)) {
+                if (containsStruct(G->getResultElementType(), key->first, tseen) ||
+                    (fieldKey(D, dl) && *fieldKey(D, dl) == *key))
+                  est.insert(&F);
+              } else if (auto *Al = dyn_cast<AllocaInst>(D)) {
+                if (containsStruct(Al->getAllocatedType(), key->first, tseen))
+                  est.insert(&F);
+              }
+            }
+          }
+        }
+      Function *g = est.size() == 1 ? *est.begin() : nullptr;
+      estCache[ck] = g;
+      return g;
+    }
+  }
+  return nullptr;
+}
+
 Value *Model::rootOf(Value *V) {
     std::unordered_set<const Value *> seen;
     while (V && seen.insert(V).second) {

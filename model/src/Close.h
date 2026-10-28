@@ -32,3 +32,9 @@ void closeLibrary(llvm::Module &M, const std::filesystem::path &caseDir);
 // model/env.syms) defines the symbol. Such a function has a specification
 // and the environment model, not the harness, gives its body.
 bool environmentSymbol(const std::string &name);
+
+// Whether the installed image defines the function but the case has no
+// bitcode for it (native residue: assembly, or a binary without .llvm_bc).
+// closeLibrary records these on the module; the harness does not invent a
+// body and does not count them as open obligations.
+bool nativeResidue(const llvm::Module &M, const std::string &name);

@@ -1172,6 +1172,25 @@ ref<Expr> Executor::maxStaticPctChecks(ExecutionState &current,
   return condition;
 }
 
+// Concolic: the constant a branch compares its symbolic operand against, or 0
+// when neither operand is constant. It tells apart the distinct facts one
+// branch instruction tests on different executions -- e.g. a codec table scan
+// re-runs the same `if (c->scheme == scheme)` against 1, 5, 7, ... -- so each
+// fact may flip once. A byte loop compares a changing byte against the same
+// constant, keeps one key, and stays bounded.
+static uint64_t branchCmpConst(const ref<Expr> &cond) {
+  Expr *e = cond.get();
+  if (e->getNumKids() == 2) {
+    if (klee::ConstantExpr *c = dyn_cast<klee::ConstantExpr>(e->getKid(0).get()))
+      if (c->getWidth() <= 64)
+        return c->getZExtValue();
+    if (klee::ConstantExpr *c = dyn_cast<klee::ConstantExpr>(e->getKid(1).get()))
+      if (c->getWidth() <= 64)
+        return c->getZExtValue();
+  }
+  return 0;
+}
+
 Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
                                    bool isInternal, BranchType reason) {
   Solver::Validity res;
@@ -1198,7 +1217,8 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
     } else {
       bool flip = false;
       if (!isInternal) {
-        unsigned &k = current.flips[{current.prevPC, decided == 1}];
+        unsigned &k = current.flips[{current.prevPC, decided == 1,
+                                     branchCmpConst(condition)}];
         if (k < ConcolicFlipBound) {
           ++k;
           flip = decision >= current.floor;
@@ -1644,11 +1664,16 @@ void Executor::bindCorpus(ExecutionState &state, ref<Expr> e) {
     // A length read first binds the data object it measures.
     if (a->name.rfind("length:", 0) == 0) {
       const std::string dn = a->name.substr(7);
+      const Array *d = nullptr;
       for (auto &sym : state.symbolics)
-        if (sym.second->name == dn) {
-          a = sym.second;
-          break;
-        }
+        if (sym.second->name == dn)
+          d = sym.second;
+      if (!d) {
+        // Read before its data object exists: its value is now the path's.
+        state.fixed.insert(a->name);
+        continue;
+      }
+      a = d;
     }
     if (!isDataObject(a))
       continue;
@@ -1851,7 +1876,14 @@ void Executor::writeLedger(bool exhausted) {
      << "flip-bound " << ConcolicFlipBound << "\n"
      << "respawned " << ledger.respawned << "\n"
      << "checkpoints " << ledger.checkpoints << "\n"
-     << "checkpoint-at " << ledger.checkpointAt << "\n";
+     << "checkpoint-at " << ledger.checkpointAt << "\n"
+     << "slot-misses " << ledger.slotMisses << "\n"
+     << "gates " << ledger.gates << "\n"
+     << "gates-solved " << ledger.gatesSolved << "\n"
+     << "gate-reached " << ledger.gateReached << "\n"
+     << "gate-sym " << ledger.gateSym << "\n"
+     << "directed " << ledger.directed << "\n"
+     << "directed-solved " << ledger.directedSolved << "\n";
   for (auto &kv : ledger.fates)
     *f << "fate:" << kv.first << " " << kv.second << "\n";
 }
@@ -1877,9 +1909,14 @@ uint64_t Executor::sinkDistance(ExecutionState &state) {
 }
 
 uint64_t Executor::sinkOrder(ExecutionState &state) {
-  return sinkGuide(computeMinDistToSinkSlot(
-                       state.pc, state.stack.back().minDistToSinkSlotOnReturn),
-                   sinkDistance(state));
+  return klee::sinkOrder(
+      state.stInstalled,
+      computeMinDistToSt(state.pc, state.stack.back().minDistToStOnReturn),
+      computeMinDistToSinkWit(state.pc,
+                              state.stack.back().minDistToSinkWitOnReturn),
+      computeMinDistToSinkSlot(state.pc,
+                               state.stack.back().minDistToSinkSlotOnReturn),
+      sinkDistance(state));
 }
 
 bool Executor::dropUnreachable(ExecutionState *state) {
@@ -1890,6 +1927,104 @@ bool Executor::dropUnreachable(ExecutionState *state) {
   terminateStateEarlyAlgorithm(*state, "concolic: cannot reach sink",
                                StateTerminationType::Replay);
   return true;
+}
+
+void Executor::spawnGateFlips(ExecutionState &state, const ref<Expr> &cond,
+                              KInstruction *ki) {
+  // `state` is the branch's false side: the path that keeps scanning the
+  // table. A gate fires only in concolic mode, before an installer has run,
+  // on a comparison the static analysis marked as a dispatch-table gate.
+  if (!Concolic || state.stInstalled || isa<ConstantExpr>(cond) ||
+      cond->getNumKids() != 2)
+    return;
+  auto *bi = dyn_cast<BranchInst>(ki->inst);
+  if (!bi || !bi->isConditional())
+    return;
+  const auto *cmp = dyn_cast<Instruction>(bi->getCondition());
+  if (!cmp)
+    return;
+  const std::vector<std::uint64_t> *keys = klee::gateKeys(cmp);
+  if (!keys || keys->empty())
+    return;
+  // The branch compares a table key constant against a symbolic value; take
+  // the symbolic side (the dispatch variable).
+  ref<Expr> sym = cond->getKid(0);
+  if (isa<ConstantExpr>(sym))
+    sym = cond->getKid(1);
+  if (isa<ConstantExpr>(sym))
+    return;
+
+  // The inputs to carry into the gate state's model: the seed the false side
+  // still follows, or (if the seed matched an earlier entry and this side is
+  // already a pending flip) its inherited parent input.
+  std::shared_ptr<const Assignment> parent = state.parentInput;
+  if (auto it = seedMap.find(&state); it != seedMap.end() && !it->second.empty())
+    parent = std::make_shared<Assignment>(it->second.front().assignment);
+
+  for (std::uint64_t K : *keys) {
+    // The memory cap closes the gate: no extra state is created near it.
+    if (!branchingPermitted(state))
+      break;
+    // One assertion of each key per path (ConcolicFlipBound), so a scan over
+    // the whole table adds the gate state once, not once per entry.
+    unsigned &k = state.flips[{ki, true, K}];
+    if (k >= ConcolicFlipBound)
+      continue;
+    ref<Expr> gate = EqExpr::create(ConstantExpr::create(K, sym->getWidth()), sym);
+    if (isa<ConstantExpr>(gate)) // the key is already decided on this path
+      continue;
+    ++k;
+    ExecutionState *gs = state.branch();
+    addedStates.push_back(gs);
+    executionTree->attach(state.executionTreeNode, gs, &state,
+                          BranchType::Conditional);
+    ++stats::forks;
+    gs->pendingSeed = true;
+    gs->parentInput = parent;
+    addConstraint(*gs, gate);
+    ++ledger.flips;
+    ++ledger.gates;
+    if (dropUnreachable(gs)) // no continuation of gs reaches the sink
+      continue;
+    // Solve the gate now, so it enters the seeded generation and marches to
+    // the installer instead of waiting behind every concrete path for the
+    // pending pool to drain (the generational scheduler solves ordinary flips
+    // only once no seeded state is left, which a large program never reaches).
+    if (!ensureSeed(*gs)) {
+      terminateStateEarlyAlgorithm(*gs, "concolic: infeasible gate",
+                                   StateTerminationType::Replay);
+      continue;
+    }
+    ++ledger.gatesSolved;
+  }
+}
+
+void Executor::promoteDirectedFlip(ExecutionState *a, ExecutionState *b) {
+  if (!Concolic || !statsTracker || !userSearcherRequiresSink() || !a || !b)
+    return;
+  // One side follows the seed; the other is the pending flip of this branch.
+  ExecutionState *seeded = seedMap.count(a) ? a : seedMap.count(b) ? b : nullptr;
+  ExecutionState *flip = (seeded == a) ? b : (seeded == b) ? a : nullptr;
+  if (!seeded || !flip || !flip->pendingSeed || flip->stack.empty() ||
+      seeded->stack.empty())
+    return;
+  // The flip must move strictly closer along the sink-directed order than the
+  // seed does: a finite order (T_st until the installer has run, then the
+  // sink guide) that the seed's side does not beat.
+  uint64_t df = sinkOrder(*flip);
+  if (!df)
+    return;
+  uint64_t ds = sinkOrder(*seeded);
+  if (ds && ds <= df)
+    return;
+  ++ledger.directed;
+  // Solve it now so it runs in the seeded generation toward the installer. On
+  // failure leave it pending: it is still a branch result the caller uses, so
+  // the normal pending path terminates it later rather than freeing it here.
+  if (ensureSeed(*flip))
+    ++ledger.directedSolved;
+  else
+    flip->pendingSeed = true;
 }
 
 void Executor::prunePending() {
@@ -2658,6 +2793,9 @@ void Executor::executeCall(ExecutionState &state, KInstruction *ki, Function *f,
 
     state.pushFrame(state.prevPC, kf);
     state.pc = kf->instructions;
+    // §3.7 D item 2: entering an input-dispatch installer opens the Π_I gate.
+    if (f->getMetadata("sp.st"))
+      state.stInstalled = true;
 
     if (statsTracker)
       statsTracker->framePushed(state, &state.stack[state.stack.size() - 2]);
@@ -2953,6 +3091,22 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       if (branches.second)
         transferToBasicBlock(bi->getSuccessor(1), bi->getParent(), *branches.second);
       if (Concolic) {
+        // Π_I gate: the false side keeps scanning the dispatch table, so from
+        // it assert the key that installs a sink-reaching handler directly --
+        // whether or not the seed matched an earlier entry and returned. Done
+        // before dropping the unreachable branch so the side is still alive.
+        if (auto *cmp = dyn_cast_or_null<ICmpInst>(bi->getCondition());
+            cmp && klee::gateKeys(cmp)) {
+          ++ledger.gateReached;
+          if (!isa<ConstantExpr>(cond))
+            ++ledger.gateSym;
+          if (cmp->getPredicate() == ICmpInst::ICMP_EQ && branches.second &&
+              !branches.second->stInstalled)
+            spawnGateFlips(*branches.second, cond, ki);
+        }
+        // Drive flips that head toward an uninstalled installer (sp.st / T_st)
+        // without waiting for the pending pool to drain.
+        promoteDirectedFlip(branches.first, branches.second);
         dropUnreachable(branches.first);
         dropUnreachable(branches.second);
       }
@@ -3049,7 +3203,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       if (seedsDecide(state, cond) == 2) {
         flip = true; // seeds split: every case keeps or gets an input
       } else {
-        unsigned &k = state.flips[{ki, true}];
+        unsigned &k = state.flips[{ki, true, 0}];
         if (k < ConcolicFlipBound) {
           ++k;
           flip = decision >= state.floor;
@@ -3296,6 +3450,12 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
           auto it = legalFunctions.find(addr);
           if (it != legalFunctions.end()) {
             f = it->second;
+            if (!slotAdmits(cb, f)) {
+              ++ledger.slotMisses;
+              klee_warning_once(f, "call relation omits executed target %s in %s",
+                                f->getName().data(),
+                                cb.getFunction()->getName().data());
+            }
 
             // Don't give warning on unique resolution
             if (res.second || !first)

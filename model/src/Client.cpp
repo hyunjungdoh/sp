@@ -381,6 +381,10 @@ std::vector<Client::Param> Client::signature(Function *F) const {
   // types[0] is the result; a member function's 'this' is the first formal
   // and is listed like any other parameter.
   for (unsigned i = 1; i < types.size(); ++i) {
+    // A null entry is the "..." of a variadic function (DW_TAG_unspecified_
+    // parameters): not a typed formal, so it adds no source parameter.
+    if (!types[i])
+      continue;
     Param p;
     p.kind = classify(types[i], p.type);
     const DIType *T = strip(types[i]);
@@ -835,184 +839,26 @@ std::vector<std::pair<std::string, int64_t>> Client::fieldsOf(Value *P) const {
   return source::levels(G, dl);
 }
 
-// Function constants a global initializer places in struct fields. D is the
-// source type of the object C initializes.
-void Client::constFields(Constant *C, Type *T, std::string S, int64_t at, const DIType *D) {
-  if (!C)
-    return;
-  if (auto *F = dyn_cast<Function>(C->stripPointerCasts())) {
-    if (!S.empty())
-      if (Function *B = body(F->getName().str()))
-        fnField[{S, at}].insert(B);
-    return;
-  }
-  if (auto *STy = dyn_cast<StructType>(T)) {
-    if (!isa<ConstantStruct>(C))
-      return;
-    const StructLayout *L = dl.getStructLayout(STy);
-    std::string self = STy->hasName() ? source::key(D, STy, dl) : S;
-    for (unsigned i = 0; i < STy->getNumElements(); ++i) {
-      int64_t o = (int64_t)L->getElementOffset(i);
-      Type *E = STy->getElementType(i);
-      const DIType *M = D ? source::member(D, (uint64_t)o, E->isSized() ? dl.getTypeAllocSize(E).getFixedValue() : 0)
-                          : nullptr;
-      constFields(C->getAggregateElement(i), E, self, STy->hasName() ? o : at + o, M);
-    }
-  } else if (auto *AT = dyn_cast<ArrayType>(T)) {
-    if (!isa<ConstantArray>(C))
-      return;
-    for (unsigned i = 0; i < AT->getNumElements(); ++i)
-      constFields(C->getAggregateElement(i), AT->getElementType(), S,
-                  at + (int64_t)(i * dl.getTypeAllocSize(AT->getElementType())), source::element(D));
-  }
-}
-
-// Call edges. A direct call is its callee. An indirect call whose callee is
-// loaded from field (S, off) goes to the functions the program stores into
-// that field or a global initializer places there (the second layer of
-// multi-layer type analysis); any other indirect call, or one through a
-// field that holds no function constant, goes to every address-taken
-// function of its type (the first layer).
+// Call edges (§3.10): a direct call is its callee, an indirect call goes to
+// the targets the may layer resolved (Tgt, klee/Support/CallTargets.h).
 void Client::buildCalls() {
-  for (Module *M : {&down, &up})
-    for (GlobalVariable &G : M->globals())
-      if (G.hasInitializer())
-        constFields(G.getInitializer(), G.getValueType(), "", 0, source::ofGlobal(G));
-  for (const auto &kv : bodies)
-    for (Instruction &I : instructions(*kv.second))
-      if (auto *S = dyn_cast<StoreInst>(&I))
-        if (auto *F = dyn_cast<Function>(S->getValueOperand()->stripPointerCasts()))
-          if (Function *B = body(F->getName().str()))
-            for (const auto &f : fieldsOf(S->getPointerOperand()))
-              fnField[f].insert(B);
-  std::map<FunctionType *, std::vector<Function *>> taken;
-  for (const auto &kv : bodies) {
-    Function *F = kv.second;
-    for (const Use &U : F->uses()) {
-      auto *CB = dyn_cast<CallBase>(U.getUser());
-      if (!CB || !CB->isCallee(&U)) {
-        taken[F->getFunctionType()].push_back(F);
-        break;
-      }
-    }
-  }
-  // Class hierarchy analysis for virtual calls. A vtable _ZTV<C> holds, in
-  // each of its arrays, the offset to top and the type info before the
-  // address point, then the virtual functions by slot. A call through slot
-  // k of the vtable of an object of static class C goes to slot k of C's
-  // vtable and of every class derived from C.
-  std::map<std::string, std::map<int64_t, FnSet>> vslots;
-  for (Module *M : {&down, &up})
-    for (GlobalVariable &G : M->globals()) {
-      if (!G.hasInitializer() || !G.getName().starts_with("_ZTV"))
-        continue;
-      std::string cls = "_ZTS" + G.getName().substr(4).str();
-      auto *CS = dyn_cast<ConstantStruct>(G.getInitializer());
-      for (unsigned a = 0; CS && a < CS->getNumOperands(); ++a)
-        if (auto *CA = dyn_cast<ConstantArray>(CS->getOperand(a)))
-          for (unsigned e = 2; e < CA->getNumOperands(); ++e)
-            if (auto *Fn = dyn_cast<Function>(CA->getOperand(e)->stripPointerCasts()))
-              if (Function *B = body(Fn->getName().str()))
-                vslots[cls][(int64_t)e - 2].insert(B);
-    }
-  std::map<std::string, std::set<std::string>> derived;
-  for (const auto &[key, C] : composite)
-    for (const DINode *N : C->getElements())
-      if (auto *M = dyn_cast<DIDerivedType>(N))
-        if (M->getTag() == dwarf::DW_TAG_inheritance)
-          if (auto *B = dyn_cast_or_null<DICompositeType>(strip(M->getBaseType())))
-            derived[typeKey(B)].insert(key);
-  auto below = [&](const std::string &C) {
-    std::set<std::string> out{C};
-    std::vector<std::string> work{C};
-    while (!work.empty()) {
-      std::string D = work.back();
-      work.pop_back();
-      for (const std::string &E : derived[D])
-        if (out.insert(E).second)
-          work.push_back(E);
-    }
-    return out;
-  };
-  // The targets of a virtual call, or none when the callee is not loaded
-  // from a vtable slot.
-  auto virtualTargets = [&](CallBase *CB, FnSet &fs) {
-    auto *L = dyn_cast<LoadInst>(CB->getCalledOperand()->stripPointerCasts());
-    if (!L)
-      return;
-    Value *P = L->getPointerOperand()->stripPointerCasts();
-    int64_t k = 0;
-    bool slot = false;
-    if (auto *G = dyn_cast<GEPOperator>(P)) {
-      if (!G->getSourceElementType()->isPointerTy())
-        return;
-      slot = true;
-      APInt off(64, 0);
-      if (!G->accumulateConstantOffset(dl, off))
-        return;
-      k = off.getSExtValue() / 8;
-      P = G->getPointerOperand()->stripPointerCasts();
-    }
-    auto *V = dyn_cast<LoadInst>(P);
-    if (!V || !V->getType()->isPointerTy())
-      return;
-    Value *O = V->getPointerOperand()->stripPointerCasts();
-    if (isa<AllocaInst>(O))
-      return;
-    std::string cls;
-    if (auto *C = dyn_cast_or_null<DICompositeType>(strip(source::pointee(O))))
-      cls = typeKey(C);
-    auto add = [&](const std::string &C) {
-      auto it = vslots.find(C);
-      if (it == vslots.end())
-        return;
-      auto s = it->second.find(k);
-      if (s != it->second.end())
-        for (Function *T : s->second)
-          if (T->arg_size() == CB->arg_size())
-            fs.insert(T);
-    };
-    if (!cls.empty())
-      for (const std::string &C : below(cls))
-        add(C);
-    if (fs.empty() && slot)
-      for (const auto &kv : vslots)
-        add(kv.first);
-  };
+  targets.index(down);
+  targets.index(up);
   for (const auto &kv : bodies) {
     Function *F = kv.second;
     auto &out = calls[F];
     for (Instruction &I : instructions(*F)) {
       auto *CB = dyn_cast<CallBase>(&I);
-      if (!CB || isa<IntrinsicInst>(CB))
+      if (!CB || isa<IntrinsicInst>(CB) || CB->isInlineAsm())
         continue;
-      if (auto *C = dyn_cast<Function>(CB->getCalledOperand()->stripPointerCasts())) {
+      if (const Function *C = klee::calls::callee(*CB)) {
         if (Function *B = body(C->getName().str()))
           out.insert(B);
         continue;
       }
-      FnSet fs;
-      virtualTargets(CB, fs);
-      if (!fs.empty()) {
-        out.insert(fs.begin(), fs.end());
-        continue;
-      }
-      if (auto *L = dyn_cast<LoadInst>(CB->getCalledOperand()->stripPointerCasts())) {
-        auto fl = fieldsOf(L->getPointerOperand());
-        if (!fl.empty()) {
-          auto ft = fnField.find(fl.back());
-          if (ft != fnField.end())
-            for (Function *T : ft->second)
-              if (T->getFunctionType() == CB->getFunctionType() || T->arg_size() == CB->arg_size())
-                fs.insert(T);
-        }
-      }
-      if (fs.empty()) {
-        auto it = taken.find(CB->getFunctionType());
-        if (it != taken.end())
-          fs.insert(it->second.begin(), it->second.end());
-      }
-      out.insert(fs.begin(), fs.end());
+      for (Function *T : targets.of(*CB))
+        if (Function *B = body(T->getName().str()))
+          out.insert(B);
     }
   }
 }
@@ -1710,6 +1556,19 @@ std::string Client::bareName(const std::string &n) {
 bool Client::satisfies(const std::string &v, const Cell &c) {
   if (v == "*")
     return true;
+  // §3.8 정의 3.8.1: 상수 k는 has m이면 k & m = m, lacks m이면 k & m = 0일 때 만족한다.
+  if (c.op == "has" || c.op == "lacks") {
+    auto k = asU64(v);
+    if (!k)
+      if (auto s = asI64(v))
+        k = (uint64_t)*s;
+    if (!k || c.values.empty())
+      return !k;
+    auto m = asU64(c.values[0]);
+    if (!m)
+      return false;
+    return c.op == "has" ? (*k & *m) == *m : (*k & *m) == 0;
+  }
   auto same = [&](const std::string &a, const std::string &b) {
     if (bareName(a) == bareName(b))
       return true;
@@ -2101,12 +1960,8 @@ void Client::buildWrites() {
 // A function releases formal k when it passes a pointer into k's object to
 // free or to a formal another function releases (least fixpoint). Releasing ends the
 // handle's lifetime, so it never establishes a cell the sink needs. An
-// indirect call may reach any address-taken function of its type.
+// indirect call goes to its targets in the call relation (§3.10).
 void Client::buildReleases() {
-  std::map<FunctionType *, std::vector<Function *>> taken;
-  for (const auto &kv : bodies)
-    if (kv.second->hasAddressTaken())
-      taken[kv.second->getFunctionType()].push_back(kv.second);
   for (bool grew = true; grew;) {
     grew = false;
     for (const auto &kv : bodies) {
@@ -2115,19 +1970,22 @@ void Client::buildReleases() {
         auto *CB = dyn_cast<CallBase>(&I);
         if (!CB)
           continue;
-        auto *C = dyn_cast<Function>(CB->getCalledOperand()->stripPointerCasts());
-        std::vector<Function *> targets;
-        if (C) {
-          if (Function *B = body(C->getName().str()))
-            targets.push_back(B);
-        } else if (!CB->isInlineAsm()) {
-          auto it = taken.find(CB->getFunctionType());
-          if (it != taken.end())
-            targets = it->second;
-        }
+        std::vector<Function *> ts;
+        bool frees = false;
+        auto add = [&](const Function *T) {
+          if (Function *B = body(T->getName().str()))
+            ts.push_back(B);
+          else
+            frees = frees || T->getName() == "free";
+        };
+        if (const Function *C = klee::calls::callee(*CB))
+          add(C);
+        else if (!CB->isInlineAsm())
+          for (Function *T : targets.of(*CB))
+            add(T);
         for (unsigned i = 0; i < CB->arg_size(); ++i) {
-          bool rel = C && C->getName() == "free";
-          for (Function *B : targets)
+          bool rel = frees;
+          for (Function *B : ts)
             rel = rel || releases.count({B, i});
           if (!rel)
             continue;
@@ -2535,15 +2393,7 @@ bool Client::guardOf(Function *E, const Cell &c, Guard &g, bool config) const {
     }
   }
   std::vector<int64_t> vs;
-  for (const std::string &v : c.values) {
-    if (auto s = asI64(v))
-      vs.push_back(*s);
-    else if (auto u = asU64(v))
-      vs.push_back((int64_t)*u);
-    else
-      return false;
-  }
-  if (vs.empty())
+  if (!intValues(c, vs))
     return false;
   // The offset of the field inside each level of the path.
   std::vector<int64_t> within(steps.size());
@@ -2579,623 +2429,562 @@ bool Client::guardOf(Function *E, const Cell &c, Guard &g, bool config) const {
   return true;
 }
 
-// The client for a set of may witnesses. The sink is reachable when one of
-// them is, so the client may start at the entry of any of them and may run
-// the writers of any of their constrained cells: entries and writers are the
-// unions over the witnesses.
-Client::Plan Client::plan(const std::vector<std::pair<std::vector<std::string>, std::vector<Cell>>> &ws) const {
-  Plan P;
-  // §3.5 정리 B (경계 투영): 클라이언트 의무는 경계 셀 Φ_∂뿐이다. 비경계 셀은 U가
-  // 교차 후 스스로 쓰는 내부 셀이거나 U가 관측하지 않는 D 셀이라 의무가 아니다.
-  // 투영은 witness에 D→U 교차가 있을 때만 정의된다(c.crossing). 교차 근이 전부
-  // 미해결이어도(경계 셀 0) 투영은 적용되어 모든 라이브러리 셀이 의무에서 빠지고,
-  // 의무는 미해결 근의 구성(생산자 체인의 입력 리더)으로만 남는다. 교차가 없으면
-  // 투영이 정의되지 않으므로 제한하지 않는다.
-  // The nonterminals of the client grammar the entries and the writers can
-  // demand: their held inputs, closed under the held inputs of every
-  // producer. This is the grammar the harness carries; one execution
-  // expands only the producers it picks.
-  std::set<std::string> need;
-  auto want = [&](Function *F) {
-    for (const Param &p : signature(F))
-      if (held(p) && cost.count(p.type))
-        need.insert(p.type);
+// ---------------------------------------------------------------------------
+// §3.9 The plan: steering and realization.
+
+const char *Client::realizeName(Realize r) {
+  switch (r) {
+  case Realize::Own:
+    return "own";
+  case Realize::Lever:
+    return "lever";
+  case Realize::Key:
+    return "key";
+  case Realize::Write:
+    return "write";
+  case Realize::Construct:
+    return "construct";
+  case Realize::File:
+    return "file";
+  case Realize::Open:
+    return "open";
+  }
+  return "?";
+}
+
+bool Client::intValues(const Cell &c, std::vector<int64_t> &vs) {
+  vs.clear();
+  for (const std::string &v : c.values) {
+    if (auto s = asI64(v))
+      vs.push_back(*s);
+    else if (auto u = asU64(v))
+      vs.push_back((int64_t)*u);
+    else {
+      vs.clear();
+      return false;
+    }
+  }
+  return !vs.empty();
+}
+
+std::string Client::heldType(Function *E, int root) const {
+  auto sig = signature(E);
+  auto at = irParams(E);
+  if (root < 0 || (size_t)root >= at.size() || at[root] < 0 || (size_t)at[root] >= sig.size())
+    return "";
+  const Param &p = sig[at[root]];
+  return held(p) ? p.type : "";
+}
+
+bool Client::own(Function *E, const Cell &c) const {
+  auto sig = signature(E);
+  auto at = irParams(E);
+  if (c.root < 0 || (size_t)c.root >= at.size() || at[c.root] < 0 || (size_t)at[c.root] >= sig.size() ||
+      sig[at[c.root]].kind != Kind::Object)
+    return false;
+  for (const std::string &t : c.path)
+    if (!isPublic(irName(t)))
+      return false;
+  return true;
+}
+
+// A store of a value loaded from another field, through casts: the entry
+// building a crossing object from its handle's settings, as libtiff's
+// JPEGPreEncode does with cinfo.image_width = td_imagewidth.
+const std::map<Client::Field, std::set<Client::Field>> &Client::copies(Function *F) const {
+  auto it = copiesOf.find(F);
+  if (it != copiesOf.end())
+    return it->second;
+  auto &out = copiesOf[F];
+  for (Function *G : innerClosure(F))
+    for (Instruction &I : instructions(*G)) {
+      auto *S = dyn_cast<StoreInst>(&I);
+      if (!S)
+        continue;
+      Value *V = S->getValueOperand();
+      while (auto *C = dyn_cast<CastInst>(V))
+        V = C->getOperand(0);
+      auto *L = dyn_cast<LoadInst>(V);
+      if (!L)
+        continue;
+      for (const Field &d : fieldsOf(S->getPointerOperand()))
+        for (const Field &s : fieldsOf(L->getPointerOperand()))
+          if (d != s)
+            out[d].insert(s);
+    }
+  return out;
+}
+
+std::vector<Function *> Client::copySetters(Function *F, const Cell &c) const {
+  const auto &cm = copies(F);
+  auto it = cm.find(fieldOf(c));
+  if (it == cm.end())
+    return {};
+  FnSet out;
+  for (const Field &d : it->second) {
+    Cell src;
+    src.type = d.first;
+    src.off = d.second;
+    src.op = "!=";
+    for (Function *W : writers(src))
+      if (W != F)
+        out.insert(W);
+  }
+  return {out.begin(), out.end()};
+}
+
+// Intraprocedural: through value operations, local slots and loads, not
+// into callees.
+bool Client::returnsArg(Function *F, unsigned j) const {
+  auto key = std::make_pair(F, j);
+  if (auto it = returnsOf.find(key); it != returnsOf.end())
+    return it->second;
+  bool &res = returnsOf[key] = false;
+  if (F->isDeclaration() || j >= F->arg_size())
+    return res;
+  std::set<Value *> tv;
+  std::vector<Value *> work;
+  auto taint = [&](Value *v) {
+    if (tv.insert(v).second)
+      work.push_back(v);
   };
-  FnSet entrySet, writerSet, unguarded;
-  std::set<std::tuple<std::string, int64_t, std::string, std::vector<std::string>>> cellSet;
-  // §3.6 쓰기측 writer: entry가 교차 직전에 보유 핸들 H의 설정 필드를 교차 객체로
-  // 복사할 때, 교차 객체의 경계 셀 c에 대한 의무는 그 값을 공급한 소스 필드 d로
-  // 환원된다. copyMap은 entry 클로저의 복사 store(V=load(src)→dst)를 모은 dst→{src}
-  // 맵이고, 그로부터 d의 실제 세터를 c의 writer로 잡는다. entry마다 한 번 계산한다.
-  using FieldKey = std::pair<std::string, int64_t>;
-  std::map<Function *, std::map<FieldKey, std::set<FieldKey>>> copyCache;
-  // §3.6 클라이언트 레버: writer W가 어떤 필드를 "클라이언트가 고른 값"으로 쓰는지.
-  // W의 입력 형식인자(스칼라/바이트/텍스트)에서 전방 데이터흐름으로 전파해, tainted
-  // 값이 store되는 필드를 모은다. 상수나 다른 고정 라이브러리 상태만 쓰는 store는
-  // 여기 없다 — 그래서 경계 셀의 writer는 실제로 인자가 그 칸에 닿을 때만 인정된다.
-    std::map<std::pair<Function *, int>, std::set<FieldKey>> taintCache;
-  for (const auto &[seq, phi] : ws) {
-    if (seq.empty())
+  taint(F->getArg(j));
+  while (!work.empty()) {
+    Value *v = work.back();
+    work.pop_back();
+    for (User *U : v->users()) {
+      if (auto *R = dyn_cast<ReturnInst>(U)) {
+        if (R->getReturnValue() == v)
+          return res = true;
+      } else if (auto *S = dyn_cast<StoreInst>(U)) {
+        if (S->getValueOperand() == v)
+          if (auto *A = dyn_cast<AllocaInst>(S->getPointerOperand()->stripPointerCasts()))
+            taint(A);
+      } else if (auto *L = dyn_cast<LoadInst>(U)) {
+        if (L->getPointerOperand() == v)
+          taint(L);
+      } else if (!isa<CallBase>(U) && isa<Instruction>(U)) {
+        taint(U);
+      }
+    }
+  }
+  return res;
+}
+
+// Forward from the formals over W's closure. A value operation, a load
+// through a derived pointer and a local slot (§3.8 taint (i)) carry the
+// value; an argument carries it into the callee's formal, and the result
+// of a callee that returns it (iii) or of a declaration given it (iv).
+const std::set<Client::Field> &Client::argStores(Function *W, int only) const {
+  if (auto it = argStoresOf.find({W, only}); it != argStoresOf.end())
+    return it->second;
+  std::set<Field> &out = argStoresOf[{W, only}];
+  auto sig = signature(W);
+  auto at = irParams(W);
+  std::map<Function *, std::set<unsigned>> argT;
+  for (unsigned i = 0; i < W->arg_size(); ++i) {
+    if (only >= 0 && (unsigned)only != i)
       continue;
-    Function *E = body(seq.front());
+    Type *T = W->getArg(i)->getType();
+    int k = i < at.size() ? at[i] : -1;
+    Kind kd = k >= 0 ? sig[k].kind : (T->isIntegerTy() ? Kind::Scalar : Kind::Object);
+    if (T->isIntegerTy() || kd == Kind::Scalar || kd == Kind::Bytes || kd == Kind::Text)
+      argT[W].insert(i);
+  }
+  FnSet queued;
+  std::vector<Function *> fwork;
+  auto enqueue = [&](Function *F) {
+    if (queued.insert(F).second)
+      fwork.push_back(F);
+  };
+  enqueue(W);
+  while (!fwork.empty()) {
+    Function *F = fwork.back();
+    fwork.pop_back();
+    queued.erase(F);
+    if (F->isDeclaration())
+      continue;
+    std::set<Value *> tv;
+    std::vector<Value *> work;
+    auto taint = [&](Value *v) {
+      if (tv.insert(v).second)
+        work.push_back(v);
+    };
+    for (unsigned i : argT[F])
+      if (i < F->arg_size())
+        taint(F->getArg(i));
+    while (!work.empty()) {
+      Value *v = work.back();
+      work.pop_back();
+      for (User *U : v->users()) {
+        if (auto *S = dyn_cast<StoreInst>(U)) {
+          if (S->getValueOperand() == v) {
+            for (const Field &f : fieldsOf(S->getPointerOperand()))
+              out.insert(f);
+            if (auto *A = dyn_cast<AllocaInst>(S->getPointerOperand()->stripPointerCasts()))
+              taint(A);
+          }
+        } else if (auto *L = dyn_cast<LoadInst>(U)) {
+          if (L->getPointerOperand() == v)
+            taint(L);
+        } else if (auto *CB = dyn_cast<CallBase>(U)) {
+          auto *C = dyn_cast<Function>(CB->getCalledOperand()->stripPointerCasts());
+          if (!C)
+            continue;
+          if (Function *Bd = body(C->getName().str())) {
+            bool ret = false;
+            for (unsigned j = 0; j < CB->arg_size() && j < Bd->arg_size(); ++j)
+              if (CB->getArgOperand(j) == v) {
+                if (argT[Bd].insert(j).second)
+                  enqueue(Bd);
+                ret = ret || returnsArg(Bd, j);
+              }
+            if (ret)
+              taint(CB);
+          } else if (!CB->getType()->isVoidTy()) {
+            taint(CB);
+          }
+        } else if (isa<Instruction>(U)) {
+          taint(U);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+bool Client::carries(Function *W, const Cell &c, Function *E) const {
+  const auto &ts = argStores(W);
+  if (ts.count(fieldOf(c)))
+    return true;
+  const auto &cm = copies(E);
+  if (auto it = cm.find(fieldOf(c)); it != cm.end())
+    for (const Field &d : it->second)
+      if (ts.count(d))
+        return true;
+  return false;
+}
+
+bool Client::readsInput(Function *F) const {
+  if (auto it = readsOf.find(F); it != readsOf.end())
+    return it->second;
+  static const std::set<StringRef> io{"read",   "pread",    "pread64",       "readv",   "preadv",
+                                      "recv",   "recvfrom", "recvmsg",       "fread",   "fread_unlocked",
+                                      "fgetc",  "getc",     "getc_unlocked", "getchar", "fgets",
+                                      "fgetws", "getline",  "getdelim",      "mmap",    "mmap64"};
+  for (Function *G : innerClosure(F))
+    for (Instruction &I : instructions(*G))
+      if (auto *CB = dyn_cast<CallBase>(&I))
+        if (Function *C = CB->getCalledFunction())
+          if (io.count(C->getName()))
+            return readsOf[F] = true;
+  return readsOf[F] = false;
+}
+
+bool Client::storesInput(Function *F, const Field &f) const {
+  for (Function *G : closureOf(F))
+    if (auto it = stores.find(G); it != stores.end())
+      for (auto s = it->second.lower_bound({f, ""}); s != it->second.end() && s->first == f; ++s)
+        if (s->second == "*")
+          return true;
+  return false;
+}
+
+bool Client::storesSatisfying(Function *F, const Field &f, const Cell &c) const {
+  for (Function *G : closureOf(F))
+    if (auto it = stores.find(G); it != stores.end())
+      for (auto s = it->second.lower_bound({f, ""}); s != it->second.end() && s->first == f; ++s)
+        if (s->second != "*" && satisfies(s->second, c))
+          return true;
+  return false;
+}
+
+bool Client::upOnly(const Field &f) const {
+  bool any = false;
+  for (const auto &[G, st] : stores) {
+    auto s = st.lower_bound({f, ""});
+    if (s == st.end() || s->first != f)
+      continue;
+    if (G->getParent() != &up)
+      return false;
+    any = true;
+  }
+  return any;
+}
+
+// Lever: a producer of the cell's held root whose integer formal reaches
+// the field. The client picks that argument from the values the atom admits.
+std::vector<std::pair<Function *, Client::Lever>> Client::leversOf(Function *E, const Cell &c) const {
+  std::vector<std::pair<Function *, Lever>> out;
+  std::vector<int64_t> vs;
+  if (c.file || (c.op != "=" && c.op != "!=") || !intValues(c, vs))
+    return out;
+  auto pit = producers.find(heldType(E, c.root));
+  if (pit == producers.end())
+    return out;
+  for (const Producer &pr : pit->second)
+    for (unsigned i = 0; i < pr.fn->arg_size(); ++i)
+      if (pr.fn->getArg(i)->getType()->isIntegerTy() && argStores(pr.fn, (int)i).count(fieldOf(c)))
+        out.push_back({pr.fn, {i, c.op == "=", vs, c.text}});
+  return out;
+}
+
+// Definition 3.8.4: W is an interface function of D other than E, takes
+// the handle the cell lies in, and has the tag and variadic shape found.
+bool Client::realizable(Function *E, const Keyed &k) const {
+  Function *W = body(k.fn);
+  if (!W || W == E || !ifaceD.count(W) || k.va != W->isVarArg())
+    return false;
+  std::string T = heldType(E, k.root);
+  if (T.empty())
+    return false;
+  auto sw = signature(W);
+  auto aw = irParams(W);
+  if (k.obj >= aw.size() || aw[k.obj] < 0 || sw[aw[k.obj]].type != T)
+    return false;
+  return k.tag < 0 || ((size_t)k.tag < aw.size() && aw[k.tag] >= 0);
+}
+
+// Wr(c): writers of c and, for a boundary cell, setters of what the entry
+// copies into it. A candidate is an interface function of D, not an entry,
+// that takes the cell's held root, and for a boundary or prefix cell
+// carries a client value into it.
+std::vector<Function *> Client::writeCandidates(Function *E, const std::vector<Function *> &es, const Cell &c) const {
+  Function *entry = es.empty() ? nullptr : es[0];
+  std::string T = heldType(E, c.root);
+  FnSet out;
+  auto admit = [&](Function *W) {
+    if (!ifaceD.count(W) || std::find(es.begin(), es.end(), W) != es.end())
+      return;
+    if (!T.empty()) {
+      bool share = false;
+      for (const Param &p : signature(W))
+        share = share || (held(p) && p.type == T);
+      if (!share)
+        return;
+    }
+    if ((c.boundary || c.prefix) && (!entry || !carries(W, c, entry)))
+      return;
+    out.insert(W);
+  };
+  for (Function *W : writers(c))
+    admit(W);
+  if (c.boundary && entry)
+    for (Function *W : copySetters(entry, c))
+      admit(W);
+  return {out.begin(), out.end()};
+}
+
+// Construct: no function stores the field, or only U does (정리 B(a)), or
+// the entry stores only constants that satisfy the atom, directly or into
+// a field it copies from.
+bool Client::establishedBy(Function *entry, const Cell &c) const {
+  Field f = fieldOf(c);
+  if (!everStored(f.first, f.second) || upOnly(f))
+    return true;
+  if (!entry || !(c.boundary || c.prefix))
+    return false;
+  if (storesSatisfying(entry, f, c))
+    return true;
+  const auto &cm = copies(entry);
+  if (auto it = cm.find(f); it != cm.end())
+    for (const Field &d : it->second)
+      if (storesSatisfying(entry, d, c))
+        return true;
+  return false;
+}
+
+// File: F reads the input and stores a non-constant to the field, to a
+// field copied into it, or, for a bound, to the field the bound names.
+bool Client::fills(Function *F, const Cell &c) const {
+  if (!F || !readsInput(F))
+    return false;
+  if (storesInput(F, fieldOf(c)))
+    return true;
+  const auto &cm = copies(F);
+  if (auto it = cm.find(fieldOf(c)); it != cm.end())
+    for (const Field &d : it->second)
+      if (storesInput(F, d))
+        return true;
+  static const std::set<std::string> bound{"ult", "ule", "ugt", "uge", "slt", "sle",
+                                           "sgt", "sge", "<",   ">",   "<=",  ">="};
+  if (!bound.count(c.op) || c.values.empty())
+    return false;
+  const std::string &other = c.values.back();
+  auto p = other.rfind('+');
+  if (p == std::string::npos || p == 0)
+    return false;
+  auto o = asI64(other.substr(p + 1));
+  return o && storesInput(F, {other.substr(0, p), *o});
+}
+
+// The call that fills the cell from the input: the entry, or a producer of
+// the cell's held root or a call it depends on.
+Function *Client::inputFiller(Function *E, Function *entry, const Cell &c) const {
+  if (fills(entry, c))
+    return entry;
+  std::string T = heldType(E, c.root);
+  auto pit = producers.find(T);
+  if (pit == producers.end())
+    return nullptr;
+  for (const Producer &pr : pit->second) {
+    if (fills(pr.fn, c))
+      return pr.fn;
+    for (Function *D : dependences(pr.fn, T))
+      if (fills(D, c))
+        return D;
+  }
+  return nullptr;
+}
+
+Client::WitnessPlan Client::realize(Function *E, const std::vector<Cell> &phi, const std::vector<Keyed> &keyed) const {
+  WitnessPlan W;
+  W.first = E;
+  W.entries = entries(E);
+  Function *entry = W.entries.empty() ? nullptr : W.entries[0];
+  W.iface = entry && ifaceD.count(entry);
+  W.direct = W.entries.size() == 1 && entry == E;
+  std::vector<Keyed> kw;
+  for (const Keyed &k : keyed)
+    if (realizable(E, k))
+      kw.push_back(k);
+  auto valueAtom = [](const Cell &c) { return c.op == "=" || c.op == "!=" || c.op == "has" || c.op == "lacks"; };
+  std::map<size_t, std::vector<Function *>> cand;
+  for (const Cell &c : phi) {
+    if (c.type.empty() || c.op.empty())
+      continue;
+    bool mine = W.direct && own(E, c);
+    std::vector<std::pair<Function *, Lever>> lv;
+    if (!mine)
+      lv = leversOf(E, c);
+    W.levers.insert(W.levers.end(), lv.begin(), lv.end());
+    if (c.crossing && !c.boundary && !c.prefix && !mine)
+      continue;
+    Guard g;
+    if (W.direct && !c.file && guardOf(E, c, g, mine))
+      W.guards.push_back(g);
+    if (mine && c.file)
+      W.files.push_back(c);
+    Realized r{c};
+    const Keyed *k = nullptr;
+    for (const Keyed &x : kw)
+      if (!k && x.covers(c))
+        k = &x;
+    std::vector<Function *> wr;
+    if (mine) {
+      r.how = Realize::Own;
+    } else if (!lv.empty()) {
+      r.how = Realize::Lever;
+      r.by = lv.front().first;
+    } else if (k) {
+      r.how = Realize::Key;
+      r.by = body(k->fn);
+      bool dup = false;
+      for (const auto &[F, o] : W.keyed)
+        dup = dup || (F == r.by && o.tag == k->tag && o.tagV == k->tagV && o.preds == k->preds);
+      if (!dup)
+        W.keyed.push_back({r.by, *k});
+    } else if (valueAtom(c) && !(wr = writeCandidates(E, W.entries, c)).empty()) {
+      r.how = Realize::Write;
+      cand[W.cells.size()] = wr;
+    } else if (!c.file && establishedBy(entry, c)) {
+      r.how = Realize::Construct;
+    } else if (!c.file && (c.boundary || c.prefix) && (r.by = inputFiller(E, entry, c))) {
+      r.how = Realize::File;
+    }
+    W.cells.push_back(r);
+  }
+  // Greedy set cover of the Write cells by at most writerSlots functions,
+  // the writer calls the §4 grammar makes before the entry.
+  auto covers = [&](size_t i, Function *F) { return std::find(cand[i].begin(), cand[i].end(), F) != cand[i].end(); };
+  std::vector<size_t> left;
+  FnSet pool;
+  for (const auto &[i, wr] : cand) {
+    left.push_back(i);
+    pool.insert(wr.begin(), wr.end());
+  }
+  while (!left.empty() && W.cover.size() < writerSlots) {
+    Function *best = nullptr;
+    size_t got = 0;
+    for (Function *F : pool) {
+      size_t n = std::count_if(left.begin(), left.end(), [&](size_t i) { return covers(i, F); });
+      if (n > got) {
+        got = n;
+        best = F;
+      }
+    }
+    if (!best)
+      break;
+    W.cover.push_back(best);
+    pool.erase(best);
+    std::vector<size_t> rest;
+    for (size_t i : left)
+      if (covers(i, best))
+        W.cells[i].by = best;
+      else
+        rest.push_back(i);
+    left.swap(rest);
+  }
+  for (size_t i : left)
+    W.cells[i].how = Realize::Open;
+  W.pass = W.iface;
+  for (const Realized &r : W.cells)
+    W.pass = W.pass && r.how != Realize::Open;
+  return W;
+}
+
+// The client for a set of may witnesses. The sink is reachable when one of
+// them is, so the plan is the union of their steering and of the calls that
+// realize the witnesses that pass.
+Client::Plan Client::plan(const Witnesses &ws) const {
+  Plan P;
+  FnSet entrySet, unguarded, writerSet;
+  for (size_t wi = 0; wi < ws.size(); ++wi) {
+    const auto &[seq, phi] = ws[wi];
+    Function *E = seq.empty() ? nullptr : body(seq.front());
     if (!E)
       continue;
+    WitnessPlan W = realize(E, phi, wi < keyedIn.size() ? keyedIn[wi] : std::vector<Keyed>{});
     if (std::find(P.firsts.begin(), P.firsts.end(), E) == P.firsts.end())
       P.firsts.push_back(E);
-    auto es = entries(E);
-    for (Function *F : es)
+    for (Function *F : W.entries)
       if (entrySet.insert(F).second)
         P.entries.push_back(F);
-    // Finding 3: the obligation partition is computed once here and shared by
-    // all three passes below (guards, writers/files, verdict), so they cannot
-    // diverge on what a cell is. own: the cell lies in a public object the
-    // client itself passes to the entry (§4 설정), so the client writes it
-    // directly. obligated: §3.5 정리 B(정제) — with a crossing, only boundary
-    // cells and the client's own prefix cells are obligations; without a
-    // crossing every cell is.
-    auto ownCell = [&](const std::vector<Param> &sig, const std::vector<int> &at, const Cell &c) {
-      bool own = es.size() == 1 && es[0] == E && c.root >= 0 && (size_t)c.root < at.size() &&
-                 at[c.root] >= 0 && (size_t)at[c.root] < sig.size() && sig[at[c.root]].kind == Kind::Object;
-      for (const std::string &t : c.path)
-        own = own && isPublic(irName(t));
-      return own;
-    };
-    auto obligated = [](const Cell &c, bool own) { return !c.crossing || c.boundary || own; };
-    // §3.6 쓰기측 writer 실현. entry 클로저의 복사 store(교차 객체 필드 dst ←
-    // 보유 핸들 필드 src의 load)를 모아 dst→{src} 맵을 만든다. 예: libtiff
-    // JPEGPreEncode의 cinfo.image_width = tif->tif_dir.td_imagewidth. 값의
-    // 캐스트(trunc/zext/bitcast 등)는 벗겨 소스 load까지 따라간다.
-    auto copyMap = [&](Function *En) -> const std::map<FieldKey, std::set<FieldKey>> & {
-      auto it = copyCache.find(En);
-      if (it != copyCache.end())
-        return it->second;
-      auto &out = copyCache[En];
-      for (Function *G : innerClosure(En))
-        for (Instruction &I : instructions(*G)) {
-          auto *S = dyn_cast<StoreInst>(&I);
-          if (!S)
-            continue;
-          Value *V = S->getValueOperand();
-          while (auto *C = dyn_cast<CastInst>(V))
-            V = C->getOperand(0);
-          auto *L = dyn_cast<LoadInst>(V);
-          if (!L)
-            continue;
-          auto dst = fieldsOf(S->getPointerOperand());
-          auto src = fieldsOf(L->getPointerOperand());
-          if (dst.empty() || src.empty())
-            continue;
-          for (const auto &d : dst)
-            for (const auto &s : src)
-              if (d != s)
-                out[d].insert(s);
-        }
-      return out;
-    };
-    // entry만 직접 쓰는 경계 셀 c의 설정 세터: c로 복사된 소스 필드 d를 쓰는
-    // 인터페이스 함수(= 그 설정 필드의 실제 세터, 예: TIFFSetField). 값 제약
-    // 없이(op="!=", 빈 집합) writers를 호출해 d의 세터 전부를 얻는다.
-    auto configOf = [&](Function *En, const Cell &c) {
-      std::vector<Function *> out;
-      const auto &cm = copyMap(En);
-      auto it = cm.find({c.type, c.off});
-      if (it == cm.end())
-        return out;
-      std::set<Function *> seen;
-      for (const FieldKey &d : it->second) {
-        Cell src;
-        src.type = d.first;
-        src.off = d.second;
-        src.op = "!=";
-        for (Function *W : writers(src))
-          if (W != En && seen.insert(W).second)
-            out.push_back(W);
-      }
-      std::sort(out.begin(), out.end(), [](Function *a, Function *b) { return a->getName() < b->getName(); });
-      return out;
-    };
-    // W가 클라이언트가 고른 값으로 쓰는 필드 집합. W의 입력 형식인자에서 시작해 W의
-    // 클로저를 전방 전파한다: 값 연산(캐스트·산술·GEP·phi 등)은 taint를 잇고, tainted
-    // 포인터의 load도 잇고(바이트 버퍼 읽기), 호출 인자는 피호출자 형식인자로 넘긴다.
-    // tainted 값이 store되는 (타입,오프셋)을 모은다.
-    // only >= 0이면 그 형식인자 하나에서만 시작한다(생성자 레버: 어느 인자가 어느
-    // 셀을 정하는지).
-    std::function<const std::set<FieldKey> &(Function *, int)> taintFrom = [&](Function *W, int only) -> const std::set<FieldKey> & {
-      auto it = taintCache.find({W, only});
-      if (it != taintCache.end())
-        return it->second;
-      std::set<FieldKey> &out = taintCache[{W, only}]; // 재귀 차단용으로 먼저 삽입
-      auto sig = signature(W);
-      auto at = irParams(W);
-      std::map<Function *, std::set<unsigned>> argT;
-      for (unsigned i = 0; i < W->arg_size(); ++i) {
-        if (only >= 0 && (unsigned)only != i)
-          continue;
-        Type *T = W->getArg(i)->getType();
-        int k = i < at.size() ? at[i] : -1;
-        Kind kd = k >= 0 ? sig[k].kind : (T->isIntegerTy() ? Kind::Scalar : Kind::Object);
-        if (T->isIntegerTy() || kd == Kind::Scalar || kd == Kind::Bytes || kd == Kind::Text)
-          argT[W].insert(i);
-      }
-      std::set<Function *> inWork;
-      std::vector<Function *> wl;
-      auto enqueue = [&](Function *F) {
-        if (inWork.insert(F).second)
-          wl.push_back(F);
-      };
-      enqueue(W);
-      while (!wl.empty()) {
-        Function *F = wl.back();
-        wl.pop_back();
-        inWork.erase(F);
-        if (F->isDeclaration())
-          continue;
-        std::set<Value *> tv;
-        std::vector<Value *> vwl;
-        auto taint = [&](Value *v) {
-          if (tv.insert(v).second)
-            vwl.push_back(v);
-        };
-        for (unsigned i : argT[F])
-          if (i < F->arg_size())
-            taint(F->getArg(i));
-        while (!vwl.empty()) {
-          Value *v = vwl.back();
-          vwl.pop_back();
-          for (User *U : v->users()) {
-            if (auto *S = dyn_cast<StoreInst>(U)) {
-              if (S->getValueOperand() == v)
-                for (const auto &f : fieldsOf(S->getPointerOperand()))
-                  out.insert(f);
-              continue;
-            }
-            if (auto *L = dyn_cast<LoadInst>(U)) {
-              if (L->getPointerOperand() == v)
-                taint(L);
-              continue;
-            }
-            if (auto *CB = dyn_cast<CallBase>(U)) {
-              if (auto *C = dyn_cast<Function>(CB->getCalledOperand()->stripPointerCasts()))
-                if (Function *B = body(C->getName().str()))
-                  for (unsigned j = 0; j < CB->arg_size() && j < B->arg_size(); ++j)
-                    if (CB->getArgOperand(j) == v && argT[B].insert(j).second)
-                      enqueue(B);
-              continue;
-            }
-            if (isa<Instruction>(U))
-              taint(U);
-          }
-        }
-      }
-      return out;
-    };
-    auto taintWritten = [&](Function *W) -> const std::set<FieldKey> & { return taintFrom(W, -1); };
-    // 경계 셀 c의 writer W가 클라이언트 레버를 나르는가: W가 c를 직접 (입력으로) 쓰거나,
-    // §3.6 복사의 소스 필드 d를 (입력으로) 쓴다.
-    auto carries = [&](Function *W, const Cell &c, Function *En) {
-      const auto &tw = taintWritten(W);
-      if (tw.count({c.type, c.off}))
-        return true;
-      const auto &cm = copyMap(En);
-      auto it = cm.find({c.type, c.off});
-      if (it != cm.end())
-        for (const FieldKey &d : it->second)
-          if (tw.count(d))
-            return true;
-      return false;
-    };
-    // §7 닫힌 세계의 두 번째 클라이언트 레버: 입력 파일 내용. 파일 내용은 read()류가
-    // 메모리 버퍼에 채우고 파서가 그 메모리를 다시 읽어 필드에 넣으므로 SSA taint로는
-    // 추적되지 않는다. 대신 닫힌 세계(심볼릭 파일이 유일 입력, §7)를 근거로 한다:
-    // entry 클로저가 열린 파일을 읽고(아래 I/O 프리미티브) 그 클로저가 경계 셀을
-    // 비상수(abstractValue "*") 값으로 쓰면, 그 값은 상수(정적 초기화)도 인자도 아니므로
-    // 유일한 입력인 파일 내용에서 온 것이다 → 심볼릭 파일 + entry가 그 칸을 realize한다
-    // (추가 호출 불필요: entry가 파일을 파싱하면서 채운다). 라이브러리 무관 일반 규칙.
-    auto ioPrimitive = [](StringRef n) {
-      static const std::set<StringRef> io{"read",   "pread",   "pread64",        "readv",   "preadv",
-                                          "recv",   "recvfrom", "recvmsg",       "fread",   "fread_unlocked",
-                                          "fgetc",  "getc",     "getc_unlocked", "getchar", "fgets",
-                                          "fgetws", "getline",  "getdelim",      "mmap",    "mmap64"};
-      return io.count(n) > 0;
-    };
-    auto readsFile = [&](Function *F) {
-      for (Function *G : innerClosure(F))
-        for (Instruction &I : instructions(*G))
-          if (auto *CB = dyn_cast<CallBase>(&I))
-            if (Function *C = CB->getCalledFunction())
-              if (ioPrimitive(C->getName()))
-                return true;
-      return false;
-    };
-    // entry가 전이적으로 실행하는 코드 전체(인터페이스 경계에서 멈추지 않음). 파일은
-    // 라이브러리 깊숙이(예: libjpeg의 jpeg_read_header 아래)에서 파싱되므로, 파일 내용
-    // 레버는 이 깊은 도달 집합으로 본다.
-    std::map<Function *, std::shared_ptr<FnSet>> deepCache;
-    auto deepClosure = [&](Function *F) -> const FnSet & {
-      auto it = deepCache.find(F);
-      if (it != deepCache.end())
-        return *it->second;
-      auto set = std::make_shared<FnSet>();
-      set->insert(F);
-      std::vector<Function *> work{F};
-      while (!work.empty()) {
-        Function *G = work.back();
-        work.pop_back();
-        auto c = calls.find(G);
-        if (c == calls.end())
-          continue;
-        for (Function *C : c->second)
-          if (set->insert(C).second)
-            work.push_back(C);
-      }
-      deepCache[F] = set;
-      return *set;
-    };
-    // entry가 실행하는 코드 어딘가에서 (타입,오프셋)에 비상수(파일 유래) 값을 쓰는가.
-    auto fileStored = [&](Function *F, const std::string &type, int64_t off) {
-      std::pair<std::string, int64_t> key{type, off};
-      for (Function *G : deepClosure(F)) {
-        auto it = stores.find(G);
-        if (it == stores.end())
-          continue;
-        for (auto s = it->second.lower_bound({key, ""}); s != it->second.end() && s->first == key; ++s)
-          if (s->second == "*")
-            return true;
-      }
-      return false;
-    };
-    // §3.5 정리 B(a): 교차 후 U가 스스로 할당·기록하는 내부 셀은 클라이언트 의무가
-    // 아니다. 신호는 그 필드를 쓰는 정의된 함수가 전부 U(up 모듈)에 있다는 것 —
-    // 포인터 너머 U가 할당한 하위 객체(예: libjpeg의 my_main_controller). D 함수가
-    // 하나라도 쓰면(예: libtiff의 JPEGPreEncode가 cinfo로 복사) U-내부가 아니라 D가
-    // 세우는 설정 유래 의무다.
-    auto uInternal = [&](const std::string &type, int64_t off) {
-      std::pair<std::string, int64_t> key{type, off};
-      bool any = false;
-      for (const auto &[G, st] : stores)
-        for (auto s = st.lower_bound({key, ""}); s != st.end() && s->first == key; ++s) {
-          any = true;
-          if (G->getParent() != &up)
-            return false;
-          break;
-        }
-      return any;
-    };
-    // The witness's arguments are the entry's only when it starts there. A
-    // cell of a public object the client passes is its configuration; any
-    // other cell the entry does not change is a guard.
-    std::vector<Guard> conj;
-    if (es.size() == 1 && es[0] == E) {
-      auto sigG = signature(E);
-      auto atG = irParams(E);
-      for (const Cell &c : phi) {
-        bool own = ownCell(sigG, atG, c);
-        // §3.5 정리 B: 비경계 셀의 가드는 클라이언트가 제어할 수 없는 상태를
-        // 강제해 과잉 제약이 되므로 뺀다. own 설정 셀은 유지한다.
-        if (!obligated(c, own))
-          continue;
-        // §2.4 Open: 파일 통로 셀의 의무는 값 가드가 아니라 입력 파일 이름("f")을
-        // 그 자리에 쓰는 것이다. 이는 files 메커니즘이 처리하므로(그리고 가드로
-        // 두면 뒤에 상수 0을 덮어써 파일 이름을 지운다) 값 가드에서는 뺀다.
-        if (c.file)
-          continue;
-        Guard g;
-        if (guardOf(E, c, g, own))
-          conj.push_back(g);
-      }
-    }
-    if (es.size() == 1 && es[0] == E)
-      P.guards[E].push_back(conj);
+    // The witness's arguments are the entry's only when it starts there.
+    if (W.direct)
+      P.guards[E].push_back(W.guards);
     else
-      unguarded.insert(es.begin(), es.end());
-    // A cell the client writes itself: its root is a public object the
-    // client passes to the entry, and every struct on its path is public.
-    // Any other cell lies in memory only the library reaches.
-    auto sigE = signature(E);
-    auto atE = irParams(E);
-    for (const Cell &c : phi) {
-      if (c.type.empty() || c.op.empty())
-        continue;
-      bool own = ownCell(sigE, atE, c);
-      // §3.5 정리 B: 경계 투영. 비경계 셀은 클라이언트 의무가 아니므로 writer/파일
-      // 대상에서 뺀다. 클라이언트가 직접 쓰는 own 셀은 투영과 무관하게 설정이다.
-      if (!obligated(c, own))
-        continue;
-      if (own && c.file) {
-        auto &fs = P.files[E];
+      unguarded.insert(W.entries.begin(), W.entries.end());
+    for (const auto &[F, l] : W.levers) {
+      auto &ls = P.levers[F];
+      bool dup = false;
+      for (const Lever &o : ls)
+        dup = dup || (o.formal == l.formal && o.text == l.text);
+      if (!dup)
+        ls.push_back(l);
+    }
+    for (const Cell &c : W.files) {
+      auto &fs = P.files[E];
+      bool dup = false;
+      for (const Cell &d : fs)
+        dup = dup || d.text == c.text;
+      if (!dup)
+        fs.push_back(c);
+    }
+    if (W.pass) {
+      writerSet.insert(W.cover.begin(), W.cover.end());
+      auto &ks = P.keyed[E];
+      for (const auto &[F, k] : W.keyed) {
         bool dup = false;
-        for (const Cell &d : fs)
-          dup = dup || d.text == c.text;
+        for (const auto &[G, o] : ks)
+          dup = dup || (G == F && o.tag == k.tag && o.tagV == k.tagV && o.preds == k.preds);
         if (!dup)
-          fs.push_back(c);
+          ks.push_back({F, k});
       }
-      if (!cellSet.insert({c.type, c.off, c.op, c.values}).second)
-        continue;
-      if (own) {
-        P.clientCells.push_back(c);
-        continue;
-      }
-      auto w = writers(c);
-      // A writer changes the entry's cell only through the object the cell
-      // lies in, and the client shares an object between calls only by
-      // passing the instance it holds. A writer that takes no held
-      // argument of the root's type writes some other object.
-      // When the root is not an object the client holds, the cell can still
-      // lie in memory reachable from what it passes to the entry, so the
-      // writer must share some held object with an entry.
-      if (c.root >= 0 && (size_t)c.root < sigE.size()) {
-        std::set<std::string> via;
-        if (held(sigE[c.root]))
-          via.insert(sigE[c.root].type);
-        else
-          for (Function *X : es)
-            for (const Param &p : signature(X))
-              if (held(p))
-                via.insert(p.type);
-        std::vector<Function *> shared;
-        for (Function *W : w) {
-          bool s = false;
-          for (const Param &p : signature(W))
-            s = s || (held(p) && via.count(p.type));
-          if (s)
-            shared.push_back(W);
-        }
-        w = shared;
-      }
-      // §3.6 클라이언트 레버: 경계 셀의 writer는 그 store 값이 호출 인자에서 전파돼야
-      // 인정한다(상수·고정 상태 store 제외). 직접 writer를 레버로 거르고, entry만
-      // 직접 쓰면 복사 소스를 세우는 세터(configOf)를 레버 조건으로 더한다.
-      if (c.boundary && !es.empty()) {
-        std::vector<Function *> kept;
-        for (Function *W : w)
-          if (std::find(es.begin(), es.end(), W) != es.end() || carries(W, c, es[0]))
-            kept.push_back(W);
-        w = kept;
-        bool onlyEntry = true;
-        for (Function *W : w)
-          onlyEntry = onlyEntry && std::find(es.begin(), es.end(), W) != es.end();
-        if (onlyEntry)
-          for (Function *W : configOf(es[0], c))
-            if (carries(W, c, es[0]) && std::find(w.begin(), w.end(), W) == w.end())
-              w.push_back(W);
-      }
-      if (w.empty())
-        continue;
-      P.cellWriters.push_back({c, w});
-      writerSet.insert(w.begin(), w.end());
+      if (ks.empty())
+        P.keyed.erase(E);
     }
-    // §3.6 생성자 레버. 보유(불투명) 인자 안의 값 셀 c는 클라이언트가 직접 쓸 수도,
-    // 보유 객체를 받는 writer로 쓸 수도 없는 경우가 있다: 값이 생산자의 입력 인자에서
-    // 흘러든 때(예: fz_new_font_from_memory(..., use_glyph_bbox) → font->use_glyph_bbox).
-    // 그 생산자의 그 형식인자가 c의 레버다. §3.5 투영과 무관하다 — 투영은 클라이언트가
-    // 무엇을 직접 써야 하는가를 말하고, 레버는 클라이언트가 자기 인자를 어떻게 고르는가를
-    // 말한다. 생산자마다 형식인자별 taint로 어느 인자가 c에 닿는지 가른다.
-    for (const Cell &c : phi) {
-      if (c.type.empty() || (c.op != "=" && c.op != "!=") || c.file)
-        continue;
-      if (c.root < 0 || (size_t)c.root >= atE.size() || atE[c.root] < 0)
-        continue;
-      const Param &rp = sigE[atE[c.root]];
-      if (!held(rp) || ownCell(sigE, atE, c))
-        continue;
-      std::vector<int64_t> vs;
-      for (const std::string &v : c.values) {
-        if (auto s = asI64(v))
-          vs.push_back(*s);
-        else if (auto u = asU64(v))
-          vs.push_back((int64_t)*u);
-        else {
-          vs.clear();
-          break;
-        }
-      }
-      if (vs.empty())
-        continue;
-      auto pit = producers.find(rp.type);
-      if (pit == producers.end())
-        continue;
-      for (const Producer &pr : pit->second) {
-        Function *W = pr.fn;
-        for (unsigned i = 0; i < W->arg_size(); ++i) {
-          if (!W->getArg(i)->getType()->isIntegerTy())
-            continue;
-          if (!taintFrom(W, (int)i).count({c.type, c.off}))
-            continue;
-          auto &ls = P.levers[W];
-          bool dup = false;
-          for (const Lever &l : ls)
-            dup = dup || (l.formal == i && l.text == c.text);
-          if (!dup)
-            ls.push_back({i, c.op == "=", vs, c.text});
-        }
-      }
-    }
-    // This witness alone. A call discharges a cell when it is an interface
-    // function other than the witness entry and its closure stores the
-    // cell's value. The entry's own stores are already substituted by the
-    // path condition; a cell only the entry stores is not a prefix.
-    {
-      std::vector<std::pair<Cell, std::vector<Function *>>> local;
-      Function *entry = es.empty() ? nullptr : es[0];
-      for (const Cell &c : phi) {
-        if (c.type.empty() || c.op.empty())
-          continue;
-        bool own = ownCell(sigE, atE, c);
-        // own 셀은 클라이언트가 직접 쓴다(설정). own file 셀은 Open 통로("f")로
-        // 충족되므로, 어느 쪽이든 uncovered가 아니다.
-        if (own)
-          continue;
-        // §3.5 정리 B: 경계 셀(과 own 전위 셀)만 의무다. 비경계 셀은 uncovered로
-        // 세지 않는다.
-        if (!obligated(c, own))
-          continue;
-        // A bound or a relation between two cells is an entry obligation.
-        // A store of some other value does not discharge it.
-        std::vector<Function *> ww;
-        if (!c.file && c.op != "=" && c.op != "!=") {
-          local.push_back({c, ww});
-          continue;
-        }
-        for (Function *W : writers(c)) {
-          if (!ifaceD.count(W))
-            continue;
-          if (std::find(es.begin(), es.end(), W) != es.end())
-            continue;
-          bool share = true;
-          if (c.root >= 0 && (size_t)c.root < sigE.size() && held(sigE[c.root])) {
-            share = false;
-            for (const Param &p : signature(W))
-              share = share || (held(p) && p.type == sigE[c.root].type);
-          }
-          if (!share)
-            continue;
-          // §3.6 클라이언트 레버: 경계 셀의 직접 writer는 인자가 그 칸에 닿을 때만.
-          if (c.boundary && entry && !carries(W, c, entry))
-            continue;
-          ww.push_back(W);
-        }
-        // §3.6 클라이언트 레버: 경계 셀을 entry가 교차 직전 핸들 설정에서 복사로 지으면,
-        // 복사 소스를 세우는 세터(configOf)를 레버 조건으로 더한다. 그런 세터가 있으면
-        // 커버, 없으면 uncovered로 정직하게 남는다.
-        if (c.boundary && entry)
-          for (Function *W : configOf(entry, c))
-            if (carries(W, c, entry) && std::find(ww.begin(), ww.end(), W) == ww.end())
-              ww.push_back(W);
-        local.push_back({c, ww});
-      }
-      int uncovered = 0;
-      int construct = 0;
-      int fileCov = 0;
-      std::string openCells;
-      std::vector<Function *> cand;
-      std::vector<int> need;
-      bool entryReadsFile = entry && readsFile(entry);
-      for (size_t i = 0; i < local.size(); ++i) {
-        if (local[i].second.empty()) {
-          // Finding 1 (§2.4 Open): a file cell is the input channel, not a
-          // value. If it is not own (so the client cannot write "f" into it
-          // directly) and no interface call sets it, the harness cannot
-          // direct the input — a genuine unmet obligation. It must surface
-          // loudly as uncovered, never as construct (static init), which
-          // would silently pass a harness that never reaches the crossing.
-          if (!local[i].first.file &&
-              // A field no defined function writes is set only by the
-              // library's static initialization. The necessary condition the
-              // model read along the path is that fixed value, the same in
-              // every execution, so it is established by construction, not by
-              // a client call. §3.5 정리 B(a): U가 교차 후 스스로 세우는 내부 셀도
-              // 클라이언트 의무가 아니므로 같은 버킷(construct)이다.
-              (!everStored(local[i].first.type, local[i].first.off) ||
-               uInternal(local[i].first.type, local[i].first.off))) {
-            ++construct;
-            continue;
-          }
-          // §7 파일 내용 레버: 경계 셀을 entry가 열린 파일을 파싱하며 비상수로 채우면,
-          // 그 값은 상수도 인자도 아닌 유일 입력(파일)에서 온 것이므로 심볼릭 파일 +
-          // entry가 그 칸을 realize한다(추가 호출 불필요).
-          const Cell &fc = local[i].first;
-          if (fc.boundary && entryReadsFile) {
-            bool byFile = fileStored(entry, fc.type, fc.off);
-            if (!byFile) {
-              const auto &cm = copyMap(entry);
-              auto it = cm.find({fc.type, fc.off});
-              if (it != cm.end())
-                for (const FieldKey &d : it->second)
-                  byFile = byFile || fileStored(entry, d.first, d.second);
-            }
-            if (byFile) {
-              ++fileCov;
-              continue;
-            }
-          }
-          // 상수-확립: 경계 셀을 라이브러리가 제약을 만족하는 상수로 결정적으로 세우면
-          // (abstractValue가 상수이고 satisfies), 그 값은 모든 실행에서 같으므로
-          // construction으로 확립된 것이다(클라이언트 호출 불필요).
-          if (fc.boundary && entry) {
-            auto satConst = [&](const std::string &ty, int64_t of) {
-              std::pair<std::string, int64_t> key{ty, of};
-              for (Function *G : deepClosure(entry)) {
-                auto it = stores.find(G);
-                if (it == stores.end())
-                  continue;
-                for (auto s = it->second.lower_bound({key, ""}); s != it->second.end() && s->first == key; ++s)
-                  if (s->second != "*" && satisfies(s->second, fc))
-                    return true;
-              }
-              return false;
-            };
-            bool est = satConst(fc.type, fc.off);
-            if (!est) {
-              const auto &cm = copyMap(entry);
-              auto it = cm.find({fc.type, fc.off});
-              if (it != cm.end())
-                for (const FieldKey &d : it->second)
-                  est = est || satConst(d.first, d.second);
-            }
-            if (est) {
-              ++construct;
-              continue;
-            }
-          }
-          ++uncovered;
-          openCells += " " + local[i].first.type + "+" + std::to_string(local[i].first.off);
-          continue;
-        }
-        need.push_back((int)i);
-        for (Function *W : local[i].second)
-          if (std::find(cand.begin(), cand.end(), W) == cand.end())
-            cand.push_back(W);
-      }
-      std::sort(cand.begin(), cand.end(), [](Function *A, Function *B) { return A->getName() < B->getName(); });
-      std::vector<Function *> word;
-      if (!need.empty()) {
-        std::vector<int> left = need;
-        for (int n = 0; n < 4 && !left.empty(); ++n) {
-          Function *best = nullptr;
-          int got = -1;
-          for (Function *C : cand) {
-            int ncover = 0;
-            for (int i : left)
-              for (Function *W : local[i].second)
-                ncover += W == C;
-            if (ncover > got) {
-              got = ncover;
-              best = C;
-            }
-          }
-          if (!best || got <= 0)
-            break;
-          word.push_back(best);
-          std::vector<int> rest;
-          for (int i : left) {
-            bool hit = false;
-            for (Function *W : local[i].second)
-              hit = hit || W == best;
-            if (!hit)
-              rest.push_back(i);
-          }
-          left.swap(rest);
-        }
-        if (!left.empty())
-          word.clear();
-      }
-      bool inI = entry && ifaceD.count(entry);
-      int calls = (int)word.size() + (inI ? 1 : 0);
-      bool pass = inI && uncovered == 0 && (need.empty() || !word.empty()) && calls <= 5;
-      std::string line = std::string("result ") + (pass ? "pass" : "open");
-      line += " iface " + std::to_string(inI ? 1 : 0);
-      line += " lib " + std::to_string(local.size());
-      line += " uncovered " + std::to_string(uncovered);
-      line += " construct " + std::to_string(construct);
-      line += " file " + std::to_string(fileCov);
-      line += " calls " + std::to_string(calls);
-      for (Function *W : word)
-        line += " " + W->getName().str();
-      if (entry)
-        line += " " + entry->getName().str();
-      line += openCells;
-      P.verdicts.push_back(line);
-    }
+    P.witnesses.push_back(std::move(W));
   }
   // A witness that starts elsewhere constrains nothing at this entry: it is
   // an alternative with no configuration and no guard.
@@ -3218,12 +3007,29 @@ Client::Plan Client::plan(const std::vector<std::pair<std::vector<std::string>, 
     it->second = distinct;
     it = any ? std::next(it) : P.guards.erase(it);
   }
+  P.writers.assign(writerSet.begin(), writerSet.end());
+  grammar(P);
+  dispatch(ws, P);
+  return P;
+}
+
+// The nonterminals the entries, writers and key setters demand: their held
+// inputs, closed under the held inputs of every producer and of the calls
+// it depends on. One execution expands only the producers it picks.
+void Client::grammar(Plan &P) const {
+  std::set<std::string> need;
+  auto want = [&](Function *F) {
+    for (const Param &p : signature(F))
+      if (held(p) && cost.count(p.type))
+        need.insert(p.type);
+  };
   for (Function *F : P.entries)
     want(F);
-  P.writers.assign(writerSet.begin(), writerSet.end());
-  std::sort(P.writers.begin(), P.writers.end(), [](Function *a, Function *b) { return a->getName() < b->getName(); });
   for (Function *F : P.writers)
     want(F);
+  for (const auto &[E, ks] : P.keyed)
+    for (const auto &[W, k] : ks)
+      want(W);
   for (std::vector<std::string> work(need.begin(), need.end()); !work.empty();) {
     std::string T = work.back();
     work.pop_back();
@@ -3251,28 +3057,33 @@ Client::Plan Client::plan(const std::vector<std::pair<std::vector<std::string>, 
     auto it = producers.find(T);
     P.handles.push_back({T, it == producers.end() ? std::vector<Producer>{} : it->second});
   }
-  // §2.4 Key and §3.7: an edge a -> b of a witness is indirect when a has no
-  // call of b. Definition D realizes its dispatch by a key (1), by a call
-  // of the harness installing b while the harness reads the input (2), or
-  // by a writer the harness calls installing it (3). The harness calls the
-  // producers of the held handles and the calls they depend on, the
-  // writers and the entry.
-  FnSet made;
+}
+
+// §2.4 Key and §3.7: an edge a -> b of a witness is indirect when a has no
+// call of b. Definition D realizes its dispatch by a key (1), by a call of
+// the harness installing b while the harness reads the input (2), or by a
+// writer or key setter the harness calls installing it (3).
+void Client::dispatch(const Witnesses &ws, Plan &P) const {
+  FnSet made, setters(P.writers.begin(), P.writers.end());
   for (const auto &h : P.handles)
     for (const Producer &pr : h.second)
       made.insert(pr.fn);
   for (const auto &[k, ds] : P.deps)
     made.insert(ds.begin(), ds.end());
+  for (const auto &[E, ks] : P.keyed)
+    for (const auto &[W, k] : ks)
+      setters.insert(W);
   std::set<std::string> keySeen;
   for (const auto &[seq, phi] : ws) {
     Function *E = seq.empty() ? nullptr : body(seq[0]);
-    FnSet calls = made;
+    FnSet called = made;
     if (E)
-      calls.insert(E);
+      called.insert(E);
     bool file = false;
-    for (Function *H : calls)
+    for (Function *H : called)
       file = file || opensFile(H);
     std::vector<std::string> notes;
+    std::string gate;
     unsigned indirect = 0, open = 0;
     for (size_t i = 0; i + 1 < seq.size(); ++i) {
       Function *A = body(seq[i]), *T = body(seq[i + 1]);
@@ -3296,14 +3107,19 @@ Client::Plan Client::plan(const std::vector<std::pair<std::vector<std::string>, 
         how += " key";
       if (file) {
         Function *by = nullptr;
-        for (Function *H : calls)
+        for (Function *H : called)
           for (Function *G : St)
             if (!by && closureOf(H).count(G))
               by = G;
-        if (by)
+        if (by) {
           how += " input:" + by->getName().str();
+          // The first input installer on the witness is the Π_I gate the
+          // search must open before later dispatch steps matter (H3).
+          if (gate.empty())
+            gate = by->getName().str();
+        }
       }
-      for (Function *W : P.writers) {
+      for (Function *W : setters) {
         bool by = false;
         for (Function *G : St)
           by = by || closureOf(W).count(G) > 0;
@@ -3316,14 +3132,14 @@ Client::Plan Client::plan(const std::vector<std::pair<std::vector<std::string>, 
       notes.push_back("  D " + A->getName().str() + " -> " + T->getName().str() + " st " +
                       std::to_string(St.size()) + (how.empty() ? " OPEN" : how));
     }
-    std::string head = "obligations " + (seq.empty() ? std::string("-") : seq[0]) + " edges " +
-                       std::to_string(seq.empty() ? 0 : seq.size() - 1) + " indirect " +
-                       std::to_string(indirect) + " open " + std::to_string(open) + " file " +
-                       std::to_string(file ? 1 : 0);
-    P.obligations.push_back(head);
+    if (!gate.empty() && std::find(P.stInstallers.begin(), P.stInstallers.end(), gate) == P.stInstallers.end())
+      P.stInstallers.push_back(gate);
+    P.obligations.push_back("obligations " + (seq.empty() ? std::string("-") : seq[0]) + " edges " +
+                            std::to_string(seq.empty() ? 0 : seq.size() - 1) + " indirect " +
+                            std::to_string(indirect) + " open " + std::to_string(open) + " file " +
+                            std::to_string(file ? 1 : 0));
     P.obligations.insert(P.obligations.end(), notes.begin(), notes.end());
   }
-  return P;
 }
 
 void Client::report(const Plan &P, raw_ostream &out) const {
@@ -3377,15 +3193,10 @@ void Client::report(const Plan &P, raw_ostream &out) const {
       out << "  make " << h.second[i].fn->getName() << (h.second[i].out >= 0 ? " out " + std::to_string(h.second[i].out) : "")
           << " (" << sig(h.second[i].fn) << ")\n";
   }
-  for (const Cell &c : P.clientCells)
-    out << "client-cell " << c.type << "+" << c.off << " " << c.op << " " << c.values.size() << "\n";
-  for (const auto &cw : P.cellWriters) {
- out << "cell " << cw.first.type << "+" << cw.first.off << " " << cw.first.op << " " << (cw.first.values.empty() ? "" : cw.first.values[0]) << " writers " << cw.second.size() << ":";
-    for (size_t i = 0; i < cw.second.size() && i < 8; ++i)
-      out << " " << cw.second[i]->getName();
-    out << "\n";
-  }
-  out << "writers " << P.writers.size() << "\n";
+  out << "writers " << P.writers.size();
+  for (Function *W : P.writers)
+    out << " " << W->getName();
+  out << "\n";
   for (const auto &[W, ls] : P.levers)
     for (const Lever &l : ls) {
       out << "lever " << W->getName() << " arg" << l.formal << " " << (l.eq ? "=" : "!=");
@@ -3393,10 +3204,37 @@ void Client::report(const Plan &P, raw_ostream &out) const {
         out << " " << v;
       out << " : " << l.text << "\n";
     }
-  for (const std::string &v : P.verdicts)
-    out << v << "\n";
+  for (const auto &[E, ks] : P.keyed)
+    for (const auto &[W, k] : ks) {
+      out << "keyed " << E->getName() << " " << W->getName() << " obj " << k.obj;
+      if (k.tag >= 0)
+        out << " tag arg" << k.tag << " = " << k.tagV;
+      for (const auto &[op, v] : k.preds)
+        out << " va " << op << " " << v;
+      out << " : " << k.target << "\n";
+    }
+  for (const WitnessPlan &W : P.witnesses) {
+    std::map<Realize, unsigned> n;
+    for (const Realized &r : W.cells)
+      ++n[r.how];
+    out << "witness " << W.first->getName() << " " << (W.pass ? "pass" : "open") << " iface " << W.iface;
+    for (Realize r : {Realize::Own, Realize::Lever, Realize::Key, Realize::Write, Realize::Construct, Realize::File,
+                      Realize::Open})
+      out << " " << realizeName(r) << " " << n[r];
+    out << " cover";
+    for (Function *F : W.cover)
+      out << " " << F->getName();
+    out << "\n";
+    for (const Realized &r : W.cells)
+      out << "  cell " << r.cell.type << "+" << r.cell.off << " " << r.cell.op << " "
+          << (r.cell.values.empty() ? "-" : r.cell.values[0]) << " " << realizeName(r.how)
+          << (r.by ? " " + r.by->getName().str() : "") << "\n";
+  }
   for (const std::string &o : P.obligations)
     out << o << "\n";
+  out << "st-installers " << P.stInstallers.size() << "\n";
+  for (const std::string &n : P.stInstallers)
+    out << "st-installer " << n << "\n";
   out << "null-fields " << nullFields.size() << " unguarded-calls " << unguardedCalls.size() << "\n";
 }
 
@@ -5018,16 +4856,66 @@ void Client::emit(const Plan &P, Module &H) const {
     X.CreateRet(got);
   }
   hoist(B, P.entries);
-  for (unsigned k = 0; k < writerSlots; ++k) {
+  // §4: (skip | w)^K, w ∈ writers (정의 6의 최소 덮개).
+  for (unsigned k = 0; k < writerSlots && !P.writers.empty(); ++k) {
     std::vector<std::function<void(IRBuilder<> &)>> alts{[](IRBuilder<> &) {}};
     for (Function *W : P.writers)
       alts.push_back([&, W](IRBuilder<> &C) { call(C, W, "", -1); });
     K.oneOf(B, alts, "write");
   }
+  // §3.8 정의 3.8.4 키 세터 레버: entry를 부르기 직전, 보유 핸들 h 위에서 키 세터
+  // W(h, 태그, v)를 호출한다. h는 make_T가 메모한 그 핸들이므로 entry가 받는 핸들과
+  // 같다. v는 심볼릭 정수에서 may 계층이 준 조건(preds)을 만족하는 값으로 접는다.
+  auto keySet = [&](IRBuilder<> &C, Function *W, const Keyed &k) {
+    FunctionType *FT = W->getFunctionType();
+    auto sig = signature(W);
+    auto at = irParams(W);
+    std::vector<Value *> args;
+    for (unsigned i = 0; i < FT->getNumParams(); ++i) {
+      Type *T = FT->getParamType(i);
+      if (at[i] == (int)k.obj && T->isPointerTy()) {
+        args.push_back(obtain(C, sig[at[i]].type));
+      } else if (at[i] == k.tag && T->isIntegerTy()) {
+        args.push_back(ConstantInt::get(T, (uint64_t)k.tagV, true));
+      } else if (T->isPointerTy()) {
+        args.push_back(ConstantPointerNull::get(p0));
+      } else {
+        args.push_back(K.symbolic(C, T, "arg"));
+      }
+    }
+    if (FT->isVarArg()) {
+      // The variadic value the key setter writes into target. One i32 chosen
+      // to satisfy preds (=, !=, has, lacks), promoted as the ABI passes it.
+      Value *v = K.symbolic(C, C.getInt32Ty(), "keyed");
+      Type *IT = v->getType();
+      for (const auto &[op, val] : k.preds) {
+        if (op == "=") {
+          v = ConstantInt::get(IT, (uint64_t)val, true);
+        } else if (op == "!=") {
+          Value *bad = C.CreateICmpEQ(v, ConstantInt::get(IT, (uint64_t)val, true));
+          v = C.CreateSelect(bad, ConstantInt::get(IT, (uint64_t)(val + 1), true), v);
+        } else if (op == "has") {
+          Value *m = ConstantInt::get(IT, (uint64_t)val, true);
+          Value *ok = C.CreateICmpEQ(C.CreateAnd(v, m), m);
+          v = C.CreateSelect(ok, v, C.CreateOr(v, m));
+        } else if (op == "lacks") {
+          Value *m = ConstantInt::get(IT, (uint64_t)val, true);
+          Value *ok = C.CreateICmpEQ(C.CreateAnd(v, m), ConstantInt::get(IT, 0));
+          v = C.CreateSelect(ok, v, C.CreateAnd(v, C.CreateNot(m)));
+        }
+      }
+      args.push_back(v);
+    }
+    C.CreateCall(declare(W), args);
+  };
   {
     std::vector<std::function<void(IRBuilder<> &)>> alts;
     for (Function *E : P.entries)
       alts.push_back([&, E](IRBuilder<> &C) {
+        auto kit = P.keyed.find(E);
+        if (kit != P.keyed.end())
+          for (const auto &[W, k] : kit->second)
+            keySet(C, W, k);
         auto g = P.guards.find(E);
         auto f = P.files.find(E);
         call(C, E, "", -1, g == P.guards.end() ? nullptr : &g->second, f == P.files.end() ? nullptr : &f->second);

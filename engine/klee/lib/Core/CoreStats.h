@@ -60,6 +60,11 @@ namespace stats {
   /// minDistToReturn and minDistToSink over the call graph of slot targets.
   extern Statistic minDistToReturnSlot;
   extern Statistic minDistToSinkSlot;
+  /// minDistToSink when a call descends toward the sink only along a
+  /// witness edge (T_W). Return distances are those of the slot graph.
+  extern Statistic minDistToSinkWit;
+  /// Distance to an input-dispatch installer (sp.st, §3.7 D item 2).
+  extern Statistic minDistToSt;
 
   /// Count branch types in execution tree. Inhibited branches are ignored.
   #undef BTYPE

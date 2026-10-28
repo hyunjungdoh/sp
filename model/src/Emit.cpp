@@ -1385,13 +1385,10 @@ void Model::emit(Module &H) const {
     std::map<int, std::vector<Function *>> argChoice;
     for (auto &kv : accs) {
       Acc &a = kv.second;
-      std::vector<Function *> may = realize(a);
-      std::vector<Function *> fns;
-      // One named target determines the cell. A larger set is every function
-      // that call could reach, which is not a value of the cell. It becomes a
-      // witness only when the solved frontier names a function inside that set.
-      if (may.size() == 1)
-        fns = may;
+      // The values of the cell are the functions the program places in its
+      // field that every call through it can take (§3.10 Res); they form the
+      // cell's domain, chosen symbolically.
+      std::vector<Function *> fns = realize(a);
       if (a.bad) {
         continue;
       }
@@ -1400,13 +1397,6 @@ void Model::emit(Module &H) const {
         continue;
       }
       const Loc &loc = it->second;
-      // The values of the cell are the functions the program stores in its
-      // field; those the call can take form the cell's domain, chosen
-      // symbolically.
-      if (may.size() > 1)
-        for (Function *F : storedAt(loc.suf))
-          if (std::find(may.begin(), may.end(), F) != may.end())
-            fns.push_back(F);
       if (!args.count(loc.arg))
         args[loc.arg] = Piece{};
       auto pl = placeIn(loc.arg, loc.suf);
@@ -1429,7 +1419,7 @@ void Model::emit(Module &H) const {
           }
           if (a.ty && B->getFunctionType() != a.ty)
             continue;
-          if (!may.empty() && std::find(may.begin(), may.end(), B) == may.end())
+          if (!fns.empty() && std::find(fns.begin(), fns.end(), B) == fns.end())
             continue;
           pinned.push_back(B);
         }

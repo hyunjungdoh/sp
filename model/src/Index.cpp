@@ -143,51 +143,6 @@ Suffix Model::suffix(Value *V) const {
     return s;
   }
 
-void Model::ensureSlots() const {
-    if (slotReady)
-      return;
-    slotReady = true;
-    for (const auto &kv : fnAt) {
-      auto put = [&](const Suffix &key, Function *F) {
-        auto &v = slotAt[key];
-        if (std::find(v.begin(), v.end(), F) == v.end())
-          v.push_back(F);
-      };
-      for (Function *F : kv.second)
-        put(kv.first, F);
-      for (size_t n = 1; n < kv.first.size(); ++n) {
-        bool zero = true;
-        for (size_t i = 0; i < n; ++i)
-          if (kv.first[i].off != 0)
-            zero = false;
-        if (!zero)
-          continue;
-        Suffix tail(kv.first.begin() + (long)n, kv.first.end());
-        for (Function *F : kv.second)
-          put(tail, F);
-      }
-    }
-  }
-
-std::vector<Function *> Model::storedAt(const Suffix &s) const {
-    ensureSlots();
-    size_t from = 0;
-    for (size_t i = 0; i < s.size(); ++i)
-      if (s[i].deref)
-        from = i;
-    Suffix in(s.begin() + (long)from, s.end());
-    if (!in.empty())
-      in.front().deref = false;
-    for (size_t n = 0; n < in.size(); ++n) {
-      if (in[n].type.empty())
-        continue;
-      auto it = slotAt.find(Suffix(in.begin() + (long)n, in.end()));
-      if (it != slotAt.end() && !it->second.empty())
-        return it->second;
-    }
-    return {};
-  }
-
 std::vector<Model::InitSite> Model::initializers(const std::string &type, const std::set<int64_t> &cells) const {
     auto memo = initMemo.find({type, cells});
     if (memo != initMemo.end())
@@ -204,17 +159,17 @@ std::vector<Model::InitSite> Model::initializers(const std::string &type, const 
       if (kv.first.first == type && cells.count(kv.first.second))
         for (const InitSite &s : kv.second)
           methods.insert(s.stored);
-    for (const auto &kv : fnAt)
-      if (!kv.first.empty() && kv.first.back().type == type && cells.count(kv.first.back().off))
-        methods.insert(kv.second.begin(), kv.second.end());
+    for (const auto &[field, fns] : fieldFns)
+      if (field.first == type && cells.count(field.second))
+        methods.insert(fns.begin(), fns.end());
     std::set<Function *> callbacks;
     for (const auto &kv : initSites)
       if (kv.first.first == type)
         for (const InitSite &s : kv.second)
           callbacks.insert(s.stored);
-    for (const auto &kv : fnAt)
-      if (!kv.first.empty() && kv.first.back().type == type)
-        callbacks.insert(kv.second.begin(), kv.second.end());
+    for (const auto &[field, fns] : fieldFns)
+      if (field.first == type)
+        callbacks.insert(fns.begin(), fns.end());
     for (bool grew = true; grew;) {
       grew = false;
       eachBody([&](Function &F) {
@@ -403,14 +358,6 @@ std::vector<Model::InitSite> Model::initializers(const std::string &type, const 
     return out;
   }
 
-void Model::addFn(const Suffix &s, Function *F) {
-    if (!F || s.empty())
-      return;
-    auto &v = fnAt[s];
-    if (std::find(v.begin(), v.end(), F) == v.end())
-      v.push_back(F);
-  }
-
 std::string Model::dec(const ConstantInt *CI) {
     SmallVector<char, 32> buf;
     CI->getValue().toString(buf, 10, true);
@@ -507,22 +454,17 @@ void Model::noteZero(Type *Ty, const Suffix &suf) {
     }
   }
 
-// D is the source type of the object C initializes, when DWARF declares it.
-void Model::walkInit(Constant *C, Type *Ty, const Suffix &suf, bool scalars, const DIType *D) {
+// The leaves of a constant, a function or an integer, each with the path
+// of the struct fields it lies at. D is the source type of the object C
+// initializes, when DWARF declares it.
+void Model::eachLeaf(Constant *C, Type *Ty, const Suffix &suf, const DIType *D,
+                     const std::function<void(Constant *, const Suffix &)> &leaf) {
     if (!C)
       return;
     if (isa<ConstantPointerNull>(C) || isa<ConstantAggregateZero>(C))
       return;
-    if (auto *F = dyn_cast<Function>(C->stripPointerCasts())) {
-      if (Function *D = define(F->getName()))
-        F = D;
-      addFn(suf, F);
-      noteScalar(suf, F->getName().str());
-      return;
-    }
-    if (auto *CI = dyn_cast<ConstantInt>(C)) {
-      if (scalars)
-        noteScalar(suf, dec(CI));
+    if (isa<Function>(C->stripPointerCasts()) || isa<ConstantInt>(C)) {
+      leaf(C, suf);
       return;
     }
     if (auto *CDS = dyn_cast<ConstantDataSequential>(C)) {
@@ -532,7 +474,7 @@ void Model::walkInit(Constant *C, Type *Ty, const Suffix &suf, bool scalars, con
         Suffix n = suf;
         if (!n.empty() && es)
           n.back().off += (int64_t)i * (int64_t)es;
-        walkInit(CDS->getElementAsConstant(i), ET, n, scalars, source::element(D));
+        eachLeaf(CDS->getElementAsConstant(i), ET, n, source::element(D), leaf);
       }
       return;
     }
@@ -541,7 +483,7 @@ void Model::walkInit(Constant *C, Type *Ty, const Suffix &suf, bool scalars, con
       auto named = namesFor(ST);
       if (named.empty()) {
         for (unsigned i = 0; i < S->getNumOperands(); ++i)
-          walkInit(S->getOperand(i), S->getOperand(i)->getType(), suf, scalars);
+          eachLeaf(S->getOperand(i), S->getOperand(i)->getType(), suf, nullptr, leaf);
         return;
       }
       // A declared source type names the one struct the constant is; the
@@ -556,8 +498,8 @@ void Model::walkInit(Constant *C, Type *Ty, const Suffix &suf, bool scalars, con
           uint64_t o = SL->getElementOffset(i);
           n.push_back(Step{k, (int64_t)o});
           Type *E = N->getElementType(i);
-          walkInit(S->getOperand(i), E, n, scalars,
-                   D ? source::member(D, o, E->isSized() ? dl.getTypeAllocSize(E).getFixedValue() : 0) : nullptr);
+          eachLeaf(S->getOperand(i), E, n,
+                   D ? source::member(D, o, E->isSized() ? dl.getTypeAllocSize(E).getFixedValue() : 0) : nullptr, leaf);
         }
       }
       return;
@@ -570,9 +512,21 @@ void Model::walkInit(Constant *C, Type *Ty, const Suffix &suf, bool scalars, con
         Suffix n = suf;
         if (!n.empty() && es)
           n.back().off += (int64_t)i * (int64_t)es;
-        walkInit(A->getOperand(i), ET, n, scalars, source::element(D));
+        eachLeaf(A->getOperand(i), ET, n, source::element(D), leaf);
       }
     }
+  }
+
+void Model::walkInit(Constant *C, Type *Ty, const Suffix &suf, bool scalars, const DIType *D) {
+    eachLeaf(C, Ty, suf, D, [&](Constant *L, const Suffix &at) {
+      if (auto *F = dyn_cast<Function>(L->stripPointerCasts())) {
+        if (Function *B = define(F->getName()))
+          F = B;
+        noteScalar(at, F->getName().str());
+      } else if (scalars) {
+        noteScalar(at, dec(cast<ConstantInt>(L)));
+      }
+    });
   }
 
 bool Model::typeNameMatches(StringRef llvmName, StringRef access) {
@@ -644,9 +598,7 @@ void Model::indexFunctions() {
         continue;
       walkInit(G.getInitializer(), G.getValueType(), {}, true, source::ofGlobal(G));
     }
-    for (auto &kv : fnAt) {
-      std::sort(kv.second.begin(), kv.second.end(), [](Function *A, Function *B) { return pretty(A->getName()) < pretty(B->getName()); });
-    }
+    buildResolve();
     indexKeys();
   }
 
@@ -858,14 +810,6 @@ void Model::addUnique(std::vector<Function *> &v, Function *F) {
   }
 
 void Model::indexArgFns() {
-    struct Site {
-      Function *caller = nullptr;
-      Function *callee = nullptr;
-      unsigned index = 0;
-      int from = -1;
-    };
-    std::vector<Site> sites;
-    std::vector<std::pair<const CallBase *, unsigned>> indirect;
     struct Stored {
       Function *fn;
       unsigned arg;
@@ -920,58 +864,12 @@ void Model::indexArgFns() {
           if (arg >= 0 && !suf.empty())
             stored.push_back(Stored{&F, (unsigned)arg, std::move(suf)});
         }
-        auto *CB = dyn_cast<CallBase>(&I);
-        if (!CB)
-          continue;
-        Function *C = CB->getCalledFunction();
-        if (C) {
-          if (Function *D = define(C->getName()))
-            C = D;
-        }
-        for (unsigned i = 0; i < CB->arg_size(); ++i) {
-          Value *Op = CB->getArgOperand(i);
-          if (auto *Fn = dyn_cast<Function>(Op->stripPointerCasts())) {
-            if (Function *D = define(Fn->getName()))
-              Fn = D;
-            if (C)
-              addUnique(argFn[std::make_pair(C, i)], Fn);
-            continue;
-          }
-          int arg = argOf(Op);
-          if (C && arg >= 0)
-            sites.push_back(Site{&F, C, i, arg});
-        }
-        if (!C) {
-          int arg = argOf(CB->getCalledOperand());
-          if (arg >= 0)
-            indirect.push_back({CB, (unsigned)arg});
-        }
       }
     });
-    bool grew = true;
-    while (grew) {
-      grew = false;
-      for (const Site &s : sites) {
-        if (s.from < 0 || !s.callee)
-          continue;
-        for (Function *Fn : argFn[std::make_pair(s.caller, (unsigned)s.from)]) {
-          auto &dst = argFn[std::make_pair(s.callee, s.index)];
-          if (std::find(dst.begin(), dst.end(), Fn) == dst.end()) {
-            dst.push_back(Fn);
-            grew = true;
-          }
-        }
-      }
-    }
-    for (const auto &c : indirect)
-      argCallTargets[c.first] = argFn[std::make_pair(const_cast<Function *>(c.first->getFunction()), c.second)];
-    for (const Stored &s : stored) {
-      for (Function *Fn : argFn[std::make_pair(s.fn, s.arg)])
-        addFn(s.suf, Fn);
+    for (const Stored &s : stored)
       argStored[s.fn].push_back({s.arg, s.suf});
-    }
     for (const Stored &s : stored) {
-      if (argFn[std::make_pair(s.fn, s.arg)].empty())
+      if (fnsOf(s.fn->getArg(s.arg)).empty())
         continue;
       for (const Stored &o : stored) {
         if (o.fn != s.fn || o.arg == s.arg)
@@ -1228,6 +1126,11 @@ Model::VSlot Model::vslot(CallBase *CB) const {
       field = fo.getSExtValue();
       obj = OG->getPointerOperand()->stripPointerCasts();
     }
+    // A virtual call reads its slot through the vtable pointer of an object
+    // whose source class is polymorphic; a C function pointer field read
+    // through a struct pointer has the same IR shape.
+    if (field < 0 || !source::vptrAt(source::pointee(obj), (uint64_t)field))
+      return s;
     s.ok = true;
     s.obj = obj;
     s.field = field;
@@ -1353,41 +1256,31 @@ std::vector<Function *> Model::vtableTargets(CallBase *CB) const {
       vtableCache[CB] = out;
       return out;
     }
+    // Class hierarchy analysis: the receiver's dynamic class is its static
+    // class or one derived from it. A class's own table (_ZTV, Itanium ABI)
+    // is installed by its constructors at the vtable pointer of every
+    // subobject; the class is the one of the storing member function's this.
+    // The call reads the slot of the table at the receiver's subobject.
     indexVtables();
-    std::unordered_set<const Value *> objs{s.obj};
-    for (Instruction &I : instructions(*CB->getFunction()))
-      if (auto *C = dyn_cast<CastInst>(&I))
-        if (objs.count(C->getOperand(0)))
-          objs.insert(&I);
-    std::set<std::string> types;
-    for (Instruction &I : instructions(*CB->getFunction())) {
-      auto *G = dyn_cast<GetElementPtrInst>(&I);
-      if (!G)
+    auto classes = source::derived(source::pointee(s.obj));
+    for (const VTab &vt : vtAll) {
+      if (!vt.g->getName().starts_with("_ZTV") || vt.by->arg_empty())
         continue;
-      if (!objs.count(G->getPointerOperand()->stripPointerCasts()))
+      auto it = classes.find(source::name(source::pointee(vt.by->getArg(0))));
+      if (it == classes.end())
         continue;
-      std::string k = source::container(cast<GEPOperator>(G), dl);
-      if (!k.empty())
-        types.insert(k);
+      bool at = std::any_of(it->second.begin(), it->second.end(), [&](const std::optional<uint64_t> &o) {
+        return !o || vt.field == (int64_t)*o + s.field;
+      });
+      if (!at)
+        continue;
+      if (Function *Fn = functionAt(vt.g->getInitializer(), 0, vt.base + s.slot)) {
+        Function *B = define(Fn->getName());
+        Function *T = B ? B : Fn;
+        if (T->getFunctionType() == CB->getFunctionType() && std::find(out.begin(), out.end(), T) == out.end())
+          out.push_back(T);
+      }
     }
-    for (const std::string &ty : types) {
-      auto it = vtOf.find(ty);
-      if (it == vtOf.end())
-        continue;
-      for (Function *Fn : fromVtabs(it->second, s.field, s.slot))
-        if (std::find(out.begin(), out.end(), Fn) == out.end())
-          out.push_back(Fn);
-    }
-    // Without the receiver's type, class hierarchy analysis by slot: every
-    // vtable's function at this slot whose type is the call's.
-    if (out.empty())
-      for (const auto &kv : vtOf)
-        for (Function *Fn : fromVtabs(kv.second, s.field, s.slot)) {
-          Function *B = define(Fn->getName());
-          Function *T = B ? B : Fn;
-          if (T->getFunctionType() == CB->getFunctionType() && std::find(out.begin(), out.end(), T) == out.end())
-            out.push_back(T);
-        }
     vtableCache[CB] = out;
     return out;
   }
@@ -1461,105 +1354,558 @@ std::vector<Function *> Model::vtableReads(CallBase *CB) const {
   }
 
 std::vector<Function *> Model::targetsOf(CallBase *CB) const {
-    Value *Cal = CB->getCalledOperand()->stripPointerCasts();
-    if (auto *A = dyn_cast<GlobalAlias>(Cal))
-      if (Constant *Ali = A->getAliasee())
-        Cal = Ali->stripPointerCasts();
-    if (auto *F = dyn_cast<Function>(Cal)) {
-      if (Function *D = define(F->getName()))
+    if (const Function *C = klee::calls::callee(*CB)) {
+      if (Function *D = define(C->getName()))
         return {D};
       return {};
     }
-    Suffix s = suffix(CB->getCalledOperand());
-    if (s.empty()) {
-      Value *V = CB->getCalledOperand();
-      std::unordered_set<const Value *> seen;
-      while (V && seen.insert(V).second) {
-        if (auto *C = dyn_cast<CastInst>(V)) {
-          V = C->getOperand(0);
-          continue;
+    auto it = resolved.find(CB);
+    return it == resolved.end() ? std::vector<Function *>{} : it->second;
+  }
+
+// §3.10 Res: the least solution of one inclusion system in which function
+// constants and abstract objects flow. A cell is an SSA value, the return of
+// a function, an access path, the contents of an object, or the variadic
+// area. Every constraint is monotone, so a worklist that sends each token
+// along each edge once reaches the least solution.
+void Model::buildResolve() {
+    using Node = unsigned;
+    std::vector<std::vector<Node>> succ;
+    std::vector<SmallPtrSet<Value *, 4>> pt;
+    std::vector<std::pair<Node, Value *>> work;
+    auto fresh = [&]() {
+      succ.emplace_back();
+      pt.emplace_back();
+      return (Node)(succ.size() - 1);
+    };
+    auto token = [&](Function *F) {
+      Function *B = define(F->getName());
+      return B ? B : F;
+    };
+    // An object is a local or global whose type can hold a function pointer
+    // (H_mlta: without type punning a data-only object holds none), or the
+    // result of a call to an external function. IR without source type is
+    // treated as able to hold one (C void * slots).
+    std::function<bool(Type *)> holdsIR = [&](Type *T) {
+      if (T->isPointerTy())
+        return true;
+      if (auto *ST = dyn_cast<StructType>(T))
+        return std::any_of(ST->element_begin(), ST->element_end(), holdsIR);
+      if (auto *AT = dyn_cast<ArrayType>(T))
+        return holdsIR(AT->getElementType());
+      return false;
+    };
+    auto object = [&](Value *V) -> Value * {
+      if (auto *A = dyn_cast<AllocaInst>(V)) {
+        if (const DIType *D = source::pointee(A))
+          return source::holdsFn(D) ? V : nullptr;
+        return holdsIR(A->getAllocatedType()) ? V : nullptr;
+      }
+      if (auto *G = dyn_cast<GlobalVariable>(V)) {
+        if (const DIType *D = source::ofGlobal(*G))
+          return source::holdsFn(D) ? V : nullptr;
+        return holdsIR(G->getValueType()) ? V : nullptr;
+      }
+      return nullptr;
+    };
+    // The token a value is: a function, or the object a constant address is in.
+    auto tokenOf = [&](Value *V) -> Value * {
+      V = V->stripPointerCastsAndAliases();
+      while (isa<Constant>(V) && isa<GEPOperator>(V))
+        V = cast<GEPOperator>(V)->getPointerOperand()->stripPointerCastsAndAliases();
+      if (auto *F = dyn_cast<Function>(V))
+        return token(F);
+      return object(V);
+    };
+
+    std::unordered_map<const Value *, Node> valN, elemN;
+    std::unordered_map<const Function *, Node> retN;
+    std::map<Suffix, Node> stN, ldN;
+    auto val = [&](Value *V) {
+      V = V->stripPointerCastsAndAliases();
+      auto [it, added] = valN.try_emplace(V, 0);
+      if (added) {
+        it->second = fresh();
+        if (Value *T = tokenOf(V))
+          work.push_back({it->second, T});
+      }
+      return it->second;
+    };
+    auto node = [&](auto &m, const auto &k) {
+      auto [it, added] = m.try_emplace(k, 0);
+      if (added)
+        it->second = fresh();
+      return it->second;
+    };
+    auto edge = [&](Node a, Node b) {
+      if (a != b)
+        succ[a].push_back(b);
+    };
+    auto link = [&](Node a, Node b) {
+      edge(a, b);
+      for (Value *t : pt[a])
+        if (!pt[b].count(t))
+          work.push_back({b, t});
+    };
+    // A path stored at is read at every path one of whose layers sequences is
+    // a suffix of the other's: the same field, named from an outer or an inner
+    // struct. A cell is joined to the others when it is first named.
+    std::map<Step, std::vector<std::pair<Suffix, Node>>> stLeaf, ldLeaf;
+    auto tail = [](const Suffix &a, const Suffix &b) {
+      return a.size() <= b.size() && std::equal(a.begin(), a.end(), b.end() - (long)a.size());
+    };
+    auto cell = [&](bool store, const Suffix &p) {
+      auto &m = store ? stN : ldN;
+      auto [it, added] = m.try_emplace(p, 0);
+      if (!added)
+        return it->second;
+      Node n = it->second = fresh();
+      for (const auto &[q, o] : (store ? ldLeaf : stLeaf)[p.back()])
+        if (tail(p, q) || tail(q, p))
+          store ? link(n, o) : link(o, n);
+      (store ? stLeaf : ldLeaf)[p.back()].push_back({p, n});
+      return n;
+    };
+
+    // The access path of an address: the struct layers holding it, outer to
+    // inner, each the layer's source type and the address's offset in it, up
+    // to the last loaded pointer. Layers outside an unknown offset (a variable
+    // array index) are not named; the layers inside it are. An address with no
+    // layer is into the objects its base pointer points to.
+    struct Addr {
+      Suffix path;
+      Value *base = nullptr;
+      bool va = false;
+    };
+    auto layers = [&](GEPOperator *G, Suffix &inner, std::optional<int64_t> &acc) {
+      Type *T = G->getSourceElementType();
+      const DIType *D = source::pointee(G->getPointerOperand());
+      std::vector<std::optional<int64_t>> c;
+      std::vector<std::pair<std::string, size_t>> lv;
+      auto idx = G->idx_begin();
+      if (idx != G->idx_end()) {
+        auto *CI = dyn_cast<ConstantInt>(*idx);
+        if (CI && T->isSized())
+          c.push_back(CI->getSExtValue() * (int64_t)dl.getTypeAllocSize(T).getFixedValue());
+        else
+          c.push_back(std::nullopt);
+        ++idx;
+      }
+      for (bool open = true; open;) {
+        auto *ST = dyn_cast<StructType>(T);
+        if (ST && ST->hasName())
+          lv.push_back({source::key(D, ST, dl), c.size()});
+        if (idx == G->idx_end())
+          break;
+        auto *CI = dyn_cast<ConstantInt>(*idx);
+        if (ST && CI && ST->isSized() && CI->getZExtValue() < ST->getNumElements()) {
+          unsigned i = (unsigned)CI->getZExtValue();
+          uint64_t o = dl.getStructLayout(ST)->getElementOffset(i);
+          c.push_back((int64_t)o);
+          T = ST->getElementType(i);
+          D = D ? source::member(D, o, T->isSized() ? dl.getTypeAllocSize(T).getFixedValue() : 0) : nullptr;
+        } else if (auto *AT = dyn_cast<ArrayType>(T)) {
+          int64_t es = (int64_t)dl.getTypeAllocSize(AT->getElementType()).getFixedValue();
+          c.push_back(CI ? std::optional<int64_t>(CI->getSExtValue() * es) : std::nullopt);
+          T = AT->getElementType();
+          D = D ? source::element(D) : nullptr;
+        } else {
+          c.push_back(std::nullopt);
+          open = false;
         }
-        if (auto *G = dyn_cast<GEPOperator>(V)) {
-          V = G->getPointerOperand();
-          continue;
+        ++idx;
+      }
+      // Offset of the address from the start of contribution k onward.
+      auto from = [&](size_t k) -> std::optional<int64_t> {
+        if (!acc)
+          return std::nullopt;
+        int64_t s = *acc;
+        for (size_t j = k; j < c.size(); ++j) {
+          if (!c[j])
+            return std::nullopt;
+          s += *c[j];
         }
-        if (auto *P = dyn_cast<PHINode>(V)) {
-          Value *one = nullptr;
-          bool bad = false;
-          for (Value *in : P->incoming_values()) {
-            if (isa<UndefValue>(in) || isa<ConstantPointerNull>(in))
-              continue;
-            if (one && one != in) {
-              bad = true;
-              break;
-            }
-            one = in;
-          }
-          if (bad || !one)
+        return s;
+      };
+      // A struct the GEP only ends at is the layer the next access enters.
+      Suffix add;
+      for (const auto &[key, k] : lv)
+        if (k < c.size() || inner.empty())
+          if (auto o = from(k))
+            add.push_back(Step{key, *o});
+      inner.insert(inner.begin(), add.begin(), add.end());
+      acc = from(0);
+    };
+    // The variadic arguments lie in untyped storage that va_list values
+    // carry between functions, so they are one cell Va. A va_arg reads
+    // through a pointer loaded from a __va_list_tag field.
+    auto vaArea = [&](const LoadInst &L) {
+      const Value *P = L.getPointerOperand()->stripPointerCasts();
+      if (auto *G = dyn_cast<GEPOperator>(P))
+        if (auto *ST = dyn_cast<StructType>(G->getSourceElementType()); ST && ST->hasName())
+          if (ST->getName().starts_with("struct.__va_list_tag"))
+            return true;
+      const MDNode *T = L.getMetadata(LLVMContext::MD_tbaa);
+      auto *B = T && T->getNumOperands() ? dyn_cast<MDNode>(T->getOperand(0)) : nullptr;
+      auto *N = B && B->getNumOperands() ? dyn_cast<MDString>(B->getOperand(0)) : nullptr;
+      return N && N->getString() == "__va_list_tag";
+    };
+    auto addrs = [&](Value *A) {
+      std::vector<Addr> out;
+      struct Item {
+        Value *v;
+        Suffix inner;
+        std::optional<int64_t> acc;
+      };
+      std::vector<Item> items{{A, {}, 0}};
+      std::unordered_set<const Value *> phis;
+      while (!items.empty()) {
+        Item it = std::move(items.back());
+        items.pop_back();
+        Value *V = it.v;
+        while (V) {
+          if (auto *O = dyn_cast<Operator>(V);
+              O && (O->getOpcode() == Instruction::BitCast || O->getOpcode() == Instruction::AddrSpaceCast)) {
+            V = O->getOperand(0);
+          } else if (auto *GA = dyn_cast<GlobalAlias>(V)) {
+            V = GA->getAliasee();
+          } else if (auto *G = dyn_cast<GEPOperator>(V)) {
+            layers(G, it.inner, it.acc);
+            V = G->getPointerOperand();
+          } else if (auto *P = dyn_cast<PHINode>(V)) {
+            if (phis.insert(P).second)
+              for (Value *in : P->incoming_values())
+                items.push_back({in, it.inner, it.acc});
             break;
-          V = one;
-          continue;
+          } else if (auto *S = dyn_cast<SelectInst>(V)) {
+            items.push_back({S->getTrueValue(), it.inner, it.acc});
+            items.push_back({S->getFalseValue(), it.inner, it.acc});
+            break;
+          } else {
+            if (!it.inner.empty())
+              out.push_back({it.inner, nullptr});
+            else if (auto *L = dyn_cast<LoadInst>(V); L && vaArea(*L))
+              out.push_back({{}, nullptr, true});
+            else
+              out.push_back({{}, V});
+            break;
+          }
         }
-        if (auto *L = dyn_cast<LoadInst>(V)) {
-          auto *A = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts());
-          if (!A) {
-            V = L->getPointerOperand();
+      }
+      return out;
+    };
+    // An access whose address carries no layer (a byte GEP of optimized IR)
+    // still names its struct path in its TBAA tag (base type, offset): the
+    // compiler's statement of the lvalue's type (C11 6.5p7). The path descends
+    // from the base type into the member types holding the offset.
+    ensureAccess();
+    auto tbaaStruct = [&](const MDNode *B) -> StructType * {
+      auto *N = B->getNumOperands() ? dyn_cast<MDString>(B->getOperand(0)) : nullptr;
+      if (!N)
+        return nullptr;
+      std::string n = N->getString().str();
+      if (StringRef(n).starts_with("_ZTS")) {
+        n = llvm::demangle(n);
+        StringRef r(n);
+        if (!r.consume_front("typeinfo name for "))
+          return nullptr;
+        n = r.str();
+      }
+      auto it = accessNames.find(n);
+      return it == accessNames.end() || it->second.empty() ? nullptr : structNamed(it->second.front());
+    };
+    auto tbaa = [&](const Instruction &I) {
+      Suffix s;
+      const MDNode *T = I.getMetadata(LLVMContext::MD_tbaa);
+      if (!T || T->getNumOperands() < 3)
+        return s;
+      const MDNode *B = dyn_cast<MDNode>(T->getOperand(0));
+      auto *O = mdconst::dyn_extract<ConstantInt>(T->getOperand(2));
+      if (!O)
+        return s;
+      int64_t off = O->getSExtValue();
+      while (B) {
+        StructType *ST = tbaaStruct(B);
+        if (!ST)
+          break;
+        s.push_back(Step{source::key(nullptr, ST, dl), off});
+        const MDNode *in = nullptr;
+        int64_t at = -1;
+        for (unsigned i = 1; i + 1 < B->getNumOperands(); i += 2) {
+          auto *mo = mdconst::dyn_extract<ConstantInt>(B->getOperand(i + 1));
+          if (mo && mo->getSExtValue() <= off && mo->getSExtValue() >= at) {
+            in = dyn_cast<MDNode>(B->getOperand(i));
+            at = mo->getSExtValue();
+          }
+        }
+        if (!in)
+          break;
+        off -= at;
+        B = in;
+      }
+      return s;
+    };
+    // An access that names a struct field, by its address or by its tag, is
+    // into the field's cell only.
+    auto access = [&](const Instruction &I, Value *A) {
+      auto at = addrs(A);
+      if (std::none_of(at.begin(), at.end(), [](const Addr &a) { return !a.path.empty(); }))
+        if (Suffix s = tbaa(I); !s.empty())
+          return std::vector<Addr>{{std::move(s), nullptr}};
+      return at;
+    };
+    std::optional<Node> vaN;
+    auto va = [&]() {
+      if (!vaN)
+        vaN = fresh();
+      return *vaN;
+    };
+    // Through a base pointer the object is known only when one reaches it:
+    // the constraint waits at the pointer's cell. A local or global base is
+    // its own object.
+    struct Deref {
+      Node n;
+      bool load;
+      Value *token;
+    };
+    std::unordered_map<Node, std::vector<Deref>> derefs;
+    auto elem = [&](Value *O) { return node(elemN, O); };
+    auto known = [](Value *B) { return isa<AllocaInst>(B) || isa<GlobalVariable>(B); };
+    auto writes = [&](const Addr &a, Node src) {
+      if (a.va)
+        edge(src, va());
+      else if (!a.base)
+        edge(src, cell(true, a.path));
+      else if (known(a.base))
+        edge(src, elem(a.base));
+      else
+        derefs[val(a.base)].push_back({src, false, nullptr});
+    };
+    auto reads = [&](const Addr &a, Node dst) {
+      if (a.va)
+        edge(va(), dst);
+      else if (!a.base)
+        edge(cell(false, a.path), dst);
+      else if (known(a.base))
+        edge(elem(a.base), dst);
+      else
+        derefs[val(a.base)].push_back({dst, true, nullptr});
+    };
+    // A path of the struct-field walk names each field by its offset in its
+    // own struct; the offset of the leaf in a layer is the sum from it inward.
+    auto inward = [](Suffix s) {
+      int64_t sum = 0;
+      for (size_t i = s.size(); i-- > 0;) {
+        sum += s[i].off;
+        s[i].off = sum;
+      }
+      return s;
+    };
+    // A constant placed at an address: each token leaf at its path, and
+    // every one of them in the objects of the base.
+    auto place = [&](Constant *C, Type *Ty, const DIType *D, const std::vector<Addr> &at) {
+      eachLeaf(C, Ty, {}, D, [&](Constant *L, const Suffix &rel) {
+        Value *T = tokenOf(L);
+        if (!T)
+          return;
+        Suffix r = inward(rel);
+        int64_t d = r.empty() ? 0 : r.front().off;
+        for (const Addr &a : at) {
+          if (a.va)
+            continue;
+          if (a.base) {
+            if (known(a.base))
+              work.push_back({elem(a.base), T});
+            else
+              derefs[val(a.base)].push_back({0, false, T});
+          }
+          Suffix p = a.path;
+          for (Step &s : p)
+            s.off += d;
+          p.insert(p.end(), r.begin(), r.end());
+          if (!p.empty())
+            work.push_back({cell(true, p), T});
+        }
+      });
+    };
+
+    for (Module *M : {&down, &up})
+      for (GlobalVariable &G : M->globals())
+        if (G.hasInitializer())
+          place(G.getInitializer(), G.getValueType(), source::ofGlobal(G), {Addr{{}, &G}});
+
+    std::unordered_map<Node, std::vector<CallBase *>> sitesAt;
+    std::vector<CallBase *> sites;
+    // A call through a C++ vtable slot calls, by the language's typing, a
+    // function the receiver's classes place at that slot: V(c). The flow does
+    // not decide it, since an object's cell holds its vptr with its data.
+    std::unordered_map<CallBase *, std::vector<Function *>> virtuals;
+    eachBody([&](Function &F) {
+      for (Instruction &I : instructions(F)) {
+        if (auto *S = dyn_cast<StoreInst>(&I)) {
+          Value *U = S->getValueOperand();
+          auto at = access(*S, S->getPointerOperand());
+          if (U->getType()->isPointerTy()) {
+            for (const Addr &a : at)
+              writes(a, val(U));
+          } else if (auto *C = dyn_cast<Constant>(U)) {
+            place(C, C->getType(), source::pointee(S->getPointerOperand()), at);
+          }
+        } else if (auto *L = dyn_cast<LoadInst>(&I)) {
+          if (L->getType()->isPointerTy())
+            for (const Addr &a : access(*L, L->getPointerOperand()))
+              reads(a, val(L));
+        } else if (auto *VA = dyn_cast<VAArgInst>(&I)) {
+          if (VA->getType()->isPointerTy())
+            edge(va(), val(VA));
+        } else if (auto *P = dyn_cast<PHINode>(&I)) {
+          if (P->getType()->isPointerTy())
+            for (Value *in : P->incoming_values())
+              edge(val(in), val(P));
+        } else if (auto *Sel = dyn_cast<SelectInst>(&I)) {
+          if (Sel->getType()->isPointerTy()) {
+            edge(val(Sel->getTrueValue()), val(Sel));
+            edge(val(Sel->getFalseValue()), val(Sel));
+          }
+        } else if (auto *Cast = dyn_cast<CastInst>(&I)) {
+          if (Cast->getType()->isPointerTy() || Cast->getOperand(0)->getType()->isPointerTy())
+            edge(val(Cast->getOperand(0)), val(Cast));
+        } else if (auto *G = dyn_cast<GetElementPtrInst>(&I)) {
+          edge(val(G->getPointerOperand()), val(G));
+        } else if (auto *R = dyn_cast<ReturnInst>(&I)) {
+          if (Value *V = R->getReturnValue(); V && V->getType()->isPointerTy())
+            edge(val(V), node(retN, &F));
+        } else if (auto *MT = dyn_cast<MemTransferInst>(&I)) {
+          Node bytes = fresh();
+          for (const Addr &s : addrs(MT->getSource()))
+            if (s.base)
+              reads(s, bytes);
+          for (const Addr &d : addrs(MT->getDest()))
+            if (d.base)
+              writes(d, bytes);
+        } else if (auto *CB = dyn_cast<CallBase>(&I)) {
+          if (isa<IntrinsicInst>(CB) || CB->isInlineAsm())
+            continue;
+          if (const Function *C = klee::calls::callee(*CB)) {
+            Function *B = define(C->getName());
+            for (unsigned i = 0; i < CB->arg_size(); ++i)
+              if (CB->getArgOperand(i)->getType()->isPointerTy())
+                edge(val(CB->getArgOperand(i)), !B ? val(CB) : i < B->arg_size() ? val(B->getArg(i)) : va());
+            if (!B && CB->getType()->isPointerTy())
+              work.push_back({val(CB), CB});
+            else if (B && CB->getType()->isPointerTy())
+              edge(node(retN, B), val(CB));
             continue;
           }
-          Value *stored = nullptr;
-          for (Instruction &I : instructions(*CB->getFunction())) {
-            auto *S = dyn_cast<StoreInst>(&I);
-            if (!S || S->getPointerOperand()->stripPointerCasts() != A)
-              continue;
-            Value *W = S->getValueOperand();
-            std::unordered_set<const Value *> walk;
-            while (W && walk.insert(W).second) {
-              if (auto *C = dyn_cast<CastInst>(W)) {
-                W = C->getOperand(0);
-                continue;
-              }
-              if (auto *GE = dyn_cast<GEPOperator>(W)) {
-                W = GE->getPointerOperand();
-                continue;
-              }
-              break;
-            }
-            if (isa<CallBase>(W))
-              stored = W;
+          sites.push_back(CB);
+          if (vslot(CB).ok) {
+            auto &v = virtuals[CB];
+            for (Function *T : vtableTargets(CB))
+              v.push_back(token(T));
+          } else {
+            sitesAt[val(CB->getCalledOperand())].push_back(CB);
           }
-          if (!stored)
-            break;
-          V = stored;
-          continue;
         }
-        if (auto *Call = dyn_cast<CallBase>(V)) {
-          if (Function *C = Call->getCalledFunction())
-            if (Function *D = define(C->getName()))
-              s = returnsOf(D);
-        }
-        break;
+      }
+    });
+
+    // An indirect call passes its actuals to, and takes the return of, each
+    // function of its type the callee comes to hold; an external one returns
+    // one of its pointer actuals or an object of its own.
+    std::set<std::pair<const CallBase *, const Function *>> wired;
+    auto wire = [&](CallBase *CB, Function *T) {
+      if (T->getFunctionType() != CB->getFunctionType() || !wired.insert({CB, T}).second)
+        return;
+      bool ext = T->isDeclaration();
+      for (unsigned i = 0; i < CB->arg_size(); ++i)
+        if (CB->getArgOperand(i)->getType()->isPointerTy())
+          link(val(CB->getArgOperand(i)), ext ? val(CB) : i < T->arg_size() ? val(T->getArg(i)) : va());
+      if (CB->getType()->isPointerTy()) {
+        if (ext)
+          work.push_back({val(CB), CB});
+        else
+          link(node(retN, T), val(CB));
+      }
+    };
+    for (const auto &[CB, ts] : virtuals)
+      for (Function *T : ts)
+        wire(CB, T);
+    while (!work.empty()) {
+      auto [n, t] = work.back();
+      work.pop_back();
+      if (!pt[n].insert(t).second)
+        continue;
+      for (size_t i = 0; i < succ[n].size(); ++i)
+        if (!pt[succ[n][i]].count(t))
+          work.push_back({succ[n][i], t});
+      if (auto *F = dyn_cast<Function>(t)) {
+        if (auto it = sitesAt.find(n); it != sitesAt.end())
+          for (CallBase *CB : it->second)
+            wire(CB, F);
+      } else if (auto it = derefs.find(n); it != derefs.end()) {
+        Node e = elem(t);
+        for (const Deref &d : it->second)
+          if (d.token)
+            work.push_back({e, d.token});
+          else if (d.load)
+            link(e, d.n);
+          else
+            link(d.n, e);
       }
     }
-    ensureSlots();
-    auto it = slotAt.find(s);
-    if (it != slotAt.end())
-      return it->second;
-    // A field of type T at offset o holds what the program places in any
-    // field of T at o, whatever object encloses it: a struct copy carries
-    // the source's fields into the destination's.
-    for (size_t n = 1; n < s.size(); ++n) {
-      if (s[n].type.empty())
-        continue;
-      auto tl = slotAt.find(Suffix(s.begin() + (long)n, s.end()));
-      if (tl != slotAt.end() && !tl->second.empty())
-        return tl->second;
+
+    auto defined = [&](const auto &from, FunctionType *T) {
+      std::vector<Function *> ts;
+      for (Value *t : from)
+        if (auto *f = dyn_cast<Function>(t); f && !f->isDeclaration() && (!T || f->getFunctionType() == T) &&
+                                             std::find(ts.begin(), ts.end(), f) == ts.end())
+          ts.push_back(f);
+      std::sort(ts.begin(), ts.end(), [](Function *A, Function *B) { return pretty(A->getName()) < pretty(B->getName()); });
+      return ts;
+    };
+    for (CallBase *CB : sites) {
+      auto v = virtuals.find(CB);
+      resolved[CB] = v != virtuals.end() ? defined(v->second, CB->getFunctionType())
+                                         : defined(pt[val(CB->getCalledOperand())], CB->getFunctionType());
     }
-    auto at = argCallTargets.find(CB);
-    // A formal that callers pass a function through is that function.
-    // An empty list is a call through the object, which a vtable may name.
-    if (at != argCallTargets.end() && !at->second.empty())
-      return at->second;
-    return vtableTargets(CB);
+    for (const auto &[V, n] : valN)
+      if (auto *A = dyn_cast<Argument>(V))
+        if (auto ts = defined(pt[n], nullptr); !ts.empty())
+          formalFns[A] = std::move(ts);
+    for (const auto &[p, n] : stN) {
+      auto &v = fieldFns[{p.back().type, p.back().off}];
+      for (Function *f : defined(pt[n], nullptr))
+        if (std::find(v.begin(), v.end(), f) == v.end())
+          v.push_back(f);
+    }
+  }
+
+const std::vector<Function *> &Model::fnsOf(const Argument *A) const {
+    static const std::vector<Function *> none;
+    auto it = formalFns.find(A);
+    return it == formalFns.end() ? none : it->second;
+  }
+
+calls::Table Model::indirectTargets() const {
+    calls::Table t;
+    for (Module *M : {&down, &up}) {
+      char side = M == &down ? 'D' : 'U';
+      for (Function &F : *M) {
+        if (F.isDeclaration())
+          continue;
+        std::vector<std::vector<calls::Fn>> sites;
+        for (Instruction &I : instructions(F))
+          if (auto *CB = dyn_cast<CallBase>(&I); CB && klee::calls::indirect(*CB)) {
+            std::vector<calls::Fn> ts;
+            for (Function *T : targetsOf(CB))
+              ts.push_back({T->getParent() == &down ? 'D' : 'U', T->getName().str()});
+            sites.push_back(ts);
+          }
+        if (!sites.empty())
+          t[{side, F.getName().str()}] = sites;
+      }
+    }
+    return t;
   }
 
 bool Model::exported(const Function &F) {

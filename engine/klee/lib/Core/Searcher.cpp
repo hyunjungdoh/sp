@@ -218,12 +218,17 @@ double WeightedRandomSearcher::getWeight(ExecutionState *es) {
     }
     case Sink: {
       // Stored distance is d+1 (0 means unreachable), so this is 1/(d+1)^2.
-      uint64_t dist = sinkGuide(
+      // An unreachable state weighs less than any reachable one.
+      uint64_t dist = sinkOrder(
+          es->stInstalled,
+          computeMinDistToSt(es->pc, es->stack.back().minDistToStOnReturn),
+          computeMinDistToSinkWit(es->pc,
+                                  es->stack.back().minDistToSinkWitOnReturn),
           computeMinDistToSinkSlot(es->pc,
                                    es->stack.back().minDistToSinkSlotOnReturn),
           computeMinDistToSink(es->pc,
                                es->stack.back().minDistToSinkOnReturn));
-      double inv = 1. / (dist ? dist : 10000);
+      double inv = 1. / (dist ? (double)dist : 1e12);
       return inv * inv;
     }
   }

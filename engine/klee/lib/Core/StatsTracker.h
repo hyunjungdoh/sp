@@ -13,12 +13,15 @@
 #include "CallPathManager.h"
 #include "klee/System/Time.h"
 
+#include <cstdint>
 #include <memory>
 #include <set>
 #include <sqlite3.h>
+#include <vector>
 
 namespace llvm {
   class BranchInst;
+  class CallBase;
   class Function;
   class Instruction;
   class raw_fd_ostream;
@@ -113,10 +116,31 @@ namespace klee {
   uint64_t computeMinDistToSinkSlot(const KInstruction *ki,
                                     uint64_t minDistAtRA);
 
-  /// The search order of a state: T_slot when finite, else past every
-  /// finite T_slot by T. 0 exactly when T is infinite.
-  extern uint64_t sinkGuideOffset;
-  uint64_t sinkGuide(uint64_t slot, uint64_t sig);
+  /// The same with calls descending toward the sink only along witness
+  /// edges (T_W).
+  uint64_t computeMinDistToSinkWit(const KInstruction *ki,
+                                   uint64_t minDistAtRA);
+
+  /// Distance to an input-dispatch installer (sp.st / T_st).
+  uint64_t computeMinDistToSt(const KInstruction *ki, uint64_t minDistAtRA);
+
+  /// The search order of a state: T_W when finite, else past every finite
+  /// T_W by T_slot, else past both by T. 0 exactly when T is infinite.
+  extern uint64_t sinkGuideWitOffset, sinkGuideOffset, sinkGuideStOffset;
+  uint64_t sinkGuide(uint64_t wit, uint64_t slot, uint64_t sig);
+  /// Order with the Π_I installer gate: T_st until an sp.st function has
+  /// run, then sinkGuide past every finite T_st.
+  uint64_t sinkOrder(bool stInstalled, uint64_t st, uint64_t wit, uint64_t slot,
+                     uint64_t sig);
+  // Whether f is in the refined target set Tgt(cb) of the indirect call cb.
+  bool slotAdmits(const llvm::CallBase &cb, const llvm::Function *f);
+
+  // Π_I gate keys for a comparison instruction (DESIGN-D §6): the key
+  // constants a dispatch table pairs with an installer-reaching function,
+  // extended to the compared width. Null when the comparison is not a gate.
+  // A state may assert one of these keys directly as a solver query instead
+  // of marching through the table one entry at a time.
+  const std::vector<std::uint64_t> *gateKeys(const llvm::Instruction *cmp);
 
 }
 

@@ -2,6 +2,7 @@
 
 #include "llvm/BinaryFormat/ELF.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/Linker/Linker.h"
@@ -97,6 +98,20 @@ bool environmentSymbol(const std::string &name) {
     return s;
   }();
   return syms.count(name) != 0;
+}
+
+bool nativeResidue(const Module &M, const std::string &name) {
+  const NamedMDNode *MD = M.getNamedMetadata("sp.native");
+  if (!MD)
+    return false;
+  for (const MDNode *N : MD->operands()) {
+    if (!N || N->getNumOperands() == 0)
+      continue;
+    if (const auto *S = dyn_cast<MDString>(N->getOperand(0)))
+      if (S->getString() == name)
+        return true;
+  }
+  return false;
 }
 
 namespace {
@@ -264,10 +279,14 @@ bool linkCand(Module &dest, Module *have, const Cand &c) {
                                     : parseIRFile(c.path.string(), err, dest.getContext());
   if (!mod)
     return false;
+  // A unit enters whole, as a linker pulls an archive member: its local
+  // state exists once for all its functions. A name already defined keeps
+  // the definition that came first.
+  demote(*mod, dest);
   if (have)
     demote(*mod, *have);
   Linker L(dest);
-  if (L.linkInModule(std::move(mod), Linker::Flags::LinkOnlyNeeded)) {
+  if (L.linkInModule(std::move(mod))) {
     errs() << "close: link failed " << (c.path.empty() ? std::string("llvm_bc") : c.path.string()) << "\n";
     return false;
   }
@@ -984,10 +1003,26 @@ void closeLibrary(Module &M, const fs::path &caseDir) {
   for (const std::string &so : objects)
     openImage(so, images, table);
   unsigned imaged = materialize(M, images, table);
+  // A function still declared after every bitcode unit was linked, yet defined
+  // in an installed image, is native residue (DESIGN-D §0). Record it; do not
+  // invent a body.
+  if (NamedMDNode *old = M.getNamedMetadata("sp.native"))
+    M.eraseNamedMetadata(old);
+  NamedMDNode *native = M.getOrInsertNamedMetadata("sp.native");
+  unsigned natives = 0;
+  for (Function &F : M) {
+    if (!F.isDeclaration() || F.isIntrinsic() || F.getName().starts_with("llvm."))
+      continue;
+    auto it = table.find(F.getName().str());
+    if (it == table.end() || !it->second.func)
+      continue;
+    native->addOperand(MDNode::get(M.getContext(), {MDString::get(M.getContext(), F.getName())}));
+    ++natives;
+  }
   unsigned open = 0;
   for (GlobalVariable &G : M.globals())
     if (openGlobal(G, M.getDataLayout()))
       ++open;
   errs() << "close " << caseDir.filename().string() << " bitcode " << linked << " image " << imaged << " libraries " << objects.size()
-         << " open-globals " << open << "\n";
+         << " native " << natives << " open-globals " << open << "\n";
 }

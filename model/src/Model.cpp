@@ -1,7 +1,6 @@
 #include "Model.h"
 #include "Client.h"
 #include "Close.h"
-#include "../../engine/klee/include/klee/Support/SlotTargets.h"
 #include <sstream>
 
 #include "llvm/Analysis/TargetLibraryInfo.h"
@@ -55,26 +54,23 @@ static std::set<std::string> projectExports;
 // only calls which can return. A call returns when its callee is a
 // definition with a path from entry to a ret, an environment function (a
 // declaration outside projectExports) that is not noreturn, or an indirect
-// call some address-taken function of its type can serve. Least fixpoints
-// over the call graph, so a function proven to return or to reach the sink
-// has such a path. gaps receives the closure gaps that cut it: those called
-// in functions that reach the sink only when gaps could return.
-// With bySlot, an indirect call reaches only the functions its callee slot
-// admits (klee::slots, DESIGN-D §6 slot targets).
-static bool flowReach(Module &M, std::set<std::string> &gaps, std::vector<std::string> &chain,
-                      bool bySlot = false) {
+// call one of whose targets returns. Least fixpoints over the call graph,
+// so a function proven to return or to reach the sink has such a path. gaps
+// receives the closure gaps that cut it: those called in functions that
+// reach the sink only when gaps could return. An indirect call goes to
+// Tgt_sig, or with refined to Tgt (§3.10, klee/Support/CallTargets.h).
+static bool flowReach(Module &M, const klee::calls::Targets &tg, std::set<std::string> &gaps,
+                      std::vector<std::string> &chain, bool refined) {
   std::map<const Function *, std::pair<const Function *, bool>> via;
-  std::map<FunctionType *, std::vector<Function *>> taken;
-  for (Function &F : M)
-    if (!F.isDeclaration() && F.hasAddressTaken())
-      taken[F.getFunctionType()].push_back(&F);
-  klee::slots::Targets slot;
-  if (bySlot)
-    slot.build(M);
   auto gap = [&](const Function *C) {
     return C && C->isDeclaration() && !C->isIntrinsic() && projectExports.count(C->getName().str());
   };
   auto solve = [&](bool gapsReturn, std::set<const Function *> &returns, std::set<const Function *> &sinks) {
+  auto returnsFrom = [&](const Function *C) {
+    if (C->isDeclaration())
+      return (gapsReturn || !gap(C)) && !C->doesNotReturn() && !C->getName().starts_with("klee_silent_exit");
+    return returns.count(C) > 0;
+  };
   // One pass over F: whether it reaches a ret (for returns) or the marker.
   auto walk = [&](Function &F, bool toSink) {
     std::set<const BasicBlock *> done;
@@ -89,7 +85,9 @@ static bool flowReach(Module &M, std::set<std::string> &gaps, std::vector<std::s
         auto *CB = dyn_cast<CallBase>(&I);
         if (!CB || isa<DbgInfoIntrinsic>(CB))
           continue;
-        const Function *C = CB->getCalledFunction();
+        // A call to an alias (Itanium C1/D1) is a direct call of its aliasee.
+        const Function *C =
+            dyn_cast<Function>(CB->getCalledOperand()->stripPointerCastsAndAliases());
         if (C && C->getName() == "klee_warning_once") {
           if (toSink) {
             via[&F] = {nullptr, false};
@@ -97,30 +95,23 @@ static bool flowReach(Module &M, std::set<std::string> &gaps, std::vector<std::s
           }
           continue;
         }
-        bool passes;
-        if (!C) {
-          // Indirect: every address-taken function of the same type (C11
-          // 6.3.2.3p8: a call through an incompatible type is undefined).
-          auto it = taken.find(CB->getFunctionType());
-          passes = it == taken.end();
-          if (it != taken.end())
-            for (Function *T : it->second) {
-              if (bySlot && !slot.admits(*CB, T))
-                continue;
-              if (toSink && sinks.count(T)) {
-                via[&F] = {T, true};
-                return true;
-              }
-              passes = passes || returns.count(T);
+        bool passes = false;
+        if (CB->isInlineAsm()) {
+          passes = true;
+        } else if (!C) {
+          for (Function *T : refined ? tg.of(*CB) : tg.signature(*CB)) {
+            if (toSink && sinks.count(T)) {
+              via[&F] = {T, true};
+              return true;
             }
-        } else if (C->isDeclaration()) {
-          passes = (gapsReturn || !gap(C)) && !C->doesNotReturn() && !C->getName().starts_with("klee_silent_exit");
+            passes = passes || returnsFrom(T);
+          }
         } else {
           if (toSink && sinks.count(C)) {
             via[&F] = {C, false};
             return true;
           }
-          passes = returns.count(C) > 0;
+          passes = returnsFrom(C);
         }
         if (auto *II = dyn_cast<InvokeInst>(CB)) {
           work.push_back(II->getUnwindDest());
@@ -421,9 +412,11 @@ static int finish(Module &harness, LLVMContext &ctx, const fs::path &outDir, con
       rs << "sink-reachable " << (sinks.empty() ? 0 : 1) << "\n";
       for (const std::string &s : sinks)
         rs << "sink-fn " << s << "\n";
+      klee::calls::Targets tg;
+      tg.index(harness);
       std::set<std::string> gaps;
       std::vector<std::string> chain;
-      bool cfg = flowReach(harness, gaps, chain);
+      bool cfg = flowReach(harness, tg, gaps, chain, false);
       // A library global the bitcode lacks has no initial contents, and the
       // program cannot start without them.
       std::vector<std::string> missing;
@@ -436,15 +429,23 @@ static int finish(Module &harness, LLVMContext &ctx, const fs::path &outDir, con
       rs << "global-gaps " << missing.size() << "\n";
       for (size_t k = 0; k < missing.size() && k < 20; ++k)
         rs << "global-gap " << missing[k] << "\n";
-      // '*' marks an indirect call whose type-matched targets include that step.
+      // '*' marks a step through an indirect call.
       for (const std::string &c : chain)
         rs << "cfg-path " << c << "\n";
-      std::set<std::string> slotGaps;
-      std::vector<std::string> slotChain;
-      bool bySlot = flowReach(harness, slotGaps, slotChain, true);
-      rs << "sink-reachable-slot " << (bySlot ? 1 : 0) << "\n";
-      for (const std::string &c : slotChain)
-        rs << "slot-path " << c << "\n";
+      std::set<std::string> tGaps;
+      std::vector<std::string> tChain;
+      bool refined = flowReach(harness, tg, tGaps, tChain, true);
+      unsigned sites = 0, narrowed = 0;
+      for (Function &F : harness)
+        for (Instruction &I : instructions(F))
+          if (auto *CB = dyn_cast<CallBase>(&I); CB && klee::calls::indirect(*CB) && CB->getMetadata("sp.tgt")) {
+            ++sites;
+            narrowed += tg.of(*CB).size() < tg.signature(*CB).size();
+          }
+      rs << "indirect-sites " << sites << " narrowed " << narrowed << " empty " << tg.empty << "\n";
+      rs << "sink-reachable-mlta " << (refined ? 1 : 0) << "\n";
+      for (const std::string &c : tChain)
+        rs << "mlta-path " << c << "\n";
       for (const std::string &g : gaps)
         rs << "closure-gap " << g << "\n";
     }
@@ -453,7 +454,7 @@ static int finish(Module &harness, LLVMContext &ctx, const fs::path &outDir, con
       if (!F.isDeclaration() || F.isIntrinsic() || !reach.count(&F) || F.getName().starts_with("klee_"))
         continue;
       std::string name = F.getName().str();
-      if (environmentSymbol(name))
+      if (environmentSymbol(name) || nativeResidue(harness, name))
         continue;
       open << name << "\n";
       errs() << "open: " << name << "\n";
@@ -464,6 +465,15 @@ static int finish(Module &harness, LLVMContext &ctx, const fs::path &outDir, con
   if (bec) {
     errs() << bec.message() << "\n";
     return 1;
+  }
+  {
+    unsigned witMeta = 0;
+    for (const Function &F : harness) {
+      SmallVector<MDNode *, 2> mds;
+      F.getMetadata("sp.wit", mds);
+      witMeta += mds.size();
+    }
+    errs() << stem << ".bc sp.wit " << witMeta << "\n";
   }
   WriteBitcodeToFile(harness, bc);
   return 0;
@@ -483,6 +493,7 @@ struct Witness {
     bool live = false;
   };
   std::vector<Ret> rets;
+  std::vector<Client::Keyed> keyed;
 };
 
 // A run prints every sequence it tries and stops at the first satisfiable
@@ -498,6 +509,10 @@ Witness parseWitness(std::istream &st) {
   // 투영이 정의되어 경계 셀만 의무다.
   bool crossing = false;
   bool sawModel = false;
+  // §3.8: prefix cells (root, type path, last offset) and the key setter that
+  // precedes its "discharges" line.
+  std::vector<std::tuple<int, std::vector<std::string>, int64_t>> prefixes;
+  std::optional<Client::Keyed> pendingKeyed;
   auto take = [](const std::string &s, std::vector<Client::Cell> &into) {
     std::istringstream in(s);
     std::string head, root, tok, last;
@@ -506,11 +521,12 @@ Witness parseWitness(std::istream &st) {
     auto bound = [](const std::string &t) {
       return t == "ule" || t == "uge" || t == "ult" || t == "sle" || t == "sge";
     };
+    auto bitOp = [](const std::string &t) { return t == "has" || t == "lacks"; };
     std::vector<std::string> path;
     while (in >> tok) {
       if (tok == "unknown")
         return;
-      if (tok == "=" || tok == "!=" || tok[0] == '<' || tok[0] == '>' || bound(tok)) {
+      if (tok == "=" || tok == "!=" || tok[0] == '<' || tok[0] == '>' || bound(tok) || bitOp(tok)) {
         op = tok;
         break;
       }
@@ -530,17 +546,36 @@ Witness parseWitness(std::istream &st) {
       c.root = std::atoi(root.c_str() + 3);
     c.path = std::move(path);
     c.op = op;
+    // §3.8: a bit atom after the value constraint is a second atom on the cell.
+    std::vector<std::pair<std::string, std::string>> bits;
     while (in >> tok) {
       if (tok == "file") {
         c.file = true;
         break;
       }
+      if (bitOp(tok)) {
+        std::string m;
+        if (in >> m)
+          bits.push_back({tok, m});
+        continue;
+      }
       if (bound(tok))
         break;
+      if (!bits.empty())
+        continue;
       if (tok.size() >= 2 && tok.front() == '"' && tok.back() == '"')
         tok = tok.substr(1, tok.size() - 2);
       c.values.push_back(tok);
     }
+    for (const auto &[bop, m] : bits) {
+      Client::Cell b = c;
+      b.op = bop;
+      b.values = {m};
+      b.file = false;
+      into.push_back(std::move(b));
+    }
+    if (bitOp(c.op) && !bits.empty() && c.values.empty())
+      return;
     into.push_back(std::move(c));
   };
   for (std::string s; std::getline(st, s);) {
@@ -554,6 +589,8 @@ Witness parseWitness(std::istream &st) {
       roots.clear();
       crossing = false;
       sawModel = false;
+      prefixes.clear();
+      pendingKeyed.reset();
       std::string n, absent;
       in >> n >> absent;
       if (absent.empty())
@@ -587,6 +624,72 @@ Witness parseWitness(std::istream &st) {
         typePath.push_back(p == std::string::npos ? tok : tok.substr(0, p));
       }
       roots.push_back({std::atoi(root.c_str() + 3), std::move(typePath)});
+    } else if (head == "prefixcell") {
+      std::string root;
+      in >> root;
+      if (root.rfind("arg", 0) != 0)
+        continue;
+      std::vector<std::string> typePath;
+      int64_t off = -1;
+      for (std::string tok; in >> tok;) {
+        auto p = tok.rfind('+');
+        if (p == std::string::npos || p == 0)
+          continue;
+        typePath.push_back(tok.substr(0, p));
+        if (auto o = asI64(tok.substr(p + 1)))
+          off = *o;
+      }
+      prefixes.push_back({std::atoi(root.c_str() + 3), std::move(typePath), off});
+    } else if (head == "client") {
+      // §3.8 정의 3.8.4: "client W argO argT = K [vararg …]".
+      Client::Keyed k;
+      std::string obj;
+      in >> k.fn >> obj;
+      if (obj.rfind("arg", 0) != 0)
+        continue;
+      k.obj = (unsigned)std::atoi(obj.c_str() + 3);
+      std::vector<std::string> toks;
+      for (std::string t; in >> t;)
+        toks.push_back(t);
+      bool ok = true;
+      for (size_t i = 0; i < toks.size(); ++i) {
+        if (toks[i].rfind("arg", 0) == 0 && i + 2 < toks.size() && toks[i + 1] == "=") {
+          k.tag = std::atoi(toks[i].c_str() + 3);
+          auto v = asI64(toks[i + 2]);
+          ok = ok && v.has_value();
+          k.tagV = v ? *v : 0;
+          i += 2;
+        } else if (toks[i] == "vararg" && i + 2 < toks.size()) {
+          k.va = true;
+          auto v = asI64(toks[i + 2]);
+          if (!v)
+            if (auto u = asU64(toks[i + 2]))
+              v = (int64_t)*u;
+          ok = ok && v.has_value();
+          k.preds.push_back({toks[i + 1], v ? *v : 0});
+          i += 2;
+        } else
+          ok = false;
+      }
+      pendingKeyed = ok ? std::optional<Client::Keyed>(k) : std::nullopt;
+    } else if (head == "discharges") {
+      std::string root;
+      in >> root;
+      if (pendingKeyed && root.rfind("arg", 0) == 0) {
+        Client::Keyed &k = *pendingKeyed;
+        k.target = s.substr(std::string("discharges").size());
+        k.root = std::atoi(root.c_str() + 3);
+        for (std::string tok; in >> tok;) {
+          auto p = tok.rfind('+');
+          if (p == std::string::npos || p == 0)
+            continue;
+          k.path.push_back(tok.substr(0, p));
+          if (auto o = asI64(tok.substr(p + 1)))
+            k.off = *o;
+        }
+        w.keyed.push_back(k);
+      }
+      pendingKeyed.reset();
     } else if (head == "cell") {
       take(s, may);
     } else if (head == "model") {
@@ -638,6 +741,9 @@ Witness parseWitness(std::istream &st) {
   // 뜻하므로 그 인자의 모든 셀이 경계다.
   for (Client::Cell &c : w.phi) {
     c.crossing = crossing;
+    for (const auto &[root, typePath, off] : prefixes)
+      if (root == c.root && off == c.off && typePath == c.path)
+        c.prefix = true;
     for (const auto &r : roots)
       if (r.first == c.root && r.second.size() <= c.path.size() &&
           std::equal(r.second.begin(), r.second.end(), c.path.begin())) {
@@ -1050,8 +1156,43 @@ static void plantExternal(Module &M, const std::vector<Witness::Ret> &rets, bool
   }
 }
 
+// Function p of witness k carries the attachment sp.wit !{k, p} (DESIGN-D
+// §6b). Only definitions carry it, before linking, so a renamed local keeps it.
+void markWitnesses(Module &M, const std::vector<Witness> &witnesses) {
+  LLVMContext &C = M.getContext();
+  Type *i32 = Type::getInt32Ty(C);
+  unsigned hit = 0, miss = 0;
+  for (unsigned k = 0; k < witnesses.size(); ++k)
+    for (unsigned p = 0; p < witnesses[k].seq.size(); ++p) {
+      Function *F = M.getFunction(witnesses[k].seq[p]);
+      if (!F || F->isDeclaration()) {
+        ++miss;
+        continue;
+      }
+      F->addMetadata("sp.wit", *MDNode::get(C, {ConstantAsMetadata::get(ConstantInt::get(i32, k)),
+                                                 ConstantAsMetadata::get(ConstantInt::get(i32, p))}));
+      ++hit;
+    }
+  errs() << "markWitnesses hit " << hit << " miss " << miss << "\n";
+}
+
+// §3.7 D item 2: an input-dispatch installer F (`input:F`). The search
+// approaches F before the sink so Π_I opens the gate the plan named.
+void markStInstallers(Module &M, const std::vector<std::string> &names) {
+  LLVMContext &C = M.getContext();
+  unsigned hit = 0;
+  for (const std::string &n : names) {
+    Function *F = M.getFunction(n);
+    if (!F || F->isDeclaration())
+      continue;
+    F->setMetadata("sp.st", MDNode::get(C, {}));
+    ++hit;
+  }
+  errs() << "markStInstallers hit " << hit << " of " << names.size() << "\n";
+}
+
 int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, const std::vector<Witness> &witnesses,
-             const std::string &file, unsigned line, int rc) {
+             const calls::Table &table, const std::string &file, unsigned line, int rc) {
   SMDiagnostic e2;
   auto up2 = parseIRFile((dir / "upstream.bc").string(), e2, ctx);
   auto down2 = parseIRFile((dir / "se_lib" / "downstream.closure.bc").string(), e2, ctx);
@@ -1060,13 +1201,17 @@ int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, cons
   closeModules(*down2, *up2, dir);
   annotateLibcalls(*up2);
   annotateLibcalls(*down2);
+  if (!calls::annotate(*down2, *up2, table))
+    return 1;
   source::reset();
   source::index(*down2);
   source::index(*up2);
   Client client(*down2, *up2, dir);
   std::vector<std::pair<std::vector<std::string>, std::vector<Client::Cell>>> ws;
-  for (const Witness &w : witnesses)
+  for (const Witness &w : witnesses) {
     ws.push_back({w.seq, w.phi});
+    client.keyedIn.push_back(w.keyed);
+  }
   auto bound = [](const char *name, unsigned dflt) {
     const char *v = std::getenv(name);
     return v && *v ? (unsigned)std::atoi(v) : dflt;
@@ -1087,6 +1232,10 @@ int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, cons
   client.emit(plan, ch);
   if (verifyModule(ch, &errs()))
     return 1;
+  markWitnesses(*down2, witnesses);
+  markWitnesses(*up2, witnesses);
+  markStInstallers(*down2, plan.stInstallers);
+  markStInstallers(*up2, plan.stInstallers);
   Linker l2(ch);
   if (l2.linkInModule(std::move(down2)) || l2.linkInModule(std::move(up2))) {
     errs() << "link failed\n";
@@ -1095,6 +1244,7 @@ int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, cons
   // Data the two libraries still leave undefined is filled from the installed
   // images. Function bodies were linked into the two libraries before analysis.
   closeLibrary(ch, dir);
+  markStInstallers(ch, plan.stInstallers);
   if (!witnesses.empty())
     plantExternal(ch, witnesses[0].rets, false);
   if (verifyModule(ch, &errs()))
@@ -1128,9 +1278,15 @@ int main(int argc, char **argv) {
   }
   projectExports = Client::installedExports(dir);
   LLVMContext ctx;
-  // The must side depends on the may side only through its witnesses. With
-  // MAY_REUSE set, the witnesses of an earlier run in out-dir stand for it.
+  // The must side depends on the may side only through its witnesses and its
+  // call relation. With MAY_REUSE set, those of an earlier run in out-dir
+  // stand for it.
   if (const char *r = std::getenv("MAY_REUSE"); r && *r && fs::exists(outDir / "witnesses.txt")) {
+    calls::Table table;
+    if (!calls::read(table, outDir / "calls.txt")) {
+      errs() << "MAY_REUSE: no calls.txt in " << outDir.string() << "\n";
+      return 1;
+    }
     std::vector<Witness> ws;
     {
       std::ifstream st((outDir / "state.txt").string());
@@ -1150,7 +1306,7 @@ int main(int argc, char **argv) {
         ws.push_back(v);
       block.clear();
     }
-    return mustSide(dir, outDir, ctx, ws, file, line, 0);
+    return mustSide(dir, outDir, ctx, ws, table, file, line, 0);
   }
   SMDiagnostic err;
   auto up = parseIRFile((dir / "upstream.bc").string(), err, ctx);
@@ -1212,6 +1368,10 @@ int main(int argc, char **argv) {
       n = v.index + 1;
     }
   }
+  calls::Table table = model.indirectTargets();
+  calls::write(table, outDir / "calls.txt");
+  if (!calls::annotate(*down, *up, table))
+    return 1;
   int rc = 0;
   if (model.exportFn()) {
   if (!witnesses.empty()) {
@@ -1222,6 +1382,8 @@ int main(int argc, char **argv) {
   model.emit(harness);
   if (verifyModule(harness, &errs()))
     return 1;
+  markWitnesses(*down, witnesses);
+  markWitnesses(*up, witnesses);
   Linker linker(harness);
   if (linker.linkInModule(std::move(down)) || linker.linkInModule(std::move(up))) {
     errs() << "link failed\n";
@@ -1229,9 +1391,11 @@ int main(int argc, char **argv) {
   }
   if (!witnesses.empty())
     plantExternal(harness, witnesses[0].rets);
+  // Same closing as the client: installed-image data and native residue.
+  closeLibrary(harness, dir);
   if (verifyModule(harness, &errs()))
     return 1;
   rc = finish(harness, ctx, outDir, "run", file, line);
   }
-  return mustSide(dir, outDir, ctx, witnesses, file, line, rc);
+  return mustSide(dir, outDir, ctx, witnesses, table, file, line, rc);
 }

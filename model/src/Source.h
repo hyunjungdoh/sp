@@ -29,6 +29,11 @@
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Operator.h"
 
+#include <map>
+#include <optional>
+#include <set>
+#include <string>
+
 #include <string>
 #include <utility>
 #include <vector>
@@ -55,6 +60,21 @@ const llvm::DIType *ofGlobal(const llvm::GlobalVariable &G);
 
 // The member of D at byte offset off whose size is size bytes, or null.
 const llvm::DIType *member(const llvm::DIType *D, uint64_t off, uint64_t size);
+
+// The classes derived from class D, by source name, each with the byte
+// offsets of its D subobjects (none for a virtual base, which only the
+// complete object places); D itself with offset 0.
+std::map<std::string, std::set<std::optional<uint64_t>>> derived(const llvm::DIType *D);
+
+// Whether a class D holds a vtable pointer at byte offset off, its own or a
+// base subobject's.
+bool vptrAt(const llvm::DIType *D, uint64_t off);
+
+// Whether a source type can hold a function pointer: a pointer to a
+// subroutine, a void pointer, or a record/array containing one. A vptr
+// field is not one (it holds a table address; the call through it is
+// resolved by the class hierarchy).
+bool holdsFn(const llvm::DIType *D);
 
 // The element type of an array D, or null.
 const llvm::DIType *element(const llvm::DIType *D);

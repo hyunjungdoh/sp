@@ -27,6 +27,8 @@ Statistic stats::minDistToReturn("MinDistToReturn", "Rdist");
 Statistic stats::minDistToSink("MinDistToSink", "Sdist");
 Statistic stats::minDistToReturnSlot("MinDistToReturnSlot", "RSdist");
 Statistic stats::minDistToSinkSlot("MinDistToSinkSlot", "SSdist");
+Statistic stats::minDistToSinkWit("MinDistToSinkWit", "SWdist");
+Statistic stats::minDistToSt("MinDistToSt", "STdist");
 Statistic stats::minDistToUncovered("MinDistToUncovered", "UCdist");
 Statistic stats::resolveTime("ResolveTime", "Rtime");
 Statistic stats::solverTime("SolverTime", "Stime");

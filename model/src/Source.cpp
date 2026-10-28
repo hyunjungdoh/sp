@@ -23,6 +23,9 @@ struct State {
   std::unordered_map<const Value *, const DIType *> memo;
   std::unordered_set<const Value *> open;
   std::map<std::string, StructType *> ir;
+  // For each class: the classes naming it as a direct base, the base's
+  // offset in each, and whether the base is virtual.
+  std::map<std::string, std::set<std::tuple<std::string, uint64_t, bool>>> heirs;
   Stats stats;
 };
 
@@ -191,8 +194,33 @@ void index(Module &M) {
   F.processModule(M);
   for (DIType *T : F.types())
     if (auto *C = dyn_cast<DICompositeType>(T))
-      if (record(C) && !C->isForwardDecl() && !C->getName().empty())
+      if (record(C) && !C->isForwardDecl() && !C->getName().empty()) {
         state().defs.emplace(qualified(C, ""), C);
+        for (const DINode *N : C->getElements())
+          if (auto *M = dyn_cast<DIDerivedType>(N); M && M->getTag() == dwarf::DW_TAG_inheritance)
+            if (std::string b = name(M->getBaseType()); !b.empty())
+              state().heirs[b].insert({qualified(C, ""), M->getOffsetInBits() / 8, M->isVirtual()});
+      }
+}
+
+std::map<std::string, std::set<std::optional<uint64_t>>> derived(const DIType *D) {
+  std::map<std::string, std::set<std::optional<uint64_t>>> out;
+  std::string self = name(D);
+  if (self.empty())
+    return out;
+  std::vector<std::pair<std::string, std::optional<uint64_t>>> work{{self, 0}};
+  while (!work.empty()) {
+    auto [id, at] = work.back();
+    work.pop_back();
+    if (!out[id].insert(at).second)
+      continue;
+    auto it = state().heirs.find(id);
+    if (it == state().heirs.end())
+      continue;
+    for (const auto &[sub, off, virt] : it->second)
+      work.push_back({sub, virt || !at ? std::nullopt : std::optional<uint64_t>(*at + off)});
+  }
+  return out;
 }
 
 void reset() {
@@ -201,6 +229,7 @@ void reset() {
   s.memo.clear();
   s.open.clear();
   s.ir.clear();
+  s.heirs.clear();
   s.stats = Stats{};
 }
 
@@ -231,6 +260,69 @@ const DIType *member(const DIType *D, uint64_t off, uint64_t size) {
     ++count;
   }
   return count == 1 ? any : nullptr;
+}
+
+bool vptrAt(const DIType *D, uint64_t off) {
+  const DICompositeType *C = composite(D);
+  if (!C)
+    return false;
+  for (const DINode *N : C->getElements()) {
+    auto *M = dyn_cast<DIDerivedType>(N);
+    if (!M || M->isStaticMember())
+      continue;
+    uint64_t at = M->getOffsetInBits() / 8;
+    if (M->getTag() == dwarf::DW_TAG_member && M->isArtificial() && M->getName().starts_with("_vptr") && at == off)
+      return true;
+    if (M->getTag() == dwarf::DW_TAG_inheritance && at <= off && vptrAt(M->getBaseType(), off - at))
+      return true;
+  }
+  return false;
+}
+
+bool holdsFn(const DIType *D) {
+  D = strip(D);
+  if (!D)
+    return false;
+  if (auto *Der = dyn_cast<DIDerivedType>(D)) {
+    if (Der->getTag() == dwarf::DW_TAG_pointer_type || Der->getTag() == dwarf::DW_TAG_reference_type ||
+        Der->getTag() == dwarf::DW_TAG_rvalue_reference_type) {
+      const DIType *P = strip(Der->getBaseType());
+      if (!P)
+        return true;
+      if (isa<DISubroutineType>(P))
+        return true;
+      if (auto *C = dyn_cast<DICompositeType>(P); C && C->getTag() == dwarf::DW_TAG_class_type)
+        return false;
+      if (auto *C = dyn_cast<DICompositeType>(P); C && C->getTag() == dwarf::DW_TAG_structure_type)
+        return false;
+      if (P->getTag() == dwarf::DW_TAG_pointer_type)
+        return holdsFn(P);
+      // void, unspecified, or a typedef whose strip left a basic type with no
+      // size: a C callback slot written as void *.
+      return !isa<DIBasicType>(P) || P->getName() == "void";
+    }
+    return false;
+  }
+  if (auto *C = dyn_cast<DICompositeType>(D)) {
+    if (C->getTag() == dwarf::DW_TAG_array_type)
+      return holdsFn(C->getBaseType());
+    if (!record(C))
+      return false;
+    if (C->isForwardDecl())
+      if (const DICompositeType *D2 = composite(C))
+        C = D2;
+    for (const DINode *N : C->getElements()) {
+      auto *M = dyn_cast<DIDerivedType>(N);
+      if (!M || M->isStaticMember())
+        continue;
+      if (M->getTag() == dwarf::DW_TAG_member && M->isArtificial() && M->getName().starts_with("_vptr"))
+        continue;
+      if (M->getTag() == dwarf::DW_TAG_member || M->getTag() == dwarf::DW_TAG_inheritance)
+        if (holdsFn(M->getBaseType()))
+          return true;
+    }
+  }
+  return false;
 }
 
 const DIType *element(const DIType *D) {
