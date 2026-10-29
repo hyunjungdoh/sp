@@ -1,0 +1,135 @@
+\section{Motivation}\label{sec:moti}
+% In this section, we formalize the problem addressed by \sys and illustrate why assessing exploitability through downstream applications requires recovering the calls and runtime state needed to trigger a vulnerable sink, as well as finding inputs that trigger it under that state.
+In this section, we formalize the problem addressed by \sys and then illustrate the importance of downstream configuration through a motivating example.
+We begin by distinguishing two complementary contexts that determine whether a propagated vulnerability is triggered through a downstream application:
+\begin{itemize}
+    \setlength\itemsep{0.0em}
+    \item \textbf{Data context} is the input delivered to the vulnerable
+    code.
+    \item \textbf{Configuration context} is the configuration state set by the downstream application, that affects how the upstream component processes the data context.
+\end{itemize}
+Therefore, a propagated vulnerability is exploitable through the downstream application only when both contexts satisfy its triggering conditions.
+
+\subsection{Problem Statement}
+\label{subsec:problem}
+In this paper, we focus on determining whether both the data and configuration contexts satisfy the triggering conditions for a given upstream vulnerability and downstream application.
+The same data context (e.g., Upstream PoC) often fails under $D$'s default configuration $C_\bot$ but triggers under another externally controllable configuration in $\mathcal{C}_D$.
+Our goal is to recover such a configuration and a data context $X$ under which it triggers: 
+\[
+\begin{aligned}
+\operatorname{Exploit}(U,D)
+\iff {} & \exists\,X \in \mathcal{X}_D,\;
+           \exists\,C \in \mathcal{C}_D: \\
+        & \operatorname{Trigger}(U,X,C).
+\end{aligned}
+\]
+
+% In this paper, we investigate whether vulnerabilities in upstream libraries remain exploitable through downstream applications. Let $U$ denote an upstream library containing a vulnerable sink $s$, and let $D$ denote a downstream application that uses $U$. Triggering $s$ through $D$ requires both suitable input data and the runtime state in which $U$ processes that data. We distinguish two factors that affect whether $s$ is triggered:
+% \begin{itemize}
+%     \setlength\itemsep{0.2em}
+%     \item \textbf{Explicit Inputs}: External data, such as input files or payloads, that reach $s$ and determine the data it processes.
+%     \item \textbf{Implicit Inputs}: Runtime state established by $D$ that affects how $U$ processes the input.
+% \end{itemize}
+
+% An input that triggers $s$ in isolation may fail to trigger it through $D$ if the required runtime state is not established. Assessing exploitability therefore requires recovering how $D$ invokes $U$, including the calls, arguments, and runtime state involved in reaching the vulnerable sink. A harness can exercise this interaction, but constructing one requires recovering the call sequence and establishing the implicit inputs needed along that sequence. Even with these elements in place, the harness must still execute an explicit input that triggers $s$.
+
+% \PP{Technical Challenges}
+% Automatically triggering $s$ through $D$ involves three technical challenges. The first concerns recovering the call sequence needed to trigger the sink. The second concerns recovering the arguments and runtime state required along that sequence. The third concerns finding explicit inputs that trigger the sink when executed through the resulting harness.
+
+% \PP{Challenge 1: Call Sequence Recovery}
+% Triggering $s$ through $D$ requires recovering a sequence of calls that starts from $D$'s exported interface, crosses into $U$, and reaches the vulnerable sink. Merely finding some path that touches $s$ is insufficient: the recovered sequence must expose a way to establish the vulnerability's trigger condition. The challenge is to recover such a sequence across the $D$--$U$ boundary.
+
+% \PP{Challenge 2: Argument and State Recovery}
+% Recovering the call sequence does not determine whether the sequence triggers $s$. The calls must also supply the required arguments and establish the runtime state that governs how $U$ processes the input. The challenge is to determine which arguments and state the harness must provide or establish along the recovered sequence.
+
+% \PP{Challenge 3: Sink Triggering through Execution}
+% Even if the harness reproduces the required calls and establishes the necessary implicit inputs, the sink may not be triggered by an arbitrary input. The explicit input must drive execution through the $D$--$U$ path and satisfy the conditions required to reach the vulnerable operation under the state established by the harness. The challenge is to find explicit inputs that trigger $s$ through this execution.
+
+\subsection{Motivating Examples}
+\label{subsec:motivating}
+\noindent\textbf{Example 1)}
+
+
+\noindent\textbf{Example 2)}
+
+
+
+% We illustrate these challenges using two upstream--downstream pairs.
+% The first shows why a downstream application may require a different call sequence and arguments from those in the upstream PoC.
+% The second shows why triggering the sink also requires carefully chosen explicit inputs.
+
+% \noindent\textbf{Example 1)}
+% \label{subsec:motivating1}
+% CVE-2020-35538 is a null-pointer dereference in \texttt{jcopy\_sample\_rows()} in libjpeg-turbo 2.0.5. As shown in \autoref{lst:moti_jpeg_vul}, the upstream PoC triggers it by using \texttt{jpeg\_skip\_scanlines()} to install a null output row that later reaches the sink under merged upsampling. Libtiff never calls \texttt{jpeg\_skip\_scanlines()}, so the PoC's call sequence does not trigger the vulnerability through this downstream library.
+
+% The absence of this API call does not make the sink unreachable through libtiff. As shown in \autoref{lst:moti_jpeg_ds}, JPEG strip decoding follows a different path:
+% \texttt{TIFFRead\allowbreak Encoded\allowbreak Strip()}\carrow\texttt{JPEGDecode()}\carrow\texttt{TIFFjpeg\_\allowbreak read\_\allowbreak scanlines()}.
+% Along this path, \texttt{JPEGDecode()} forwards the caller-supplied strip buffer as an output row. Supplying a null buffer at this $D$ export therefore passes a null row to \texttt{jpeg\_\allowbreak read\_\allowbreak scanlines()} without calling \texttt{jpeg\_\allowbreak skip\_\allowbreak scanlines()}. As in the upstream PoC, fancy upsampling must be disabled (e.g., with \texttt{djpeg -fast}) to select the merged upsampler. Thus, the downstream path requires the harness to supply the appropriate strip-buffer argument.
+
+% This example shows that reaching $s$ is not enough: the harness must recover a downstream call sequence that can establish the trigger condition (C1) and supply the required buffer argument (C2).
+
+% \begin{figure}[!t]
+% \begin{lstlisting}[caption=\label{lst:moti_jpeg_vul}{Upstream PoC path for CVE-2020-35538 (\texttt{jdapistd.c}, \texttt{jdmerge.c}, \texttt{jutils.c}).}, language=C, frame=single, style=base, frame=, basicstyle=\fontsize{7.6}{9}\ttfamily\color{black}, deletekeywords={for}, mathescape, breakatwhitespace=true, breaklines=true, aboveskip=0.4em, belowskip=0.4em]
+% $\text{\quad\textcolor{citegray}{\detokenize{func: read_and_discard_scanlines}}}$
+% $\text{\quad\textcolor{citegray}{\detokenize{/* via jpeg_skip_scanlines */}}}$
+% $\text{\quad\textcolor{black}{\detokenize{jpeg_read_scanlines(cinfo, }\textcolor{orange}{\detokenize{NULL}}\detokenize{, 1);}}}$
+% $\text{\quad\textcolor{citegray}{\detokenize{func: jpeg_read_scanlines}}}$
+% $\text{\quad\textcolor{black}{\detokenize{(*cinfo->main->process_data)(cinfo, scanlines, &row_ctr, max_lines);}}}$
+% $\text{\quad\textcolor{citegray}{\detokenize{func: merged_2v_upsample}}}$
+% $\text{\quad\textcolor{citegray}{\detokenize{/* when do_fancy_upsampling is false */}}}$
+% $\text{\quad\textcolor{black}{\detokenize{jcopy_sample_rows(&upsample->spare_row, 0,}}}$$\text{\hspace{6.2em}\detokenize{output_buf + *out_row_ctr, 0, 1, size);}}$
+% $\text{\quad\textcolor{citegray}{\detokenize{func: jcopy_sample_rows}}}$
+% $\text{\quad\textcolor{black}{\textcolor{purple}{\detokenize{outptr = *output_array++;}}\textcolor{citegray}{\hspace{0.5em}\detokenize{// output_array is the NULL buffer}}}}$
+% \end{lstlisting}
+% \end{figure}
+
+% \begin{figure}[!t]
+% \begin{lstlisting}[caption=\label{lst:moti_jpeg_ds}{Downstream JPEG strip path in libtiff (\texttt{tif\_jpeg.c}).}, language=C, frame=single, style=base, frame=, basicstyle=\fontsize{7.6}{9}\ttfamily\color{black}, deletekeywords={for}, mathescape, breakatwhitespace=true, breaklines=true, aboveskip=0.4em, belowskip=0.4em]
+% $\text{\quad\textcolor{citegray}{\detokenize{func: JPEGDecode}}}$
+% $\text{\quad\textcolor{black}{\detokenize{JSAMPROW bufptr = (JSAMPROW)}\textcolor{orange}{\detokenize{buf}}\detokenize{;}}}$
+% $\text{\quad\textcolor{black}{\detokenize{TIFFjpeg_read_scanlines(sp, &bufptr, 1);}}}$
+% $\text{\quad\textcolor{citegray}{\detokenize{/* jpeg_skip_scanlines is never called */}}}$
+% \end{lstlisting}
+% \end{figure}
+
+% \noindent\textbf{Example 2)}
+% CVE-2026-24450 is an integer-overflow vulnerability in LibRaw 0.21.1 that can cause a heap buffer overflow when decoding floating-point DNG files. As shown in \autoref{lst:moti_vul}, LibRaw computes the allocation size in 64-bit arithmetic and checks it against \texttt{max\_raw\_memory\_mb}, but the subsequent \texttt{calloc()} uses an element count computed without the same overflow guard. This can result in an undersized allocation that is later accessed by \texttt{memmove()}. Triggering the vulnerability therefore depends on both the memory limit in effect during decoding and the dimensions derived from the input.
+
+% OpenImageIO (OIIO) uses LibRaw to decode raw files, including floating-point DNG. As shown in \autoref{lst:moti_oiio}, three consecutive revisions of \texttt{RawInput::open\_raw()} preserve the same calls to \texttt{unpack()} and the same assignment to \texttt{max\_raw\_memory\_mb}, but change when the assignment takes effect or how large its value can be.
+
+% \begin{figure}[!t]
+% \begin{lstlisting}[caption=\label{lst:moti_vul}{Simplified vulnerability-triggering flow in LibRaw for CVE-2026-24450 (\texttt{src/decoders/fp\_dng.cpp}).}, language=C, frame=single, style=base, frame=, basicstyle=\fontsize{7.6}{9}\ttfamily\color{black}, deletekeywords={for}, mathescape, breakatwhitespace=true, breaklines=true, aboveskip=0.4em, belowskip=0.4em]
+% $\text{\quad\textcolor{citegray}{\detokenize{func: LibRaw::uncompressed_fp_dng_load_raw}}}$
+% $\text{\quad\textcolor{black}{INT64 allocsz = INT64(tiles.tileCnt) * INT64(tiles.tileWidth)}}$$\text{\hspace{5.3em}* INT64(tiles.tileHeight) * INT64(ifd->samples)}$ $\text{\hspace{5.3em}* INT64(sizeof(float));}$
+% $\text{\quad\textcolor{black}{if \detokenize{(allocsz >} INT64\detokenize{(imgdata.rawparams.}\textcolor{orange}{\detokenize{max_raw_memory_mb}})}}$$\text{\hspace{5.3em}\detokenize{* }INT64\detokenize{(1024 * 1024))}}$
+% $\text{\quad\quad\quad\textcolor{black}{throw \detokenize{LIBRAW_EXCEPTION_TOOBIG;}}}$
+% $\text{\quad\textcolor{black}{\detokenize{float_raw_image = (}float *)calloc\detokenize{(tiles.tileCnt }}}$$\text{\hspace{6.4em}\detokenize{* tiles.tileWidth * tiles.tileHeight}}$ $\text{\hspace{6.4em}\detokenize{* ifd->samples, sizeof(}float\detokenize{));}}$
+% $\text{\quad\textcolor{black}{\detokenize{...}}}$
+% $\text{\quad\textcolor{black}{int \detokenize{fullrowbytes = tiles.tileWidth * bytesps * ifd->samples;}}}$
+% $\text{\quad\textcolor{black}{unsigned char *dst = fullrowbytes > inrowbytes ? rowbuf.data()}}$$\text{: (unsigned char *)\detokenize{&float_raw_image[(}}$ $\text{\detokenize{(y + row) * imgdata.sizes.raw_width + x) * ifd->samples];}}$
+% $\text{\quad\textcolor{black}{input->read(dst, 1, fullrowbytes);}}$
+% $\text{\quad\textcolor{citegray}{\detokenize{path: src/libraw_datastream.cpp}}}$
+% $\text{\quad\textcolor{citegray}{\detokenize{func: LibRaw_buffer_datastream::read}}}$
+% $\text{\quad\textcolor{black}{\textcolor{purple}{memmove} \detokenize{(ptr, buf + streampos, to_read);}\textcolor{citegray}{\hspace{0.5em}// ptr = dst}}}$
+% \end{lstlisting}
+% \end{figure}
+
+% \begin{figure}[!t]
+% \begin{lstlisting}[caption=\label{lst:moti_oiio}{Downstream revisions of OpenImageIO that alter the exploitability of CVE-2026-24450 (\texttt{src/raw.imageio/rawinput.cpp}).}, language=C, frame=single, style=base, frame=, basicstyle=\fontsize{7.6}{9}\ttfamily\color{black}, deletekeywords={for}, mathescape, breakatwhitespace=true, breaklines=true, aboveskip=0.4em, belowskip=0.4em]
+% $\text{\quad\textcolor{citegray}{\detokenize{func: RawInput::open_raw()}}}$
+% $\text{\quad\textcolor{citegray}{/* \textcolor{purple}{\textbf{S1}}: before f717fc7 */}}$
+% $\text{\quad\textcolor{black}{\detokenize{m_processor->unpack();}}}$
+% $\text{\quad\textcolor{black}{\detokenize{m_processor->imgdata.rawparams.max_raw_memory_mb =}}}$$\text{\hspace{0.3em}\detokenize{config.get_int_attribute("}\textcolor{orange}{\detokenize{raw:max_raw_memory_mb}}", 2048);}$
+% $\text{\quad\textcolor{citegray}{/* \textcolor{purple}{\textbf{S2}}: after f717fc7 */}}$
+% $\text{\quad\textcolor{black}{\detokenize{m_processor->imgdata.rawparams.max_raw_memory_mb =}}}$$\text{\hspace{0.3em}\detokenize{config.get_int_attribute("}\textcolor{orange}{\detokenize{raw:max_raw_memory_mb}}", 2048);}$
+% $\text{\quad\textcolor{black}{\detokenize{m_processor->unpack();}}}$
+% $\text{\quad\textcolor{citegray}{/* \textcolor{purple}{\textbf{S3}}: after b112832 */}}$
+% $\text{\quad\textcolor{black}{\textcolor{purple}{int} \detokenize{maxmem = config.get_int_attribute(}}}$$\text{\hspace{13.3em}\detokenize{"}\textcolor{orange}{\detokenize{raw:max_raw_memory_mb}}", 2048);}$
+% $\text{\quad\textcolor{black}{\detokenize{m_processor->imgdata.rawparams.max_raw_memory_mb =}}}$$\text{\hspace{13.3em}\detokenize{std::min(maxmem, 16383);}}$
+% $\text{\quad\textcolor{black}{\detokenize{m_processor->unpack();}}}$
+% \end{lstlisting}
+% \end{figure}
+
+% In S1, the assignment follows \texttt{unpack()}, so decoding uses the default 2\,048\,MB limit. In S2, the assignment precedes \texttt{unpack()}, allowing a larger attribute value to take effect. In S3, the value is capped at 16\,383\,MB before decoding. Thus, the same call sequence can execute under different runtime states. We assume here that the harness has established S2's permissive limit.
+
+% This example illustrates C3. Even with S2's call sequence and permissive limit, an arbitrary input does not trigger the vulnerability. The input-derived dimensions must satisfy two conditions: the byte size computed in the 64-bit check must remain within the configured limit, while the element-count product passed as the first argument to \texttt{calloc()} must overflow. The limit governs the first condition, whereas the input determines the dimensions and thus the arithmetic results. Because several input-derived fields jointly determine these values, a mutated input is unlikely to satisfy both conditions.

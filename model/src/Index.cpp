@@ -1,5 +1,11 @@
 #include "Model.h"
 
+#include "llvm/ADT/SparseBitVector.h"
+#include "llvm/IR/DebugInfo.h"
+
+#include <deque>
+#include <numeric>
+
 void Model::run(int seqPick, raw_ostream &out) {
     sinks = findSinks();
     if (sinks.empty()) {
@@ -11,9 +17,7 @@ void Model::run(int seqPick, raw_ostream &out) {
     // with or without the staging. Off by default.
     if (const char *e = std::getenv("SP_EAGER_HELD"); e && *e)
       resolveHeld = true;
-    indexFunctions();
-    exports = findExports();
-    buildCallers();
+    index();
     cone = reachSink();
     starts = findStarts();
     out << "starts " << starts.size() << "\n";
@@ -36,6 +40,12 @@ void Model::run(int seqPick, raw_ostream &out) {
       if (solve(path.fn, out))
         return;
     }
+  }
+
+void Model::index() {
+    indexFunctions();
+    exports = findExports();
+    buildCallers();
   }
 
 Function *Model::define(StringRef name) const {
@@ -1127,9 +1137,11 @@ Model::VSlot Model::vslot(CallBase *CB) const {
       obj = OG->getPointerOperand()->stripPointerCasts();
     }
     // A virtual call reads its slot through the vtable pointer of an object
-    // whose source class is polymorphic; a C function pointer field read
-    // through a struct pointer has the same IR shape.
-    if (field < 0 || !source::vptrAt(source::pointee(obj), (uint64_t)field))
+    // whose source class is polymorphic, or of a class the program only
+    // declares; a C function pointer field read through a struct pointer
+    // has the same IR shape.
+    const DIType *cls = source::pointee(obj);
+    if (field < 0 || !(source::vptrAt(cls, (uint64_t)field) || source::foreign(cls)))
       return s;
     s.ok = true;
     s.obj = obj;
@@ -1432,58 +1444,76 @@ std::unordered_set<const BasicBlock *> Model::returnBlocks(Function *F) const {
   }
 
 // §3.10 Res: the least solution of one inclusion system in which function
-// constants and abstract objects flow. A cell is an SSA value, the return of
-// a function, an access path, the contents of an object, or the variadic
-// area. Every constraint is monotone, so a worklist that sends each token
-// along each edge once reaches the least solution.
+// constants flow. A cell is an SSA value, the return of a function, an access
+// path, the contents of a local or global no other pointer reaches, the slot
+// of a source type, or the variadic area. Every constraint is monotone, so a worklist that sends each token
+// along each edge once reaches the least solution. A node sends only the
+// tokens it gained since it last sent (difference propagation), and the
+// cells of a cycle of edges, which the least solution gives one set, are one
+// node (lazy cycle detection, Hardekopf & Lin, PLDI'07): neither changes the
+// solution.
 void Model::buildResolve() {
     using Node = unsigned;
+    using Set = SparseBitVector<>;
     std::vector<std::vector<Node>> succ;
-    std::vector<SmallPtrSet<Value *, 4>> pt;
-    std::vector<std::pair<Node, Value *>> work;
+    std::vector<Set> pt, delta;
+    std::vector<Node> rep;
+    std::vector<char> queued, dirty;
+    std::deque<Node> queue;
+    std::vector<Value *> tokens;
+    DenseMap<Value *, unsigned> tokenId;
     auto fresh = [&]() {
+      Node n = (Node)succ.size();
       succ.emplace_back();
       pt.emplace_back();
-      return (Node)(succ.size() - 1);
+      delta.emplace_back();
+      rep.push_back(n);
+      queued.push_back(0);
+      dirty.push_back(0);
+      return n;
+    };
+    auto find = [&](Node n) {
+      while (rep[n] != n)
+        n = rep[n] = rep[rep[n]];
+      return n;
+    };
+    auto enqueue = [&](Node n) {
+      if (!queued[n]) {
+        queued[n] = 1;
+        queue.push_back(n);
+      }
+    };
+    // The tokens of d that m lacks join m's set and its next sending.
+    auto flow = [&](const Set &d, Node m) {
+      Set nd = d;
+      nd.intersectWithComplement(pt[m]);
+      if (nd.empty())
+        return false;
+      pt[m] |= nd;
+      delta[m] |= nd;
+      enqueue(m);
+      return true;
+    };
+    auto add = [&](Node n, Value *t) {
+      auto [it, added] = tokenId.try_emplace(t, (unsigned)tokens.size());
+      if (added)
+        tokens.push_back(t);
+      n = find(n);
+      if (!pt[n].test(it->second)) {
+        pt[n].set(it->second);
+        delta[n].set(it->second);
+        enqueue(n);
+      }
     };
     auto token = [&](Function *F) {
       Function *B = define(F->getName());
       return B ? B : F;
     };
-    // An object is a local or global whose type can hold a function pointer
-    // (H_mlta: without type punning a data-only object holds none), or the
-    // result of a call to an external function. IR without source type is
-    // treated as able to hold one (C void * slots).
-    std::function<bool(Type *)> holdsIR = [&](Type *T) {
-      if (T->isPointerTy())
-        return true;
-      if (auto *ST = dyn_cast<StructType>(T))
-        return std::any_of(ST->element_begin(), ST->element_end(), holdsIR);
-      if (auto *AT = dyn_cast<ArrayType>(T))
-        return holdsIR(AT->getElementType());
-      return false;
-    };
-    auto object = [&](Value *V) -> Value * {
-      if (auto *A = dyn_cast<AllocaInst>(V)) {
-        if (const DIType *D = source::pointee(A))
-          return source::holdsFn(D) ? V : nullptr;
-        return holdsIR(A->getAllocatedType()) ? V : nullptr;
-      }
-      if (auto *G = dyn_cast<GlobalVariable>(V)) {
-        if (const DIType *D = source::ofGlobal(*G))
-          return source::holdsFn(D) ? V : nullptr;
-        return holdsIR(G->getValueType()) ? V : nullptr;
-      }
-      return nullptr;
-    };
-    // The token a value is: a function, or the object a constant address is in.
+    // The token a value is: the function a constant address denotes.
     auto tokenOf = [&](Value *V) -> Value * {
       V = V->stripPointerCastsAndAliases();
-      while (isa<Constant>(V) && isa<GEPOperator>(V))
-        V = cast<GEPOperator>(V)->getPointerOperand()->stripPointerCastsAndAliases();
-      if (auto *F = dyn_cast<Function>(V))
-        return token(F);
-      return object(V);
+      auto *F = dyn_cast<Function>(V);
+      return F ? token(F) : nullptr;
     };
 
     std::unordered_map<const Value *, Node> valN, elemN;
@@ -1495,7 +1525,7 @@ void Model::buildResolve() {
       if (added) {
         it->second = fresh();
         if (Value *T = tokenOf(V))
-          work.push_back({it->second, T});
+          add(it->second, T);
       }
       return it->second;
     };
@@ -1506,14 +1536,20 @@ void Model::buildResolve() {
       return it->second;
     };
     auto edge = [&](Node a, Node b) {
-      if (a != b)
+      a = find(a);
+      b = find(b);
+      if (a != b) {
         succ[a].push_back(b);
+        dirty[a] = 1;
+      }
     };
+    // An edge added while solving carries what its source already holds.
     auto link = [&](Node a, Node b) {
       edge(a, b);
-      for (Value *t : pt[a])
-        if (!pt[b].count(t))
-          work.push_back({b, t});
+      a = find(a);
+      b = find(b);
+      if (a != b)
+        flow(pt[a], b);
     };
     // A path stored at is read at every path one of whose layers sequences is
     // a suffix of the other's: the same field, named from an outer or an inner
@@ -1713,13 +1749,22 @@ void Model::buildResolve() {
       }
       return s;
     };
-    // An access that names a struct field, by its address or by its tag, is
-    // into the field's cell only.
+    // A TBAA tag names a field when the address carried no layer. It fills
+    // that field into each base the address already names; it does not drop
+    // the object (C11 6.5p7: the tag and the address are one lvalue).
     auto access = [&](const Instruction &I, Value *A) {
       auto at = addrs(A);
       if (std::none_of(at.begin(), at.end(), [](const Addr &a) { return !a.path.empty(); }))
-        if (Suffix s = tbaa(I); !s.empty())
-          return std::vector<Addr>{{std::move(s), nullptr}};
+        if (Suffix s = tbaa(I); !s.empty()) {
+          bool filled = false;
+          for (Addr &a : at)
+            if (a.path.empty() && !a.va) {
+              a.path = s;
+              filled = true;
+            }
+          if (!filled)
+            at.push_back({std::move(s), nullptr});
+        }
       return at;
     };
     std::optional<Node> vaN;
@@ -1728,36 +1773,116 @@ void Model::buildResolve() {
         vaN = fresh();
       return *vaN;
     };
-    // Through a base pointer the object is known only when one reaches it:
-    // the constraint waits at the pointer's cell. A local or global base is
-    // its own object.
-    struct Deref {
-      Node n;
-      bool load;
-      Value *token;
+    // A local or global whose address is used only to load, store, and copy
+    // at it is its own cell (below). Escape analysis feeds that choice.
+    std::unordered_map<const Value *, bool> escaped;
+    std::function<bool(const Value *)> leaks = [&](const Value *A) {
+      for (const User *U : A->users()) {
+        if (auto *L = dyn_cast<LoadInst>(U); L && L->getPointerOperand() == A)
+          continue;
+        if (auto *S = dyn_cast<StoreInst>(U); S && S->getPointerOperand() == A && S->getValueOperand() != A)
+          continue;
+        if (isa<MemIntrinsic>(U) || isa<DbgInfoIntrinsic>(U))
+          continue;
+        if (auto *II = dyn_cast<IntrinsicInst>(U); II && II->isLifetimeStartOrEnd())
+          continue;
+        if (auto *O = dyn_cast<Operator>(U); O && (isa<GEPOperator>(O) || O->getOpcode() == Instruction::BitCast ||
+                                                  O->getOpcode() == Instruction::AddrSpaceCast)) {
+          if (leaks(O))
+            return true;
+          continue;
+        }
+        return true;
+      }
+      return false;
     };
-    std::unordered_map<Node, std::vector<Deref>> derefs;
+    auto own = [&](Value *B) {
+      if (!isa<AllocaInst>(B) && !isa<GlobalVariable>(B))
+        return false;
+      auto [it, added] = escaped.try_emplace(B, false);
+      if (added)
+        it->second = leaks(B);
+      return !it->second;
+    };
+    // Memory carries function tokens only where a function pointer may live
+    // (H_mlta). A local or global no other pointer reaches is its own cell.
+    // Memory any other pointer may reach is the slot its declared type names:
+    // a record's offset-0 field cell, or one cell per other source type. A
+    // location of no source type holds none (no untyped function cell).
+    auto fnType = [&](const DIType *D) -> bool {
+      D = source::bare(D);
+      if (!D)
+        return false;
+      if (isa<DISubroutineType>(D))
+        return true;
+      return source::holdsFn(D);
+    };
     auto elem = [&](Value *O) { return node(elemN, O); };
-    auto known = [](Value *B) { return isa<AllocaInst>(B) || isa<GlobalVariable>(B); };
+    // Non-record locations whose type may hold a function pointer share one
+    // cell. Call sites intersect with Tgt_sig, so tokens of other signatures
+    // do not become targets. DIType pointer identity is not a key: the same
+    // source type from two CUs would otherwise split one list of callbacks.
+    std::optional<Node> codeN;
+    auto code = [&]() {
+      if (!codeN)
+        codeN = fresh();
+      return *codeN;
+    };
+    auto mem = [&](bool store, Value *B) -> std::optional<Node> {
+      const DIType *D = source::bare(source::pointee(B));
+      if (own(B))
+        return fnType(D) ? std::optional<Node>(elem(B)) : std::nullopt;
+      if (!fnType(D))
+        return std::nullopt;
+      if (std::string n = source::name(D); !n.empty())
+        return cell(store, Suffix{Step{n, 0}});
+      return code();
+    };
+    // Each address may name a field path and a base. Function tokens follow
+    // both: the field cell (MLTA) and the base's type slot when the base's
+    // type may hold a function pointer.
     auto writes = [&](const Addr &a, Node src) {
       if (a.va)
         edge(src, va());
-      else if (!a.base)
+      if (!a.path.empty())
         edge(src, cell(true, a.path));
-      else if (known(a.base))
-        edge(src, elem(a.base));
-      else
-        derefs[val(a.base)].push_back({src, false, nullptr});
+      if (a.base)
+        if (auto n = mem(true, a.base))
+          edge(src, *n);
     };
     auto reads = [&](const Addr &a, Node dst) {
       if (a.va)
         edge(va(), dst);
-      else if (!a.base)
+      if (!a.path.empty())
         edge(cell(false, a.path), dst);
-      else if (known(a.base))
-        edge(elem(a.base), dst);
-      else
-        derefs[val(a.base)].push_back({dst, true, nullptr});
+      if (a.base)
+        if (auto n = mem(false, a.base))
+          edge(*n, dst);
+    };
+    // A copy of a whole object moves each of its function slots, and the
+    // type slot of a non-record function-holding type. Between two objects
+    // of one record the slots are the same cells.
+    auto copy = [&](Value *from, Value *to) {
+      const DIType *S = source::pointee(from);
+      const DIType *T = source::pointee(to);
+      std::string sn = S ? source::name(S) : "", tn = T ? source::name(T) : "";
+      if (!sn.empty() && sn == tn)
+        return;
+      auto sf = mem(false, from), st = mem(true, to);
+      bool slots = !sn.empty() || !tn.empty();
+      if (!slots && !(sf && st))
+        return;
+      Node bytes = fresh();
+      if (sf)
+        edge(*sf, bytes);
+      if (!sn.empty())
+        for (const auto &[r, off] : source::fnSlots(S))
+          edge(cell(false, Suffix{Step{r, (int64_t)off}}), bytes);
+      if (st)
+        edge(bytes, *st);
+      if (!tn.empty())
+        for (const auto &[r, off] : source::fnSlots(T))
+          edge(bytes, cell(true, Suffix{Step{r, (int64_t)off}}));
     };
     // A path of the struct-field walk names each field by its offset in its
     // own struct; the offset of the leaf in a layer is the sum from it inward.
@@ -1769,8 +1894,9 @@ void Model::buildResolve() {
       }
       return s;
     };
-    // A constant placed at an address: each token leaf at its path, and
-    // every one of them in the objects of the base.
+    // A constant placed at an address: each token leaf at its path; a leaf
+    // at the address itself, or any leaf of a local or global's own cell,
+    // in the memory of the base.
     auto place = [&](Constant *C, Type *Ty, const DIType *D, const std::vector<Addr> &at) {
       eachLeaf(C, Ty, {}, D, [&](Constant *L, const Suffix &rel) {
         Value *T = tokenOf(L);
@@ -1781,18 +1907,15 @@ void Model::buildResolve() {
         for (const Addr &a : at) {
           if (a.va)
             continue;
-          if (a.base) {
-            if (known(a.base))
-              work.push_back({elem(a.base), T});
-            else
-              derefs[val(a.base)].push_back({0, false, T});
-          }
+          if (a.base && (r.empty() || own(a.base)))
+            if (auto n = mem(true, a.base))
+              add(*n, T);
           Suffix p = a.path;
           for (Step &s : p)
             s.off += d;
           p.insert(p.end(), r.begin(), r.end());
           if (!p.empty())
-            work.push_back({cell(true, p), T});
+            add(cell(true, p), T);
         }
       });
     };
@@ -1838,19 +1961,17 @@ void Model::buildResolve() {
         } else if (auto *Cast = dyn_cast<CastInst>(&I)) {
           if (Cast->getType()->isPointerTy() || Cast->getOperand(0)->getType()->isPointerTy())
             edge(val(Cast->getOperand(0)), val(Cast));
-        } else if (auto *G = dyn_cast<GetElementPtrInst>(&I)) {
-          edge(val(G->getPointerOperand()), val(G));
+        } else if (isa<GetElementPtrInst>(&I)) {
+          // A GEP is an address into an object. It does not hold the functions
+          // a pointer value may point to; those enter by load from a cell.
         } else if (auto *R = dyn_cast<ReturnInst>(&I)) {
           if (Value *V = R->getReturnValue(); V && V->getType()->isPointerTy())
             edge(val(V), node(retN, &F));
         } else if (auto *MT = dyn_cast<MemTransferInst>(&I)) {
-          Node bytes = fresh();
           for (const Addr &s : addrs(MT->getSource()))
-            if (s.base)
-              reads(s, bytes);
-          for (const Addr &d : addrs(MT->getDest()))
-            if (d.base)
-              writes(d, bytes);
+            for (const Addr &d : addrs(MT->getDest()))
+              if (s.base && d.base)
+                copy(s.base, d.base);
         } else if (auto *CB = dyn_cast<CallBase>(&I)) {
           if (isa<IntrinsicInst>(CB) || CB->isInlineAsm())
             continue;
@@ -1859,9 +1980,7 @@ void Model::buildResolve() {
             for (unsigned i = 0; i < CB->arg_size(); ++i)
               if (CB->getArgOperand(i)->getType()->isPointerTy())
                 edge(val(CB->getArgOperand(i)), !B ? val(CB) : i < B->arg_size() ? val(B->getArg(i)) : va());
-            if (!B && CB->getType()->isPointerTy())
-              work.push_back({val(CB), CB});
-            else if (B && CB->getType()->isPointerTy())
+            if (B && CB->getType()->isPointerTy())
               edge(node(retN, B), val(CB));
             continue;
           }
@@ -1879,7 +1998,7 @@ void Model::buildResolve() {
 
     // An indirect call passes its actuals to, and takes the return of, each
     // function of its type the callee comes to hold; an external one returns
-    // one of its pointer actuals or an object of its own.
+    // one of its pointer actuals.
     std::set<std::pair<const CallBase *, const Function *>> wired;
     auto wire = [&](CallBase *CB, Function *T) {
       if (T->getFunctionType() != CB->getFunctionType() || !wired.insert({CB, T}).second)
@@ -1888,39 +2007,129 @@ void Model::buildResolve() {
       for (unsigned i = 0; i < CB->arg_size(); ++i)
         if (CB->getArgOperand(i)->getType()->isPointerTy())
           link(val(CB->getArgOperand(i)), ext ? val(CB) : i < T->arg_size() ? val(T->getArg(i)) : va());
-      if (CB->getType()->isPointerTy()) {
-        if (ext)
-          work.push_back({val(CB), CB});
-        else
-          link(node(retN, T), val(CB));
-      }
+      if (CB->getType()->isPointerTy() && !ext)
+        link(node(retN, T), val(CB));
     };
     for (const auto &[CB, ts] : virtuals)
       for (Function *T : ts)
         wire(CB, T);
-    while (!work.empty()) {
-      auto [n, t] = work.back();
-      work.pop_back();
-      if (!pt[n].insert(t).second)
-        continue;
-      for (size_t i = 0; i < succ[n].size(); ++i)
-        if (!pt[succ[n][i]].count(t))
-          work.push_back({succ[n][i], t});
-      if (auto *F = dyn_cast<Function>(t)) {
-        if (auto it = sitesAt.find(n); it != sitesAt.end())
-          for (CallBase *CB : it->second)
-            wire(CB, F);
-      } else if (auto it = derefs.find(n); it != derefs.end()) {
-        Node e = elem(t);
-        for (const Deref &d : it->second)
-          if (d.token)
-            work.push_back({e, d.token});
-          else if (d.load)
-            link(e, d.n);
-          else
-            link(d.n, e);
+    // The cells of one cycle become node r: their sets, edges, and waiting
+    // calls join, and r sends its whole set again, so that every call
+    // waiting in the cycle meets every token of it.
+    auto merge = [&](const std::vector<Node> &cycle, Node r) {
+      for (Node b : cycle) {
+        if (b == r)
+          continue;
+        rep[b] = r;
+        pt[r] |= pt[b];
+        pt[b].clear();
+        delta[b].clear();
+        succ[r].insert(succ[r].end(), succ[b].begin(), succ[b].end());
+        std::vector<Node>().swap(succ[b]);
+        if (auto h = sitesAt.extract(b))
+          for (CallBase *CB : h.mapped())
+            sitesAt[r].push_back(CB);
       }
+      dirty[r] = 1;
+      delta[r] = pt[r];
+      enqueue(r);
+    };
+    // Tarjan's strongly connected components over the edges reachable from
+    // roots; each component of more than one node is merged.
+    auto collapse = [&](const std::vector<Node> &roots) {
+      std::unordered_map<Node, std::pair<unsigned, unsigned>> num;
+      std::unordered_set<Node> open;
+      std::vector<Node> stack;
+      std::vector<std::pair<Node, size_t>> dfs;
+      auto visit = [&](Node n) {
+        unsigned k = (unsigned)num.size();
+        num[n] = {k, k};
+        stack.push_back(n);
+        open.insert(n);
+        dfs.push_back({n, 0});
+      };
+      for (Node r : roots) {
+        if (num.count(find(r)))
+          continue;
+        visit(find(r));
+        while (!dfs.empty()) {
+          auto &[n, i] = dfs.back();
+          if (i < succ[n].size()) {
+            Node m = find(succ[n][i++]);
+            if (m == n)
+              continue;
+            if (auto it = num.find(m); it == num.end())
+              visit(m);
+            else if (open.count(m))
+              num[n].second = std::min(num[n].second, it->second.first);
+            continue;
+          }
+          Node v = n;
+          dfs.pop_back();
+          auto [k, low] = num[v];
+          if (!dfs.empty()) {
+            unsigned &up = num[dfs.back().first].second;
+            up = std::min(up, low);
+          }
+          if (low != k)
+            continue;
+          std::vector<Node> cycle;
+          Node m;
+          do {
+            m = stack.back();
+            stack.pop_back();
+            open.erase(m);
+            cycle.push_back(m);
+          } while (m != v);
+          if (cycle.size() > 1)
+            merge(cycle, v);
+        }
+      }
+    };
+    {
+      std::vector<Node> all(succ.size());
+      std::iota(all.begin(), all.end(), 0);
+      collapse(all);
     }
+    // A cycle closed while solving shows as an edge whose ends hold equal
+    // sets; each such edge is searched for a cycle once.
+    std::set<std::pair<Node, Node>> checked;
+    while (!queue.empty()) {
+      Node n = queue.front();
+      queue.pop_front();
+      queued[n] = 0;
+      if (find(n) != n || delta[n].empty())
+        continue;
+      Set d = std::move(delta[n]);
+      delta[n].clear();
+      if (dirty[n]) {
+        auto &s = succ[n];
+        for (Node &m : s)
+          m = find(m);
+        llvm::sort(s);
+        s.erase(std::unique(s.begin(), s.end()), s.end());
+        s.erase(std::remove(s.begin(), s.end(), n), s.end());
+        dirty[n] = 0;
+      }
+      std::vector<Node> closes;
+      for (size_t i = 0; i < succ[n].size(); ++i) {
+        Node m = find(succ[n][i]);
+        if (m != n && !flow(d, m) && pt[m] == pt[n] && checked.insert({n, m}).second)
+          closes.push_back(m);
+      }
+      if (auto it = sitesAt.find(n); it != sitesAt.end())
+        for (unsigned id : d)
+          for (CallBase *CB : it->second)
+            wire(CB, cast<Function>(tokens[id]));
+      if (!closes.empty())
+        collapse(closes);
+    }
+    auto members = [&](Node n) {
+      std::vector<Value *> v;
+      for (unsigned id : pt[find(n)])
+        v.push_back(tokens[id]);
+      return v;
+    };
 
     auto defined = [&](const auto &from, FunctionType *T) {
       std::vector<Function *> ts;
@@ -1928,21 +2137,23 @@ void Model::buildResolve() {
         if (auto *f = dyn_cast<Function>(t); f && !f->isDeclaration() && (!T || f->getFunctionType() == T) &&
                                              std::find(ts.begin(), ts.end(), f) == ts.end())
           ts.push_back(f);
-      std::sort(ts.begin(), ts.end(), [](Function *A, Function *B) { return pretty(A->getName()) < pretty(B->getName()); });
+      std::sort(ts.begin(), ts.end(), [](Function *A, Function *B) {
+        return std::make_pair(pretty(A->getName()), A->getName()) < std::make_pair(pretty(B->getName()), B->getName());
+      });
       return ts;
     };
     for (CallBase *CB : sites) {
       auto v = virtuals.find(CB);
       resolved[CB] = v != virtuals.end() ? defined(v->second, CB->getFunctionType())
-                                         : defined(pt[val(CB->getCalledOperand())], CB->getFunctionType());
+                                         : defined(members(val(CB->getCalledOperand())), CB->getFunctionType());
     }
     for (const auto &[V, n] : valN)
       if (auto *A = dyn_cast<Argument>(V))
-        if (auto ts = defined(pt[n], nullptr); !ts.empty())
+        if (auto ts = defined(members(n), nullptr); !ts.empty())
           formalFns[A] = std::move(ts);
     for (const auto &[p, n] : stN) {
       auto &v = fieldFns[{p.back().type, p.back().off}];
-      for (Function *f : defined(pt[n], nullptr))
+      for (Function *f : defined(members(n), nullptr))
         if (std::find(v.begin(), v.end(), f) == v.end())
           v.push_back(f);
     }
@@ -2101,8 +2312,14 @@ std::vector<Model::Path> Model::sequences(int seqPick) {
       if (!got)
         break;
       found.push_back(best);
-      if (best.fn.size() >= 2)
-        banned.insert({best.fn[best.fn.size() - 2], best.fn.back()});
+      // The client chooses only among interface calls, and the search
+      // explores the library below them, so a sequence is told apart from
+      // the others by the hop that leaves the interface.
+      for (size_t k = 1; k < best.fn.size(); ++k)
+        if (std::find(exports.begin(), exports.end(), best.fn[k]) == exports.end() || k + 1 == best.fn.size()) {
+          banned.insert({best.fn[k - 1], best.fn[k]});
+          break;
+        }
     }
     return found;
   }

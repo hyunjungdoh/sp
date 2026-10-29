@@ -1,10 +1,11 @@
 \section{Design of \sys}
 \label{sec:design}
 
-In this section, we describe the design of \sys, which assesses vulnerability exploitability through downstream applications by recovering the calls and runtime state needed to trigger vulnerable behavior and finding inputs that trigger it.
+In this section, we describe the design of \sys, which assesses vulnerability exploitability through downstream applications by recovering a client-visible walk to the sink, establishing the configuration context that walk demands, and searching for a data context that triggers the sink under that configuration (\autoref{sec:moti}).
 
 \PP{Overview.}
-\autoref{fig:overview} shows the workflow of \sys, which consists of three phases: \textit{trigger path recovery} (P1), \textit{harness generation} (P2), and \textit{concolic execution} (P3).
+\autoref{fig:overview} shows the workflow of \sys, which consists of three phases.
+P1 recovers a trigger path, P2 generates a harness, and P3 performs concolic execution.
 
 \begin{figure}[t]
 \centering
@@ -13,124 +14,277 @@ In this section, we describe the design of \sys, which assesses vulnerability ex
 \label{fig:overview}
 \end{figure}
 
-In P1, \sys recovers a call sequence from a public API of the downstream application to the vulnerable code in the upstream library, along with the conditions required to reach it.
-In P2, \sys generates a harness that invokes the downstream application's public APIs in the recovered sequence and establishes the required arguments and runtime state.
-Together, P1 and P2 recover how the downstream application can reach the vulnerable code and prepare the state needed to trigger it.
-In P3, \sys performs concolic execution on the generated harness to find inputs that trigger the vulnerability.
+In P1, \sys analyzes which call sequences from a public API of the downstream application can reach the vulnerable code in the upstream library, and which conditions on the configuration and data contexts those sequences require.
+In P2, \sys builds a harness that invokes the recovered API sequence and establishes the configuration context those conditions demand, while exposing a channel through which a data context can enter.
+In P3, \sys searches that channel for a concrete data context that triggers the vulnerability under the established configuration.
 
 
 \subsection{Recovering Trigger Path (P1)}
 \label{subsec:p1}
 
-The goal of P1 is to recover how a client of the downstream application $D$ can reach a sink $s$ in the upstream library $U$.
+The goal of P1 is to recover a \emph{client-visible} trigger path to sink $s$ in upstream $U$ through downstream $D$ alone.
+Unlike whole-program reachability from an arbitrary root, the path must be one that a real client of $D$ can start, so that later phases can turn it into a harness, install a configuration context, and search for a data context.
 A client never calls $U$ by name.
-It may invoke only $D$'s interface $I$---the functions that $D$ both exports and declares in its headers---and control reaches $U$ only after $D$ has installed the callees that cross the boundary.
-What P1 recovers is therefore a \emph{trigger path}: a call sequence
-\[
-\pi = f_0 \rightarrow f_1 \rightarrow \cdots \rightarrow f_n
-\]
-together with a path condition $\varphi$ under which that sequence can run.
-Here $f_0 \in I$, each step $f_i \rightarrow f_{i+1}$ is a resolved call, and $f_n$ contains $s$.
-P2 establishes $\varphi$ through $D$'s APIs, and P3 searches for concrete bytes on the harness that P2 builds.
-P1 itself is a \emph{may} analysis: a retained $(\pi, \varphi)$ is a candidate that install-resolved edges and a satisfiable condition at $f_0$ make plausible, not a proof that some client execution reaches $s$.
-Spurious candidates are discarded when P2 cannot establish $\varphi$ or when P3 finds no concrete witness.
+It may invoke only the interface $I$ of $D$, the symbols that $D$ both exports and declares in its headers.
+Reaching $s$ therefore requires a walk that begins in $I$, proceeds through $D$, and crosses into $U$.
+That crossing is often cross-boundary indirection.
+$D$ registers a callback by storing a function pointer during setup, and a later indirect call loads that pointer into code that frequently resides in $U$.
+\sys must recover which export in $I$ to start from, which store-to-load links to follow across the boundary, and which conditions make the walk feasible.
 
-Tracking $\pi$ takes three analyses.
-The call graph must expose the steps $f_i \rightarrow f_{i+1}$, including indirect ones.
-The start $f_0$ must be a client-visible root in $I$.
-The sequence must then survive a check that $\varphi$ is satisfiable at $f_0$.
-Indirect calls dominate the $D$--$U$ boundary, so a graph of direct edges alone misses real steps, while signature matching invents steps that no install wrote.
-Even on a careful graph, $\pi$ may still be unrealizable because of branches or missing installs.
-P1 answers the first issue with field-sensitive points-to analysis of function-pointer installs, and the second by solving $\varphi$ at $f_0$.
+\PP{Phase overview}
+Given closed LLVM bitcode for $D$ linked with $U$ and the source location of $s$, \sys uses three techniques.
+They are (1) cross-boundary call resolution, (2) boundary entry selection, and (3) path enumeration with feasibility checking.
+First, it builds a call graph $G$ over $D \cup U$ by connecting callback stores in $D$ to indirect loads that may enter $U$.
+Second, it selects a boundary entry set $B_{\mathrm{entry}} \subseteq I$ of candidate starts on $G$.
+Third, it enumerates paths $\pi = f_0 \rightarrow \cdots \rightarrow f_n$ from $B_{\mathrm{entry}}$ to a function containing $s$, forms $\varphi = \varphi_{\mathrm{control}} \land \varphi_{\mathrm{dispatch}}$, and retains $(\pi, \varphi)$ when $\mathrm{SAT}(\varphi|_{f_0})$ holds.
+$\varphi_{\mathrm{control}}$ captures branch decisions along the walk, and $\varphi_{\mathrm{dispatch}}$ captures the requirement that each indirect step load the next function in $\pi$.
+Projected onto the arguments and fields of $f_0$, $\varphi$ states which configuration- and data-dependent values the walk assumes at entry.
+Retained pairs are may results for later phases to discharge.
 
-The input is closed LLVM bitcode for $D$ linked with $U$, plus the source location of $s$, mapped to an IR instruction by debug information.
-$I$ is the intersection of dynamically exported symbols and header-declared names.
-
-\PP{Phase overview.}
-P1 recovers $\pi$ in order.
-Call-target resolution builds the edges $f \rightarrow g$ of the call graph~(\autoref{subsubsec:resolve}).
-Entry extraction chooses admissible starts $f_0$~(\autoref{subsubsec:entries}).
-Path enumeration extends $f_0$ toward $s$ into a full sequence and retains $(\pi, \varphi)$ when $\varphi$ is satisfiable at $f_0$~(\autoref{subsubsec:enumerate}).
-The resolved edges are reused by P2 and P3, so later phases do not re-analyze calls.
-
-\subsubsection{Resolving Call Targets}
+\PP{Cross-boundary call resolution}
 \label{subsubsec:resolve}
+Direct calls contribute a single edge to $G$.
+Indirect calls do not name their callee, and on the $D$--$U$ boundary that callee is usually a callback registered by $D$.
+The key challenge is therefore to recover cross-boundary indirection by linking a callback store in $D$ to the later load that may enter $U$, without inventing edges to handlers $D$ never registered.
+\sys addresses this with a field-sensitive, flow-insensitive points-to analysis restricted to function pointers.
+Keeping each callback field as a separate location ensures that a store into one field cannot be read as a store into another.
+When optimized IR obscures field identity behind byte offsets, \sys consults TBAA metadata on the access to preserve that separation.
+At each ordinary indirect site, only type-compatible functions in the points-to set of the loaded location become edges.
+An empty set yields no edge.
+Virtual calls are handled as a separate case of dynamic dispatch.
+\sys over-approximates their targets to matching vtable methods of classes derived from the receiver's static type.
 
-The first analysis recovers the steps of $\pi$: for every call site in a function $f$, which callees $g$ that site may enter, so that each consecutive pair in $\pi$ is an edge $f \rightarrow g$ on the call graph.
-Direct calls name $g$ in the IR and contribute that edge immediately.
-Indirect calls do not: they load a location and jump to the function constant stored there.
-Downstream code often reaches upstream code through exactly those sites---a setup path stores a handler into an object field, and a later path loads that field---so the possible $g$'s are what this analysis must compute.
-Ignoring the site drops a real step of $\pi$.
-Filling it with every address-taken function of matching type invents steps that no store created.
-P1 therefore computes $g$ from pointer installs.
-
-\PP{Points-to analysis of function-pointer installs.}
-P1 runs a field-sensitive, flow-insensitive points-to analysis restricted to function pointers~\cite{lu2019where,cheng2000access}.
-It tracks each function constant $g$ defined in $D \cup U$ through the abstract locations that may hold it.
-A location $\ell$ is a root (a global, an argument, or a heap object keyed by allocation site) refined by an access path of struct-field indices and constant offsets when the layout is known---so a store into one field never updates another---and the same paths are recovered from TBAA tags when IR uses byte GEPs.
-Flow insensitivity means one tracked set per $\ell$ for the whole module: every IR transfer that moves a function pointer updates that set, and the analysis keeps the least fixed point of those updates.
-
-Tracking begins at stores of a function constant: if $g$ is written into $\ell$, $g$ is tracked at $\ell$.
-A cast, phi, select, or GEP from $u$ to $v$ carries every tracked $g$ at $u$ over to $v$.
-A store of a pointer into address $a$ carries the tracked set into every cell of $a$, and a load carries those cells' sets into the loaded value; tokens also move between a field path and every suffix of that path, so the same field is shared under outer and inner addressing.
-At a call, tracked values move from actuals into formals of every type-compatible callee already tracked at the callee operand, and from that callee's return into the call result; as the operand's tracked set grows, new callees are admitted until the fixed point.
-
-At a non-virtual indirect call in $f$, P1 reads the tracked set of the loaded location and keeps every $g$ from $D \cup U$ whose type matches the call.
-Each such $g$ becomes an edge $f \rightarrow g$.
-If nothing is tracked there, the site contributes no library edge: P1 does not invent steps from signature matches alone.
-
-Virtual calls are not resolved by the same tracking.
-Untyped object contents erase field offsets, so a vptr cannot share that cell with ordinary data without merging unrelated values.
-P1 therefore takes vtable methods of classes derived from the receiver's static type (from debug inheritance) and retains those that match the call type.
-
-\PP{Completing the call-graph edges.}
-The tracked installs above recover stores performed inside $D$ and $U$.
-The same loaded location may still receive a function pointer from outside the closed bitcode---a client callback or a runtime hook---so P1 also records those external callees and treats an edge that exists only that way as an obligation for the harness or the environment.
-The edges used when extending $\pi$ are the tracked callees together with those external ones, restricted to address-taken functions of matching type.
-P2 and P3 read this same edge relation and do not re-resolve calls.
-
-\subsubsection{Selecting Entry Points}
+\PP{Boundary entry selection}
 \label{subsubsec:entries}
+Edges alone do not determine where a client may begin.
+Every start must lie in $I$ and reach $s$, yet an export in the reachability cone $R(s)$ may do so only because another interface function already called it.
+Starting there would place the client in the middle of $D$'s own call chain.
+\sys therefore keeps only cone roots
+\[
+B_{\mathrm{entry}} = \{ f \in I \cap R(s) \mid \nexists\, c.\ (c \rightarrow f) \in G \land c \in R(s) \},
+\]
+and begins every retained path at some $f_0 \in B_{\mathrm{entry}}$.
 
-The call graph supplies possible steps $f_i \rightarrow f_{i+1}$, but not yet the first function $f_0$ of $\pi$.
-P1 next chooses that start.
-
-It performs a reverse reachability search from the function that contains $s$, walking edges backward, and obtains the cone of every function that can reach $s$.
-Intersecting the cone with $I$ yields the exports that can appear on some path to the sink.
-Some of those exports appear in the cone only because another interface function already called them.
-They can be an $f_i$ for $i>0$, but not $f_0$: treating them as starts would force the harness to invent a prefix that $\pi$ never records.
-P1 therefore keeps only cone roots inside $I$---functions $f_0 \in I$ that reach $s$ and have no caller inside the cone.
-Every retained $\pi$ begins at such an $f_0$.
-
-\subsubsection{Enumerating Feasible Paths}
+\PP{Path enumeration and feasibility}
 \label{subsubsec:enumerate}
-
-P1 finally builds full sequences $\pi = f_0 \rightarrow \cdots \rightarrow f_n$ on the call graph, where $f_n$ contains $s$.
-From each admissible $f_0$ it searches for simple paths to $f_n$, ranking candidates by fewer indirect edges and then by shorter length.
-After a path is accepted, its last edge into $f_n$ is banned and the search resumes, so later paths enter the sink at a different call site.
-
-A path returned by this search is still only a syntactic $\pi$.
-Inside some $f_i$, branches may refuse the route to the call of $f_{i+1}$, and an indirect step $f_i \rightarrow f_{i+1}$ succeeds only when the loaded location already holds $f_{i+1}$.
-P1 therefore materializes a path condition $\varphi$ for each candidate and retains $(\pi, \varphi)$ only when a solver finds a model at $f_0$.
-
-\PP{Forming and checking the path condition.}
-For a candidate $\pi$, P1 builds the intraprocedural CFG of each $f_i$, collects the basic blocks that can reach the call to $f_{i+1}$ (or the sink instruction when $i=n$), and selects one short route from $f_i$'s entry across that slice.
-Branch predicates on those routes become control constraints.
-Each indirect step $f_i \rightarrow f_{i+1}$ contributes a dispatch constraint that the loaded location holds $f_{i+1}$.
-$\varphi$ is the conjunction of those control and dispatch constraints.
-P1 asks an SMT solver for a model of $\varphi$ over the arguments and fields of $f_0$, following stores into locals and summarizing callees that only write constant offsets into export-visible objects.
-If $\varphi$ is satisfiable at $f_0$, P1 retains $(\pi, \varphi)$ for P2 and P3.
-Otherwise the candidate is discarded, while another route through the same functions may still succeed.
-
-\PP{Output of P1.}
-P1 emits the retained pairs $(\pi, \varphi)$ and the resolved call-graph edges.
-If nothing is retained, no sequence $f_0 \rightarrow \cdots \rightarrow f_n$ with $f_0 \in I$ explains how a client of $D$ reaches $s$.
-A non-empty result is still only a may set of trigger paths for P2 and P3 to discharge.
+Even with $G$ and $B_{\mathrm{entry}}$, a path name is not yet an executable walk.
+Intraprocedural branches may divert control from the next call in $\pi$, and an indirect step succeeds only when the loaded location holds that next function.
+\sys therefore enumerates simple paths from each $f_0 \in B_{\mathrm{entry}}$ to the sink, favoring fewer indirect edges and then shorter length, and builds $\varphi$ on the intraprocedural routes along each candidate.
+To keep those routes consistent across functions, it selects them backward from the sink under suffix needs propagated from later steps, then projects $\varphi$ onto the arguments and fields of $f_0$ and checks $\mathrm{SAT}(\varphi|_{f_0})$.
+A retained $(\pi, \varphi)$ is a may witness that those edges and conditions are jointly consistent at the entry.
+Harness generation must still establish the corresponding configuration context, and concolic execution must still find a concrete data context.
 
 
 \subsection{Generating Harness (P2)}
 \label{subsec:p2}
 
+The goal of P2 is to turn each retained may witness $(\pi, \varphi)$ from P1 into a
+\emph{client harness}: a program that calls only the interface $I$ of $D$, establishes
+the configuration context $\varphi$ demands before the entry of $\pi$, and exposes a
+channel through which a data context can enter.
+A path name alone is not enough.
+The walk that P1 recovered assumes concrete values at particular memory cells---option
+fields and API arguments of the configuration context, and bytes that a loader reads as
+the data context.
+If the harness calls the entry without that configuration, the walk diverges even though
+$\mathrm{SAT}(\varphi|_{f_0})$ held at the may layer.
+If it never opens a channel for data, no later search can deliver a triggering payload.
+Conversely, if the harness invents calls or values no real client of $D$ can make, a
+later reach of $s$ would not be evidence of exploitability.
+P2 therefore answers, for every cell of $\varphi$, \emph{who} may determine its value
+and \emph{how} a client of $I$ can bring that value about---as configuration to install,
+or as data to leave open for P3.
+
+\PP{Phase overview.}
+Given the may witnesses of P1, the shared call relation of~\autoref{subsubsec:resolve},
+and the closed bitcode of $D \cup U$, \sys builds one harness per case with four
+techniques.
+They are (1)~authorship of context values, (2)~obligation realization,
+(3)~choice ordering, and (4)~forced emission.
+First, it partitions every on-path location by the agent that determines its value,
+refining the data/configuration distinction of~\autoref{sec:moti} into four disjoint
+layers $\Lambda_0,\ldots,\Lambda_3$.
+Second, for each obligation cell it selects the first sound realization among Own,
+Lever, Key, Write, Construct, and File, rejecting a witness only when some cell remains
+Open.
+Third, it orders producers and dependence calls so that the seed path---every choice
+taken as~0---installs data-derived state before entry whenever $\varphi$ requires it.
+Fourth, it emits a program in a fixed client grammar whose every path is a real client
+execution of $I$, forces configuration cells by selecting satisfying values, and leaves
+data cells bound to a named input channel for P3.
+
+\PP{Authorship of context values.}
+\label{subsubsec:authorship}
+The cells of $\varphi$ are not all alike.
+Some are arguments and option fields the client itself chooses (configuration context);
+some are fields that only an interface call can fill from those choices; some arise only
+after a loader has read the data context; and some are constants the library writes
+internally.
+Treating them uniformly either over-constrains the harness (assuming library-owned
+fields as if the client wrote them) or under-establishes it (skipping the loader that
+alone materializes data-derived state).
+\sys therefore classifies every on-path value by its \emph{author}---the agent that
+determines the value---into four layers that refine~\autoref{sec:moti}:
+
+\begin{itemize}
+\item $\Lambda_0$ (\emph{client configuration}): locations in the client's own memory
+  and arguments.
+  The client writes them directly as part of the configuration context.
+\item $\Lambda_1$ (\emph{argument-mediated configuration}): fields inside a held object
+  that an interface call sets from a client argument, a constant key, or a writer.
+  These too belong to the configuration context, but only via a call of $I$.
+\item $\Lambda_2$ (\emph{data-derived state}): fields inside a held object that a call
+  computes from the data context.
+\item $\Lambda_3$ (\emph{internal state}): constants and library-local computation that
+  neither configuration arguments nor the data context reach.
+\end{itemize}
+
+Thus $\Lambda_0 \cup \Lambda_1$ are how the harness \emph{installs} configuration;
+$\Lambda_2$ is how the data context \emph{enters} held state; and $\Lambda_3$ is state
+the library must already have written, which the harness does not invent.
+The layers are disjoint, and each maps to exactly one family of realizations below.
+Authorship also governs which fields of a held object the client may overwrite.
+A field of a held object is Own only when no producer of that object stores a
+non-constant value to it; otherwise the field belongs to $\Lambda_1$ or $\Lambda_2$,
+and writing it from the client would erase configuration or data-derived state the
+library just established.
+That refinement is what keeps a font loaded from memory from having its glyph count
+zeroed before the FreeType path, and what still lets ImageMagick's \texttt{ImageInfo}
+configuration fields remain Own when their producer stores only constants.
+
+Not every $\Lambda_2$ obligation appears as a cell of $\varphi$.
+Opaque C++ containers often carry data-derived state that later producers need, yet
+expose no field that P1 projected.
+In that case authorship follows the call that introduces the object: a context yields a
+track only after a loader has populated it from the data context, so the missing state
+is $\Lambda_2$ even when $\varphi$ is empty.
+
+\PP{Input channel for the data context.}
+\label{subsubsec:channel}
+$\Lambda_2$ state enters the program only through calls that accept the data context.
+\sys names that acceptance the \emph{input channel} $\lambda(F)$ of a function $F$:
+
+\begin{itemize}
+\item \emph{Passed}, when a formal of $F$ carries a byte sequence bounded by a length
+  formal, or a callback whose type takes such a pair;
+\item \emph{Named}, when the closure of $F$ opens or reads an environment file;
+\item \emph{None}, otherwise.
+\end{itemize}
+
+Wider element arrays (identifiers, integers) are lists of configuration values, not
+encodings of the data context, because serialization formats are defined over bytes.
+Under a closed world that admits only harness data objects and the environment file as
+carriers of the data context, every $\Lambda_2$ location inside a held object arises
+only from a call $W$ with $\lambda(W) \neq \mathrm{None}$ that receives that object
+(or an object that reaches it).
+Passed channels need no file-system model---the harness hands the bytes directly---and
+therefore precede Named channels when choices are ordered.
+Channels the environment cannot model (for example C++ file streams) remain
+$\mathrm{None}$ and never pretend to install $\Lambda_2$ state.
+
+\PP{Obligation realization.}
+\label{subsubsec:realize}
+P1's $\varphi$ projects onto cells at the entry $E$ of $\pi$.
+A cell is an \emph{obligation} when the client must establish it: it is not a
+cross-boundary artifact that another phase discharges, or it is a boundary or prefix
+cell, or it is Own.
+Realization $\rho(c)$ is the first of the following that applies to an obligation
+$c$; a witness \emph{passes} only when every obligation has $\rho(c) \neq
+\mathrm{Open}$.
+
+\begin{enumerate}
+\item \emph{Own} ($\Lambda_0$): the client writes a configuration value that satisfies
+  $\varphi_c$.
+\item \emph{Lever} ($\Lambda_1$): a producer argument flows to $c$, so choosing that
+  argument among the satisfying values sets $c$ as configuration.
+\item \emph{Key} ($\Lambda_1$): a constant-tagged setter from the may layer covers
+  $c$ without refuting other obligations on every return path.
+\item \emph{Write} ($\Lambda_1$): a greedy cover of at most $K$ interface writers,
+  each carrying a value into $c$, covers $c$.
+\item \emph{Construct} ($\Lambda_3$): every non-copy store to $c$'s field is a
+  constant that satisfies $\varphi_c$, and the same may analysis that produced
+  $\pi$ finds a feasible sequence to at least one such store whose own plan passes.
+\item \emph{File} ($\Lambda_2$): a boundary or prefix cell is written with a
+  non-constant while an entry, producer, or dependence call with $\lambda \neq
+  \mathrm{None}$ reads the data context.
+\item \emph{Open}: none of the above; the witness is rejected for harness generation.
+\end{enumerate}
+
+Own through Write realize configuration context: Own and Lever add no call---they only
+constrain values already present in the grammar---while Key adds one constant-tagged
+call and Write adds up to $K$ symbolic writer slots.
+Construct and File are inferences used only when those direct means are absent:
+Construct asks whether the library itself must have written a satisfying constant
+before entry, and File asks whether the data context is the remaining source.
+A must-summary of each candidate Key or Write call removes any call that, on every
+return path, last-stores a constant that contradicts another obligation; exclusion-only
+Keys yield to File when both apply, so a file-established compression scheme is not
+overwritten by a setter that merely forbids one value.
+The plan of a case is the union of the passing witnesses: their entries, Own
+configurations, levers, keyed setters, writer covers, and the producer/dependence
+closures of every handle those calls require.
+
+\PP{Choice ordering.}
+\label{subsubsec:order}
+The harness grammar admits many producers and dependence calls for the same handle.
+Their order does not change the set of client executions---hence does not affect the
+soundness claims of later phases---but it alone determines the \emph{seed path} on
+which every choice is~0.
+That path is the first concrete execution P3 will follow, and the first place at which
+a data context binds to a data object.
+If choice~0 never invokes a loader, no data context ever attaches, and $\Lambda_2$
+state stays empty no matter how the search later mutates bytes.
+\sys therefore orders every OR in the grammar by authorship and cost:
+
+\begin{itemize}
+\item producers by $(\lambda(P),\,\mathrm{cost}(P),\,\mathrm{free}(P),\,\mathrm{name})$;
+\item dependence calls by
+  $(\lambda(W),\,-\mathrm{meet}(W,P),\,\mathrm{cost}(W),\,\mathrm{free}(W),\,\mathrm{name})$,
+  with skip placed before the first alternative whose channel is $\mathrm{None}$.
+\end{itemize}
+
+Here $\mathrm{free}(P)$ counts formals that are neither held handles nor outputs, and
+$\mathrm{meet}(W,P)$ counts the persistent fields that $P$'s branches read and that
+$W$'s inner closure writes.
+Loaders ($\lambda \neq \mathrm{None}$) therefore precede non-loaders; among loaders,
+Passed precedes Named; among those, the call that writes more of what the producer
+later reads comes first; and among equals, fewer free formals win, so the seed path
+depends on held state rather than on unconstrained symbolic arguments.
+Dependences are exactly the field-modifier closure of each producer; \sys does not
+pad that set with every opaque-container peer, because the modifier search already
+recovers the loaders that install $\Lambda_2$ state from the data context.
+
+\PP{Forced emission.}
+\label{subsubsec:emit}
+The harness is a client program in a fixed grammar
+\[
+\mathcal{H} ::= (\mathrm{skip}\mid w)^{K}\cdot
+  (\kappa_1\mid\mathrm{skip})\cdots(\kappa_m\mid\mathrm{skip})\cdot\mathrm{entry},
+\]
+with writers $w$ and keyed setters $\kappa_i$ taken from the plan, and with every
+handle built by the producer/dependence AND--OR of its type.
+Every path of $\mathcal{H}$ is an interface-only client execution, so a later reach of
+$s$ is a genuine client reach.
+Keys and writers remain optional: realizing $c$ by $\kappa$ means that calling
+$\kappa$ \emph{can} establish $c$, not that every feasible client must call it; a
+mandatory key would delete the file-only triggers that real clients use.
+Before entry, Own and other configuration cells are not assumed.
+The harness \emph{selects} a symbolic value inside $\{x \mid \varphi_c(x)\}$, so the
+seed path already satisfies the configuration context and does not wait on a flip that
+competes with thousands of producer and parser flips.
+Library-side guards---obligations the entry cannot change---are assumed; a path that
+falsifies them ends silently, because that path is simply not a client of that
+witness.
+The emitted bitcode names each Passed byte buffer together with its length formal so
+that P3 can bind a candidate data context to both at first use.
+What remains for P3 is therefore only to search $\mathcal{H}$ for a concrete data
+context that drives the seed path---or a bounded flip of it---through $s$ under the
+configuration the harness has already installed.
+
 
 \subsection{Concolic Execution (P3)}
 \label{subsec:p3}
+
+\PP{Engine Scheduling}
+% TODO: refine scheduling so a seeded state yields after a fixed execution budget
+% (definition-level change; see DESIGN-D §6 O1).

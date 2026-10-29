@@ -128,6 +128,8 @@ cl::opt<bool> SingleObjectResolution(
     cl::desc("Try to resolve memory reads/writes to single objects "
              "when offsets are symbolic (default=false)"),
     cl::init(false), cl::cat(MiscCat));
+
+extern cl::opt<unsigned> BatchInstructions;
 } // namespace klee
 
 namespace {
@@ -1593,8 +1595,7 @@ ref<klee::ConstantExpr> Executor::getValueFromSeeds(ExecutionState &state,
   if (found == seedMap.end())
     return nullptr;
 
-  auto seeds = found->second;
-  for (auto const &seed : seeds) {
+  for (auto const &seed : found->second) {
     auto value = seed.assignment.evaluate(e);
     if (isa<ConstantExpr>(value))
       return value;
@@ -1714,25 +1715,42 @@ int Executor::seedsDecide(ExecutionState &state, ref<Expr> condition) {
   return (t && f) ? 2 : (t ? 1 : 0);
 }
 
+/// The fate of a path that got no input from solveInput's result r. No model
+/// proves it infeasible only if no value of the path was fixed, since a fixed
+/// value may be what refutes it.
+static const char *unsolvedFate(int r, bool concretized) {
+  return r < 0         ? "open:solver-gave-up"
+         : concretized ? "open:infeasible-after-concretization"
+                       : "infeasible";
+}
+
 int Executor::solveInput(ExecutionState &state,
                          std::vector<const Array *> &objects,
                          std::vector<std::vector<unsigned char>> &values) {
-  for (auto &c : state.constraints) // rewritten to false: no solver needed
+  for (auto &s : state.symbolics)
+    objects.push_back(s.second);
+  return solveInput(state.constraints, objects, state.parentInput.get(),
+                    state.queryMetaData, values);
+}
+
+int Executor::solveInput(const ConstraintSet &path,
+                         const std::vector<const Array *> &objects,
+                         const Assignment *parent, SolverQueryMetaData &meta,
+                         std::vector<std::vector<unsigned char>> &values) {
+  for (auto &c : path) // rewritten to false: no solver needed
     if (ConstantExpr *CE = dyn_cast<ConstantExpr>(c))
       if (CE->isFalse())
         return 0;
-  for (auto &s : state.symbolics)
-    objects.push_back(s.second);
   bool hasSolution = false;
   solver->setTimeout(coreSolverTimeout);
-  bool decided = solver->getInitialValues(state.constraints, objects, values,
-                                          state.queryMetaData, hasSolution);
+  bool decided =
+      solver->getInitialValues(path, objects, values, meta, hasSolution);
   solver->setTimeout(time::Span());
   if (!decided)
     return -1;
   if (!hasSolution)
     return 0;
-  if (!state.parentInput)
+  if (!parent)
     return 1;
   // The constraints read only some bytes; the model fixes those, and every
   // other byte keeps the parent's value, which is then also a model.
@@ -1745,7 +1763,7 @@ int Executor::solveInput(ExecutionState &state,
     if (!isa<ConstantExpr>(e) && visited.insert(e).second)
       stack.push_back(e);
   };
-  for (auto &c : state.constraints)
+  for (auto &c : path)
     push(c);
   while (!stack.empty()) {
     ref<Expr> top = stack.back();
@@ -1776,8 +1794,8 @@ int Executor::solveInput(ExecutionState &state,
     const Array *a = objects[k];
     if (whole.count(a))
       continue;
-    auto p = state.parentInput->bindings.find(a);
-    if (p == state.parentInput->bindings.end() || p->second.size() != a->size)
+    auto p = parent->bindings.find(a);
+    if (p == parent->bindings.end() || p->second.size() != a->size)
       continue;
     auto r = read.find(a);
     for (unsigned i = 0; i < a->size; ++i)
@@ -1796,11 +1814,7 @@ bool Executor::ensureSeed(ExecutionState &state) {
   int r = solveInput(state, objects, values);
   state.parentInput.reset();
   if (r <= 0) {
-    // No model: proven infeasible only if no value of the path was fixed,
-    // since a fixed value may be what refutes it.
-    state.fate = r < 0 ? "open:solver-gave-up"
-                 : state.concretized ? "open:infeasible-after-concretization"
-                                     : "infeasible";
+    state.fate = unsolvedFate(r, state.concretized);
     return false;
   }
   ++ledger.fates["solved"];
@@ -1916,9 +1930,11 @@ std::pair<unsigned, uint64_t> Executor::orderKey(ExecutionState &state) {
 }
 
 ExecutionState *Executor::selectConcolic() {
-  if (running && !running->pendingSeed)
+  if (running && !running->pendingSeed &&
+      stats::instructions - runningSince < BatchInstructions)
     return running;
   running = nullptr;
+  runningSince = stats::instructions;
   std::tuple<unsigned, uint64_t, std::uint32_t> best{~0U, ~0ULL, ~0U};
   for (ExecutionState *s : states) {
     auto [gen, g] = orderKey(*s);
@@ -1928,6 +1944,12 @@ ExecutionState *Executor::selectConcolic() {
       running = s;
     }
   }
+  // A deferred input is a state of the same order kept outside memory: it
+  // runs when its key is the least and there is room for it.
+  if (!deferred.empty() && states.size() < ConcolicPending &&
+      (!running ||
+       deferred.front().key < std::make_pair(std::get<0>(best), std::get<1>(best))))
+    running = nullptr;
   return running;
 }
 
@@ -2033,70 +2055,66 @@ void Executor::prunePending() {
 void Executor::defer(ExecutionState &state) {
   if (dropUnreachable(&state))
     return;
-  // The inputs of the state: its seeds, or the model of its path.
-  std::vector<std::vector<std::vector<unsigned char>>> inputs;
-  if (state.pendingSeed) {
-    std::vector<const Array *> objects;
-    std::vector<std::vector<unsigned char>> values;
-    int r = solveInput(state, objects, values);
-    if (r <= 0) {
-      state.fate = r < 0 ? "open:solver-gave-up"
-                   : state.concretized ? "open:infeasible-after-concretization"
-                                       : "infeasible";
-      terminateStateEarlyAlgorithm(state, "concolic: flip has no input",
-                                   StateTerminationType::Replay);
-      return;
-    }
-    inputs.push_back(std::move(values));
-  } else {
-    auto it = seedMap.find(&state);
-    if (it != seedMap.end())
-      for (SeedInfo &si : it->second) {
-        std::vector<std::vector<unsigned char>> values;
-        for (auto &s : state.symbolics) {
-          auto b = si.assignment.bindings.find(s.second);
-          values.push_back(b != si.assignment.bindings.end()
-                               ? b->second
-                               : std::vector<unsigned char>(s.second->size, 0));
-        }
-        inputs.push_back(std::move(values));
-      }
-  }
   Deferred entry{orderKey(state), std::max(state.floor, state.decisions), {},
                  state.fixed};
-  for (auto &values : inputs) {
-    KTest *kt = new KTest();
-    kt->version = kTest_getCurrentVersion();
-    kt->numObjects = state.symbolics.size();
-    kt->objects = new KTestObject[kt->numObjects];
-    for (unsigned i = 0; i < kt->numObjects; ++i) {
-      const std::string &name = state.symbolics[i].first->name;
-      kt->objects[i].name = new char[name.size() + 1];
-      std::memcpy(kt->objects[i].name, name.c_str(), name.size() + 1);
-      kt->objects[i].numBytes = values[i].size();
-      kt->objects[i].bytes = new unsigned char[values[i].size()];
-      std::memcpy(kt->objects[i].bytes, values[i].data(), values[i].size());
-    }
-    deferredInputs.emplace_back(kt, [](KTest *k) {
-      for (unsigned i = 0; i < k->numObjects; ++i) {
-        delete[] k->objects[i].name;
-        delete[] k->objects[i].bytes;
+  for (auto &s : state.symbolics)
+    entry.names.push_back(s.first->name);
+  if (state.pendingSeed) {
+    // A pending flip keeps its path, not a model: it is solved only when it
+    // runs (O2), as it would have been had it stayed.
+    entry.path = state.constraints;
+    entry.parent = state.parentInput;
+    entry.concretized = state.concretized;
+    for (auto &s : state.symbolics)
+      entry.objects.push_back(s.second);
+  } else if (auto it = seedMap.find(&state); it != seedMap.end()) {
+    for (SeedInfo &si : it->second) {
+      std::vector<std::vector<unsigned char>> values;
+      for (auto &s : state.symbolics) {
+        auto b = si.assignment.bindings.find(s.second);
+        values.push_back(b != si.assignment.bindings.end()
+                             ? b->second
+                             : std::vector<unsigned char>(s.second->size, 0));
       }
-      delete[] k->objects;
-      delete k;
-    });
-    entry.inputs.push_back(kt);
+      entry.inputs.push_back(storeInput(entry.names, values));
+    }
   }
-  if (!entry.inputs.empty()) {
+  bool kept = entry.path || !entry.inputs.empty();
+  if (kept) {
     deferred.push_back(std::move(entry));
     std::push_heap(deferred.begin(), deferred.end(),
                    [](const Deferred &a, const Deferred &b) {
                      return a.key > b.key;
                    });
   }
-  state.fate = inputs.empty() ? "open:no-input" : "deferred";
+  state.fate = kept ? "deferred" : "open:no-input";
   terminateStateEarlyAlgorithm(state, "concolic: deferred",
                                StateTerminationType::Replay);
+}
+
+KTest *Executor::storeInput(
+    const std::vector<std::string> &names,
+    const std::vector<std::vector<unsigned char>> &values) {
+  KTest *kt = new KTest();
+  kt->version = kTest_getCurrentVersion();
+  kt->numObjects = names.size();
+  kt->objects = new KTestObject[kt->numObjects];
+  for (unsigned i = 0; i < kt->numObjects; ++i) {
+    kt->objects[i].name = new char[names[i].size() + 1];
+    std::memcpy(kt->objects[i].name, names[i].c_str(), names[i].size() + 1);
+    kt->objects[i].numBytes = values[i].size();
+    kt->objects[i].bytes = new unsigned char[values[i].size()];
+    std::memcpy(kt->objects[i].bytes, values[i].data(), values[i].size());
+  }
+  deferredInputs.emplace_back(kt, [](KTest *k) {
+    for (unsigned i = 0; i < k->numObjects; ++i) {
+      delete[] k->objects[i].name;
+      delete[] k->objects[i].bytes;
+    }
+    delete[] k->objects;
+    delete k;
+  });
+  return kt;
 }
 
 void Executor::respawn() {
@@ -2106,6 +2124,21 @@ void Executor::respawn() {
                 });
   Deferred d = deferred.back();
   deferred.pop_back();
+  if (d.path) {
+    std::vector<std::vector<unsigned char>> values;
+    SolverQueryMetaData meta;
+    int r = solveInput(*d.path, d.objects, d.parent.get(), meta, values);
+    if (r <= 0) {
+      std::string fate = unsolvedFate(r, d.concretized);
+      if (fate.compare(0, 5, "open:") == 0)
+        ++ledger.open[fate.substr(5)];
+      else
+        ++ledger.fates[fate];
+      return;
+    }
+    ++ledger.fates["solved"];
+    d.inputs.push_back(storeInput(d.names, values));
+  }
   ExecutionState *s = pristine->branch();
   executionTree->attach(pristine->executionTreeNode, s, pristine,
                         BranchType::NONE);
@@ -4624,15 +4657,13 @@ void Executor::run(ExecutionState &initialState) {
   // main interpreter loop
   while ((!states.empty() || (Concolic && !deferred.empty())) &&
          !haltExecution) {
-    // A deferred input is a path of P_K waiting to run. Bring it back whenever
-    // there is room; waiting for seedMap to empty never does (seeds persist).
-    if (Concolic && !deferred.empty() && states.size() < ConcolicPending) {
+    ExecutionState *next = Concolic ? selectConcolic() : &searcher->selectState();
+    if (!next) {
       respawn();
       updateStates(nullptr);
       continue;
     }
-    ExecutionState &state =
-        Concolic ? *selectConcolic() : searcher->selectState();
+    ExecutionState &state = *next;
     if (state.pendingSeed && !ensureSeed(state)) {
       // Concolic: the flip is infeasible (or unsolved in the budget).
       terminateStateEarlyAlgorithm(state, "concolic: infeasible flip",
@@ -4674,7 +4705,7 @@ void Executor::run(ExecutionState &initialState) {
 
   if (Concolic) {
     for (const Deferred &d : deferred)
-      ledger.open["halted-deferred"] += d.inputs.size();
+      ledger.open["halted-deferred"] += d.path ? 1 : d.inputs.size();
     deferred.clear();
     writeLedger(exhausted);
     uint64_t open = 0;

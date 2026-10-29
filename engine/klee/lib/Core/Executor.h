@@ -35,6 +35,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -443,6 +444,12 @@ private:
   /// never concretized); -1: the solver gave up.
   int solveInput(ExecutionState &state, std::vector<const Array *> &objects,
                  std::vector<std::vector<unsigned char>> &values);
+  /// The same for a path condition with these objects; bytes the path does
+  /// not read keep the parent input's values, if there is one.
+  int solveInput(const ConstraintSet &path,
+                 const std::vector<const Array *> &objects,
+                 const Assignment *parent, SolverQueryMetaData &meta,
+                 std::vector<std::vector<unsigned char>> &values);
 
   /// Concolic mode. The fate of every state the search ends, and the
   /// candidates (pending flips) it creates. The run is exhaustive within its
@@ -458,18 +465,25 @@ private:
   void writeLedger(bool exhausted);
 
   /// Concolic mode. A state the search cannot keep in memory is replaced by
-  /// its input (solved now if it is pending), run again later from the
-  /// checkpoint (advanceCheckpoint); decisions before floor are not flipped
-  /// again. Nothing is
-  /// discarded for lack of memory.
+  /// its inputs, or by its path condition if it is pending (solved when it
+  /// runs again), and run again later from the checkpoint
+  /// (advanceCheckpoint); decisions before floor are not flipped again.
+  /// Nothing is discarded for lack of memory.
   struct Deferred {
     std::pair<unsigned, uint64_t> key; // orderKey of the deferred state
     unsigned floor;
     std::vector<KTest *> inputs; // the state's seeds, re-run together
     std::set<std::string> fixed;
+    std::vector<std::string> names; // of the symbolic objects, in order
+    std::optional<ConstraintSet> path; // a pending flip's path condition
+    std::shared_ptr<const Assignment> parent;
+    std::vector<const Array *> objects;
+    bool concretized = false;
   };
   std::vector<Deferred> deferred; // min-heap on key
   std::vector<std::unique_ptr<KTest, void (*)(KTest *)>> deferredInputs;
+  KTest *storeInput(const std::vector<std::string> &names,
+                    const std::vector<std::vector<unsigned char>> &values);
   ExecutionState *pristine = nullptr;
   std::set<std::string> programFunctions; // defined in the input module
   uint64_t memoryBase = 0; // MB in use when the run starts
@@ -520,9 +534,12 @@ private:
   /// key, deferral the greatest.
   std::pair<unsigned, uint64_t> orderKey(ExecutionState &state);
 
-  /// Concolic mode. The input-carrying state now running: it runs until it
-  /// ends, is deferred, or loses its input; then the state of least key runs.
+  /// Concolic mode. The input-carrying state now running: it runs for a
+  /// quantum of --batch-instructions, or until it ends, is deferred, or loses
+  /// its input; then the state of least key runs. selectConcolic returns
+  /// null when that is a deferred input, which respawn then brings back.
   ExecutionState *running = nullptr;
+  uint64_t runningSince = 0;
   ExecutionState *selectConcolic();
 
   /// Concolic mode. Turn a seeded state into a pending flip of the next

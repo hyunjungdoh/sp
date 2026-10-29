@@ -26,6 +26,8 @@ struct State {
   // For each class: the classes naming it as a direct base, the base's
   // offset in each, and whether the base is virtual.
   std::map<std::string, std::set<std::tuple<std::string, uint64_t, bool>>> heirs;
+  // Member function declarations by linkage name.
+  std::map<std::string, const DISubprogram *> decls;
   Stats stats;
 };
 
@@ -196,10 +198,13 @@ void index(Module &M) {
     if (auto *C = dyn_cast<DICompositeType>(T))
       if (record(C) && !C->isForwardDecl() && !C->getName().empty()) {
         state().defs.emplace(qualified(C, ""), C);
-        for (const DINode *N : C->getElements())
+        for (const DINode *N : C->getElements()) {
           if (auto *M = dyn_cast<DIDerivedType>(N); M && M->getTag() == dwarf::DW_TAG_inheritance)
             if (std::string b = name(M->getBaseType()); !b.empty())
               state().heirs[b].insert({qualified(C, ""), M->getOffsetInBits() / 8, M->isVirtual()});
+          if (auto *SP = dyn_cast<DISubprogram>(N); SP && !SP->getLinkageName().empty())
+            state().decls.emplace(SP->getLinkageName().str(), SP);
+        }
       }
 }
 
@@ -230,6 +235,7 @@ void reset() {
   s.open.clear();
   s.ir.clear();
   s.heirs.clear();
+  s.decls.clear();
   s.stats = Stats{};
 }
 
@@ -277,6 +283,49 @@ bool vptrAt(const DIType *D, uint64_t off) {
       return true;
   }
   return false;
+}
+
+bool foreign(const DIType *D) {
+  const DICompositeType *C = composite(D);
+  if (!C || !C->isForwardDecl())
+    return false;
+  // What only C++ has: a class tag, a namespace or class scope, a
+  // convention for passing the type, or an ODR identifier.
+  const auto pass = DINode::FlagNonTrivial | DINode::FlagTypePassByValue | DINode::FlagTypePassByReference;
+  return C->getTag() == dwarf::DW_TAG_class_type || isa_and_nonnull<DINamespace>(C->getScope()) ||
+         isa_and_nonnull<DICompositeType>(C->getScope()) || (C->getFlags() & pass) || !C->getIdentifier().empty();
+}
+
+const DIType *bare(const DIType *D) { return strip(D); }
+
+std::vector<std::pair<std::string, uint64_t>> fnSlots(const DIType *D) {
+  std::vector<std::pair<std::string, uint64_t>> out;
+  StringRef alias;
+  const DICompositeType *C = composite(D, &alias);
+  if (!C)
+    return out;
+  std::string self = qualified(C, alias);
+  for (const DINode *N : C->getElements()) {
+    auto *M = dyn_cast<DIDerivedType>(N);
+    if (!M || M->isStaticMember() || (M->getTag() != dwarf::DW_TAG_member && M->getTag() != dwarf::DW_TAG_inheritance))
+      continue;
+    if (M->getTag() == dwarf::DW_TAG_member && M->isArtificial() && M->getName().starts_with("_vptr"))
+      continue;
+    const DIType *T = strip(M->getBaseType());
+    while (auto *A = dyn_cast_or_null<DICompositeType>(T)) {
+      if (A->getTag() != dwarf::DW_TAG_array_type)
+        break;
+      T = strip(A->getBaseType());
+    }
+    if (pointerLike(T)) {
+      if (holdsFn(T) && !self.empty())
+        out.push_back({self, M->getOffsetInBits() / 8});
+    } else {
+      auto in = fnSlots(T);
+      out.insert(out.end(), in.begin(), in.end());
+    }
+  }
+  return out;
 }
 
 bool holdsFn(const DIType *D) {
@@ -332,6 +381,39 @@ const DIType *element(const DIType *D) {
   return nullptr;
 }
 
+const DISubroutineType *signature(const Function &F) {
+  if (const DISubprogram *SP = F.getSubprogram())
+    return SP->getType();
+  auto it = state().decls.find(F.getName().str());
+  return it == state().decls.end() ? nullptr : it->second->getType();
+}
+
+// The type of the object formal k of F addresses: the pointee of its
+// declared type, or the type itself for an aggregate passed by value.
+static const DIType *formal(const Function &F, unsigned k) {
+  const DISubroutineType *ST = signature(F);
+  if (!ST || k >= F.arg_size())
+    return nullptr;
+  auto ts = ST->getTypeArray();
+  if (ts.size() == 0)
+    return nullptr;
+  unsigned shift = 0;
+  for (unsigned j = 0; j < F.arg_size(); ++j)
+    if (F.hasParamAttribute(j, Attribute::StructRet))
+      ++shift;
+  unsigned n = !ts[ts.size() - 1] ? ts.size() - 2 : ts.size() - 1;
+  if (F.arg_size() != n + shift)
+    return nullptr;
+  if (F.hasParamAttribute(k, Attribute::StructRet))
+    return deref(ts[0]);
+  unsigned before = 0;
+  for (unsigned j = 0; j < k; ++j)
+    if (F.hasParamAttribute(j, Attribute::StructRet))
+      ++before;
+  const DIType *T = ts[k + 1 - before];
+  return F.hasParamAttribute(k, Attribute::ByVal) || !pointerLike(strip(T)) ? (composite(T) ? T : nullptr) : deref(T);
+}
+
 const DIType *pointee(const Value *V) {
   if (!V)
     return nullptr;
@@ -345,32 +427,9 @@ const DIType *pointee(const Value *V) {
   if (auto *C = dyn_cast<Operator>(V); C && (C->getOpcode() == Instruction::BitCast ||
                                              C->getOpcode() == Instruction::AddrSpaceCast))
     r = pointee(C->getOperand(0));
-  else if (auto *A = dyn_cast<Argument>(V)) {
-    const Function *F = A->getParent();
-    DISubprogram *SP = F->getSubprogram();
-    auto *ST = SP ? SP->getType() : nullptr;
-    if (ST) {
-      auto ts = ST->getTypeArray();
-      unsigned shift = 0;
-      for (unsigned k = 0; k < F->arg_size(); ++k)
-        if (F->hasParamAttribute(k, Attribute::StructRet))
-          ++shift;
-      unsigned n = ts.size() > 0 && !ts[ts.size() - 1] ? ts.size() - 2 : ts.size() - 1;
-      unsigned k = A->getArgNo();
-      if (ts.size() > 0 && F->arg_size() == n + shift) {
-        if (F->hasParamAttribute(k, Attribute::StructRet))
-          r = deref(ts[0]);
-        else {
-          unsigned before = 0;
-          for (unsigned j = 0; j < k; ++j)
-            if (F->hasParamAttribute(j, Attribute::StructRet))
-              ++before;
-          const DIType *T = ts[k + 1 - before];
-          r = A->hasByValAttr() || !pointerLike(strip(T)) ? (composite(T) ? T : nullptr) : deref(T);
-        }
-      }
-    }
-  } else if (auto *AI = dyn_cast<AllocaInst>(V)) {
+  else if (auto *A = dyn_cast<Argument>(V))
+    r = formal(*A->getParent(), A->getArgNo());
+  else if (auto *AI = dyn_cast<AllocaInst>(V)) {
     for (DbgDeclareInst *D : findDbgDeclares(const_cast<AllocaInst *>(AI)))
       if (D->getExpression()->getNumElements() == 0) {
         r = D->getVariable()->getType();
@@ -390,10 +449,9 @@ const DIType *pointee(const Value *V) {
     r = deref(pointee(L->getPointerOperand()));
   else if (auto *CB = dyn_cast<CallBase>(V)) {
     if (auto *F = dyn_cast<Function>(CB->getCalledOperand()->stripPointerCasts()))
-      if (DISubprogram *SP = F->getSubprogram())
-        if (auto *ST = SP->getType())
-          if (ST->getTypeArray().size() > 0)
-            r = deref(ST->getTypeArray()[0]);
+      if (const DISubroutineType *ST = signature(*F))
+        if (ST->getTypeArray().size() > 0)
+          r = deref(ST->getTypeArray()[0]);
   } else if (isa<PHINode>(V) || isa<SelectInst>(V)) {
     std::vector<const Value *> ins;
     if (auto *P = dyn_cast<PHINode>(V))

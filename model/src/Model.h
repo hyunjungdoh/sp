@@ -449,6 +449,10 @@ class Model {
   Model(Module &down, Module &up, StringRef file, unsigned line) : down(down), up(up), dl(down.getDataLayout()), sinkFile(file), sinkLine(line) {}
 
   void run(int seqPick, raw_ostream &out);
+  // The index run builds before its search, and the precise resolution of
+  // local-held pointers the search uses; enough for indirectTargets.
+  void index();
+  void resolvePrecisely() { resolveHeld = true; }
   // §3.10: targetsOf at every indirect call site of D and U, after run.
   calls::Table indirectTargets() const;
 
@@ -1286,11 +1290,13 @@ inline bool constReceiver(const Function *F) {
 // memory the callee only reads. The receiver is the first argument when the
 // nested name is const-qualified; a sret slot comes before it.
 inline uint64_t constPointees(const Function *F) {
-  static std::unordered_map<const Function *, uint64_t> memo;
-  if (auto it = memo.find(F); it != memo.end())
+  // Result depends only on the mangled name and arg shape. Key by name so a
+  // freed Module's Function* cannot poison a later parse at the same address.
+  static std::unordered_map<std::string, uint64_t> memo;
+  std::string name = F->getName().str();
+  if (auto it = memo.find(name); it != memo.end())
     return it->second;
   uint64_t mask = 0;
-  std::string name = F->getName().str();
   ItaniumPartialDemangler dm;
   if (!dm.partialDemangle(name.c_str()) && dm.isFunction()) {
     size_t len = 0;
@@ -1323,6 +1329,7 @@ inline uint64_t constPointees(const Function *F) {
       params.erase(std::remove_if(params.begin(), params.end(), [](const std::string &p) { return p.empty() || p == "..."; }),
                    params.end());
       // The qualifier binds the pointee when it precedes the outermost * or &.
+      // East const (T const*) and west const (const T*) are the same pointee.
       auto pointeeConst = [](const std::string &p) {
         int d = 0;
         long last = -1;
@@ -1343,7 +1350,12 @@ inline uint64_t constPointees(const Function *F) {
         std::string before = p.substr(0, s);
         while (!before.empty() && before.back() == ' ')
           before.pop_back();
-        return before.size() >= 5 && before.compare(before.size() - 5, 5, "const") == 0;
+        if (before.size() >= 5 && before.compare(before.size() - 5, 5, "const") == 0)
+          return true;
+        size_t b = 0;
+        while (b < before.size() && before[b] == ' ')
+          ++b;
+        return before.compare(b, 6, "const ") == 0 || before.compare(b, 6, "const\t") == 0;
       };
       unsigned A = F->arg_size(), P = (unsigned)params.size();
       if (P <= A) {
@@ -1359,7 +1371,7 @@ inline uint64_t constPointees(const Function *F) {
       }
     }
   }
-  memo[F] = mask;
+  memo[name] = mask;
   return mask;
 }
 
@@ -1442,6 +1454,27 @@ inline bool lookupOnlyRec(const Function *F, std::map<std::pair<const Function *
   for (const AllocaInst *A : boxes)
     if (!spill.count(A))
       held.insert(A);
+  // A GEP/cast of a local still names that local. fmt::format spills such a
+  // GEP into a slot and stores through the reload; the slot must count as
+  // holding a local, or those stores look like writes the caller observes.
+  auto rootsHeld = [&](const Value *V) {
+    const Value *X = V->stripPointerCasts();
+    std::unordered_set<const Value *> seen;
+    while (X && seen.insert(X).second) {
+      if (held.count(X))
+        return true;
+      if (auto *G = dyn_cast<GEPOperator>(X)) {
+        X = G->getPointerOperand()->stripPointerCasts();
+        continue;
+      }
+      if (auto *C = dyn_cast<CastInst>(X)) {
+        X = C->getOperand(0)->stripPointerCasts();
+        continue;
+      }
+      break;
+    }
+    return false;
+  };
   grew = true;
   while (grew) {
     grew = false;
@@ -1450,7 +1483,7 @@ inline bool lookupOnlyRec(const Function *F, std::map<std::pair<const Function *
         auto *A = baseAlloca(S->getPointerOperand());
         if (!A || holds.count(A))
           continue;
-        if (held.count(S->getValueOperand()->stripPointerCasts())) {
+        if (rootsHeld(S->getValueOperand())) {
           holds.insert(A);
           grew = true;
         }
@@ -1466,6 +1499,10 @@ inline bool lookupOnlyRec(const Function *F, std::map<std::pair<const Function *
       }
     }
   }
+  // Pointers that name a non-local argument of F (the objects the caller
+  // passed). A naked global such as stderr is not one: fprintf(stderr) in an
+  // assertion path must not disqualify a lookup that never writes the caller's
+  // objects. TypeDesc::c_str linked by closeModules is that case.
   auto fromArg = [&](const Value *P) {
     std::vector<const Value *> st{P->stripPointerCasts()};
     std::unordered_set<const Value *> seen;
@@ -1474,13 +1511,13 @@ inline bool lookupOnlyRec(const Function *F, std::map<std::pair<const Function *
       st.pop_back();
       if (!X || !seen.insert(X).second)
         continue;
-      if (outside.count(X) || isa<Argument>(X) || isa<GlobalValue>(X))
+      if (outside.count(X) || isa<Argument>(X))
         return true;
       if (auto *G = dyn_cast<GEPOperator>(X))
         st.push_back(G->getPointerOperand());
       else if (auto *C = dyn_cast<CastInst>(X))
         st.push_back(C->getOperand(0));
-      else       if (auto *L = dyn_cast<LoadInst>(X)) {
+      else if (auto *L = dyn_cast<LoadInst>(X)) {
         if (outside.count(L))
           return true;
         st.push_back(L->getPointerOperand());
@@ -1569,14 +1606,44 @@ inline bool lookupOnlyRec(const Function *F, std::map<std::pair<const Function *
     if (Cal->isDeclaration()) {
       // Without a body the callee may write any pointer it is given that its
       // type does not make read-only. It is a lookup only when every such
-      // pointer is local.
+      // pointer is local, or is memory this function itself must not write
+      // (a const-qualified argument of F, including west and east const).
+      // strlen through char_traits::length(char const*) is the latter: the
+      // C declaration carries no mangled const, but F's parameter does.
       const uint64_t ro = constPointees(Cal);
+      const uint64_t selfRO = constPointees(F);
+      auto fromConstArg = [&](const Value *P) {
+        std::vector<const Value *> st{P->stripPointerCasts()};
+        std::unordered_set<const Value *> seen;
+        while (!st.empty()) {
+          const Value *X = st.back();
+          st.pop_back();
+          if (!X || !seen.insert(X).second)
+            continue;
+          if (auto *A = dyn_cast<Argument>(X))
+            return A->getArgNo() < 64 && (selfRO >> A->getArgNo() & 1);
+          if (auto *G = dyn_cast<GEPOperator>(X))
+            st.push_back(G->getPointerOperand());
+          else if (auto *C = dyn_cast<CastInst>(X))
+            st.push_back(C->getOperand(0));
+          else if (auto *L = dyn_cast<LoadInst>(X))
+            st.push_back(L->getPointerOperand());
+          else if (auto *Slot = dyn_cast<AllocaInst>(X)) {
+            // -O0 spills the formal into an alloca; strlen sees the reload.
+            for (const User *U : Slot->users())
+              if (auto *S = dyn_cast<StoreInst>(U))
+                if (baseAlloca(S->getPointerOperand()) == Slot)
+                  st.push_back(S->getValueOperand()->stripPointerCasts());
+          }
+        }
+        return false;
+      };
       bool writesOut = false;
       for (unsigned k = 0; k < CB->arg_size(); ++k) {
         const Value *Op = CB->getArgOperand(k);
         if (!Op->getType()->isPointerTy() || (k < 64 && (childMask >> k & 1)))
           continue;
-        bool readOnly = CB->onlyReadsMemory(k) || (k < 64 && (ro >> k & 1));
+        bool readOnly = CB->onlyReadsMemory(k) || (k < 64 && (ro >> k & 1)) || fromConstArg(Op);
         if (fromArg(Op) && !readOnly)
           writesOut = true;
       }
@@ -1595,6 +1662,12 @@ inline bool lookupOnlyRec(const Function *F, std::map<std::pair<const Function *
 }
 
 inline bool lookupOnly(const Function *F) {
-  static std::map<std::pair<const Function *, uint64_t>, std::optional<bool>> memo;
+  // Memoize only within one query. A process-wide map keyed by Function* is
+  // wrong once a module is freed and another is parsed into the same addresses
+  // (MAY_REUSE); a by-name cache is wrong when an earlier phase sees a thinner
+  // body of the same symbol and records false for the later client phase.
+  if (!F)
+    return false;
+  std::map<std::pair<const Function *, uint64_t>, std::optional<bool>> memo;
   return lookupOnlyRec(F, memo, 0);
 }

@@ -107,6 +107,25 @@ public:
     int64_t off = -1;
     bool covers(const Cell &c) const { return root == c.root && off == c.off && path == c.path; }
   };
+  // §3.8 정의 3.8.6 이름 키 설정: 조회 G(o, κ, d)가 읽는 이름 κ의 값을
+  // 클라이언트가 같은 o 위의 세터 S(o, κ, v)로 정한다. κ는 조회 지점이 짓는
+  // 그대로 짓는다: init이 있으면 slot 크기의 칸을 init(…, κ, …)로 채우고, 없으면
+  // κ가 곧 인자다.
+  struct Named {
+    Function *setter = nullptr;
+    std::string type;
+    std::string key;
+    unsigned obj = 0, name = 0, value = 0;
+    // Per IR parameter of the setter outside obj, name and value: the
+    // constant the lookup passes there.
+    std::vector<Constant *> rest;
+    Function *init = nullptr;
+    Type *slot = nullptr;
+    // Per argument of init: the constant it takes, or null for the slot
+    // (at slotAt) and for κ (at textAt).
+    std::vector<Constant *> initArgs;
+    unsigned slotAt = 0, textAt = 0;
+  };
   // A constraint on an integer field embedded in an entry argument: the
   // field at byte offset off of argument root, width bits wide.
   struct Guard {
@@ -196,6 +215,9 @@ public:
     // §3.8 정의 3.8.4: per entry, the key setter calls that realize a cell of
     // a witness that passes, in the order the may layer found them.
     FnMap<std::vector<std::pair<Function *, Keyed>>> keyed;
+    // §3.8 정의 3.8.6: per entry, the named settings of the lookups its
+    // witnesses' steps make on an object the entry receives.
+    FnMap<std::vector<Named>> named;
   };
 
   // §3.8: the key setters of each witness, aligned with plan()'s witnesses.
@@ -303,10 +325,22 @@ private:
   // §3.7 St(t): the functions that take t's address (any use but as a
   // callee), or read a constant record that holds it.
   FnSet installers(Function *T) const;
-  // Whether a call of F reads the input: an input channel among its
-  // parameters, or a closure that opens a file (§7 FileEnv).
-  bool opensFile(Function *F) const;
-  mutable FnMap<bool> opensOf;
+  // §3.11 Definition L: how a call of F takes the input. Passed: a formal
+  // hands it over, a byte sequence F bounds by a length formal (A3) or a
+  // callback whose type reads one; Named: F's closure opens or reads a file
+  // of the environment (§7 FileEnv); None otherwise. The order is the
+  // provenance order of the harness's choices.
+  enum class Channel { Passed, Named, None };
+  Channel channel(Function *F) const;
+  mutable FnMap<Channel> channelOf;
+  bool opensFile(Function *F) const { return channel(F) != Channel::None; }
+  // The pointer formals of F that integer formal j bounds (A3).
+  std::vector<unsigned> boundBy(Function *F, unsigned j) const;
+  // 1 + the cost of the held inputs of a call of F (Definition 4).
+  unsigned callCost(Function *F) const;
+  // The values a call of F leaves to the client's choice: its formals that
+  // are neither held nor out.
+  unsigned freeArgs(Function *F) const;
   bool needs(const std::string &U, const std::string &T, std::set<std::string> &seen) const;
   std::vector<Function *> dependences(Function *P, const std::string &T) const;
   bool guardOf(Function *E, const Cell &c, Guard &g, bool config = false) const;
@@ -487,6 +521,9 @@ private:
   // §3.9 realizations, in their order.
   std::vector<std::pair<Function *, Lever>> leversOf(Function *E, const Cell &c) const;
   bool realizable(Function *E, const Keyed &k) const;
+  // §3.8 정의 3.8.6: the named settings of the lookups the steps make.
+  std::vector<Named> named(const std::vector<std::string> &seq) const;
+  Function *namedSetter(Function *G, unsigned obj, unsigned name, unsigned fallback) const;
   std::vector<Function *> writeCandidates(Function *E, const std::vector<Function *> &es, const Cell &c) const;
   // §3.9 정의 E. Whether c is established, and when a store establishes it
   // under Lemma E, the plan of the sequence reaching that store (via).

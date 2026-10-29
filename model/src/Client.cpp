@@ -1367,28 +1367,77 @@ FnSet Client::installers(Function *T) const {
   return out;
 }
 
-// §3.7: a call reads the input when it takes an input channel (a byte
-// buffer or a callback, whose contents the harness makes symbolic) or its
-// closure opens a path (§7 FileEnv).
-bool Client::opensFile(Function *F) const {
-  auto it = opensOf.find(F);
-  if (it != opensOf.end())
+// A serialized input is a sequence of bytes: a pointer to void or to a
+// one-byte integer. A pointer to wider elements is an array of client
+// values, not an encoding of the input.
+static bool byteSequence(const DIType *T) {
+  T = strip(T);
+  if (!T || !isPointer(T))
+    return false;
+  const DIType *E = strip(cast<DIDerivedType>(T)->getBaseType());
+  return !E || (isa<DIBasicType>(E) && E->getSizeInBits() == 8);
+}
+
+// The ones F's code bounds by j, and without such evidence the byte buffer
+// right before it. An unbounded length would let the library read past the
+// client's buffer, an error no client makes.
+std::vector<unsigned> Client::boundBy(Function *F, unsigned j) const {
+  std::vector<unsigned> out;
+  for (auto [b, k] : formalsOf(F).len)
+    if (k == j)
+      out.push_back(b);
+  if (out.empty() && j > 0 && F->getArg(j)->getType()->isIntegerTy() && F->getArg(j - 1)->getType()->isPointerTy()) {
+    auto sig = signature(F);
+    auto at = irParams(F);
+    if (at[j - 1] >= 0 && at[j] >= 0 && at[j] == at[j - 1] + 1 && sig[at[j - 1]].kind == Kind::Bytes)
+      out.push_back(j - 1);
+  }
+  return out;
+}
+
+Client::Channel Client::channel(Function *F) const {
+  if (auto it = channelOf.find(F); it != channelOf.end())
     return it->second;
+  auto sig = signature(F);
+  auto at = irParams(F);
+  for (unsigned j = 0; j < F->arg_size(); ++j)
+    if (F->getArg(j)->getType()->isIntegerTy())
+      for (unsigned b : boundBy(F, j))
+        if (at[b] >= 0 && sig[at[b]].kind == Kind::Bytes && byteSequence(sig[at[b]].di))
+          return channelOf[F] = Channel::Passed;
+  for (const Param &p : sig) {
+    if (p.kind != Kind::Callback || !isPointer(strip(p.di)))
+      continue;
+    auto *S = dyn_cast_or_null<DISubroutineType>(strip(cast<DIDerivedType>(strip(p.di))->getBaseType()));
+    auto ts = S ? S->getTypeArray() : DITypeRefArray();
+    for (unsigned i = 1; i + 1 < ts.size(); ++i)
+      if (byteSequence(ts[i]) && isa_and_nonnull<DIBasicType>(strip(ts[i + 1])))
+        return channelOf[F] = Channel::Passed;
+  }
   static const std::set<std::string> open{"fopen", "fopen64", "freopen", "open", "open64", "openat", "creat"};
-  bool r = false;
-  for (const Param &p : signature(F))
-    r = r || p.kind == Kind::Bytes || p.kind == Kind::Callback;
-  if (r)
-    return opensOf[F] = true;
-  for (Function *G : closureOf(F)) {
+  for (Function *G : closureOf(F))
     for (Instruction &I : instructions(*G))
       if (auto *CB = dyn_cast<CallBase>(&I))
         if (auto *C = dyn_cast<Function>(CB->getCalledOperand()->stripPointerCasts()))
-          r = r || open.count(bareName(C->getName().str())) > 0;
-    if (r)
-      break;
-  }
-  return opensOf[F] = r;
+          if (open.count(bareName(C->getName().str())))
+            return channelOf[F] = Channel::Named;
+  return channelOf[F] = readsInput(F) ? Channel::Named : Channel::None;
+}
+
+unsigned Client::callCost(Function *F) const {
+  unsigned c = 1;
+  for (const Param &p : signature(F))
+    if (held(p))
+      if (auto it = cost.find(p.type); it != cost.end())
+        c += it->second;
+  return c;
+}
+
+unsigned Client::freeArgs(Function *F) const {
+  unsigned n = 0;
+  for (const Param &p : signature(F))
+    n += !held(p) && p.kind != Kind::Out;
+  return n;
 }
 
 // Whether obtaining a held U can require obtaining T.
@@ -1515,31 +1564,28 @@ std::vector<Function *> Client::dependences(Function *P, const std::string &T) c
     if (reach.count(W))
       out.push_back(W);
   }
-  // §2 환경 모델 + §3.5 미해결 근: 교차 객체가 D 안에서 입력으로부터 만들어질 때,
-  // 그 내용은 클라이언트의 유일한 입력이 D로 들어오는 통로—바이트(V-Bytes)나 텍스트
-  // (V-Text, 입력 파일을 여는 경로)를 받는 인터페이스 호출—로만 확립된다. 그 통로가
-  // 생산자와 보유 객체를 공유하면, 필드-수정자 탐색이 스마트 포인터·벡터 같은 불투명
-  // 컨테이너를 거쳐 놓치더라도 생산자의 의존이다. 선택적 선행 호출로 더해지므로
-  // 유효한 클라이언트 호출이고(H1 보존), 생성 전에 상태를 세워 H2를 돕는다.
-  for (Function *W : ifaceD) {
-    if (W == P || !callable(W) || std::find(out.begin(), out.end(), W) != out.end())
-      continue;
-    auto sig = signature(W);
-    bool shares = false, cyc = false, rel = false, reads = false;
-    for (unsigned i = 0; i < sig.size(); ++i) {
-      if (held(sig[i])) {
-        shares = shares || share.count(sig[i].type);
-        std::set<std::string> seen;
-        cyc = cyc || needs(sig[i].type, T, seen);
-        rel = rel || releases.count({W, i});
-      }
-      if (sig[i].kind == Kind::Bytes || sig[i].kind == Kind::Text)
-        reads = true;
-    }
-    if (shares && reads && !cyc && !rel)
-      out.push_back(W);
+  // §3.11 Definition O: a dependence that takes the input comes first, in
+  // channel order; among equals, the one whose stores meet more of the
+  // persisting fields P's branches read, then the cheaper call, then the one
+  // that leaves fewer values to the client.
+  std::set<std::pair<std::string, int64_t>> ctl;
+  for (const auto &f : controlRefs(P))
+    if (persists.count(f.first))
+      ctl.insert(f);
+  std::map<Function *, unsigned> meets;
+  for (Function *W : out) {
+    std::set<std::pair<std::string, int64_t>> hit;
+    for (Function *G : innerClosure(W))
+      if (auto m = mods.find(G); m != mods.end())
+        for (const auto &f : m->second)
+          if (ctl.count(f))
+            hit.insert(f);
+    meets[W] = hit.size();
   }
-  std::sort(out.begin(), out.end(), [](Function *a, Function *b) { return a->getName() < b->getName(); });
+  std::sort(out.begin(), out.end(), [&](Function *a, Function *b) {
+    return std::make_tuple(channel(a), -(int64_t)meets[a], callCost(a), freeArgs(a), a->getName()) <
+           std::make_tuple(channel(b), -(int64_t)meets[b], callCost(b), freeArgs(b), b->getName());
+  });
   return out;
 }
 
@@ -2137,10 +2183,12 @@ void Client::buildProducers() {
       if (ok)
         producers[kv.first].push_back(Producer{fp.first, fp.second, c});
     }
-    std::sort(producers[kv.first].begin(), producers[kv.first].end(),
-              [](const Producer &a, const Producer &b) {
-                return a.cost != b.cost ? a.cost < b.cost : a.fn->getName() < b.fn->getName();
-              });
+    // §3.11 Definition O: a producer that takes the input comes first, then
+    // the cheaper one, then the one that leaves fewer values to the client.
+    std::sort(producers[kv.first].begin(), producers[kv.first].end(), [&](const Producer &a, const Producer &b) {
+      return std::make_tuple(channel(a.fn), a.cost, freeArgs(a.fn), a.fn->getName()) <
+             std::make_tuple(channel(b.fn), b.cost, freeArgs(b.fn), b.fn->getName());
+    });
   }
 }
 
@@ -2499,6 +2547,17 @@ bool Client::own(Function *E, const Cell &c) const {
   for (const std::string &t : c.path)
     if (!isPublic(irName(t)))
       return false;
+  // §3.11: a field of a held object is the client's own only when the
+  // library leaves it to the client. A producer that stores a computed value
+  // to it makes it argument or input state, which the client's write would
+  // replace.
+  const Param &p = sig[at[c.root]];
+  if (held(p))
+    if (auto it = producers.find(p.type); it != producers.end())
+      for (const Producer &pr : it->second)
+        for (Function *G : closureOf(pr.fn))
+          if (auto s = stores.find(G); s != stores.end() && s->second.count({fieldOf(c), "*"}))
+            return false;
   return true;
 }
 
@@ -2766,6 +2825,164 @@ bool Client::realizable(Function *E, const Keyed &k) const {
   if (k.obj >= aw.size() || aw[k.obj] < 0 || sw[aw[k.obj]].type != T)
     return false;
   return k.tag < 0 || ((size_t)k.tag < aw.size() && aw[k.tag] >= 0);
+}
+
+// Definition 3.8.6: the setter of lookup G. An interface function of D with
+// G's signature, but the value where G has its fallback, of G's result
+// type, that is not a lookup and modifies a field G reads. IR positions.
+Function *Client::namedSetter(Function *G, unsigned obj, unsigned name, unsigned fallback) const {
+  auto sg = signature(G);
+  auto ag = irParams(G);
+  if (!G->getSubprogram() || obj >= ag.size() || name >= ag.size() || fallback >= ag.size() || ag[obj] < 0 ||
+      ag[name] < 0 || ag[fallback] < 0)
+    return nullptr;
+  const DIType *ret = strip(G->getSubprogram()->getType()->getTypeArray()[0]);
+  const auto &reads = transitive(G, false);
+  // Fields S writes: its inner closure, plus one hop into non-lookup callees.
+  // A thin overload (attribute(name, int) -> attribute(name, TypeDesc, &v)) is
+  // itself an interface function whose body only forwards, so innerClosure
+  // stops before the callee that GEPs the object; the hop recovers that MOD.
+  auto writesOf = [&](Function *S) {
+    std::set<std::pair<std::string, int64_t>> w = transitive(S, true);
+    for (Instruction &I : instructions(*S)) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      auto *Cal = CB ? CB->getCalledFunction() : nullptr;
+      Function *B = Cal ? body(Cal->getName().str()) : nullptr;
+      if (!B || B == S || B->isDeclaration() || lookupOnly(B))
+        continue;
+      const auto &cw = transitive(B, true);
+      w.insert(cw.begin(), cw.end());
+    }
+    return w;
+  };
+  for (Function *S : ifaceD) {
+    if (S == G || S->arg_size() != G->arg_size() || !callable(S))
+      continue;
+    auto ss = signature(S);
+    if (ss.size() != sg.size() || irParams(S) != ag)
+      continue;
+    bool same = true;
+    for (unsigned i = 0; i < S->arg_size() && same; ++i) {
+      Type *T = S->getArg(i)->getType();
+      if (i == fallback)
+        same = T == G->getReturnType() && strip(ss[ag[i]].di) == ret;
+      else
+        same = T == G->getArg(i)->getType() && (ag[i] < 0 || (ss[ag[i]].kind == sg[ag[i]].kind && ss[ag[i]].type == sg[ag[i]].type));
+    }
+    if (!same || !held(ss[ag[obj]]) || ss[ag[name]].kind == Kind::Scalar || lookupOnly(S))
+      continue;
+    const auto writes = writesOf(S);
+    if (std::any_of(writes.begin(), writes.end(), [&](const auto &f) { return reads.count(f); }))
+      return S;
+  }
+  return nullptr;
+}
+
+// Definition 3.8.6: the named settings of the lookups each step makes on an
+// object it receives. A lookup is a call that writes no memory its caller
+// sees (lookupOnly), returns an integer, and can return one argument
+// unchanged (its fallback). The name is the constant text another argument
+// carries, as the call or the last call before it that fills its slot
+// passes it.
+std::vector<Client::Named> Client::named(const std::vector<std::string> &seq) const {
+  std::vector<Named> out;
+  std::set<std::pair<Function *, std::string>> seen;
+  auto text = [](Value *V) -> std::string {
+    auto *G = dyn_cast<GlobalVariable>(V->stripPointerCasts());
+    auto *A = G && G->hasInitializer() ? dyn_cast<ConstantDataArray>(G->getInitializer()) : nullptr;
+    return A && A->isCString() ? A->getAsCString().str() : "";
+  };
+  for (const std::string &n : seq) {
+    Function *F = body(n);
+    if (!F)
+      continue;
+    DominatorTree DT(*F);
+    for (Instruction &I : instructions(*F)) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      Function *Cal = CB ? CB->getCalledFunction() : nullptr;
+      Function *G = Cal ? body(Cal->getName().str()) : nullptr;
+      if (!CB || !Cal || !G || !G->getReturnType()->isIntegerTy() || !lookupOnly(G))
+        continue;
+      auto fb = fallbackArg(G);
+      if (!fb || *fb >= CB->arg_size())
+        continue;
+      auto sg = signature(G);
+      auto ag = irParams(G);
+      std::optional<unsigned> obj;
+      for (unsigned i = 0; i < ag.size(); ++i)
+        if (ag[i] >= 0 && held(sg[ag[i]]) && !obj)
+          obj = i;
+      if (!obj)
+        continue;
+      std::set<AllocaInst *> open;
+      bool cut = false;
+      if (positionOf(CB->getArgOperand(*obj), open, cut).root < 0)
+        continue;
+      for (unsigned j = 0; j < CB->arg_size(); ++j) {
+        if (j == *obj || j == *fb)
+          continue;
+        Named nm;
+        Value *Op = CB->getArgOperand(j);
+        nm.key = text(Op);
+        if (nm.key.empty())
+          if (auto *Slot = dyn_cast<AllocaInst>(Op->stripPointerCasts())) {
+            CallBase *best = nullptr;
+            for (User *U : Slot->users()) {
+              auto *W = dyn_cast<CallBase>(U);
+              Function *WF = W ? W->getCalledFunction() : nullptr;
+              if (!W || W == CB || !WF || !DT.dominates(W, CB) || (best && !DT.dominates(best, W)))
+                continue;
+              std::vector<Constant *> as;
+              std::optional<unsigned> s, t;
+              std::string got;
+              for (unsigned a = 0; a < W->arg_size(); ++a) {
+                Value *Arg = W->getArgOperand(a);
+                if (Arg->stripPointerCasts() == Slot && !s) {
+                  s = a;
+                  as.push_back(nullptr);
+                } else if (std::string k = text(Arg); !k.empty() && !t) {
+                  t = a;
+                  got = k;
+                  as.push_back(nullptr);
+                } else if (auto *C = dyn_cast<ConstantInt>(Arg)) {
+                  as.push_back(C);
+                } else {
+                  break;
+                }
+              }
+              if (!s || !t || as.size() != W->arg_size())
+                continue;
+              best = W;
+              nm.key = got;
+              nm.init = WF;
+              nm.slot = Slot->getAllocatedType();
+              nm.initArgs = as;
+              nm.slotAt = *s;
+              nm.textAt = *t;
+            }
+          }
+        if (nm.key.empty())
+          continue;
+        bool fixed = true;
+        for (unsigned i = 0; i < CB->arg_size(); ++i) {
+          auto *C = i == *obj || i == j || i == *fb ? nullptr : dyn_cast<ConstantInt>(CB->getArgOperand(i));
+          fixed = fixed && (C || i == *obj || i == j || i == *fb);
+          nm.rest.push_back(C);
+        }
+        Function *S = fixed ? namedSetter(G, *obj, j, *fb) : nullptr;
+        if (!S || !seen.insert({S, nm.key}).second)
+          break;
+        nm.setter = S;
+        nm.type = sg[ag[*obj]].type;
+        nm.obj = *obj;
+        nm.name = j;
+        nm.value = *fb;
+        out.push_back(std::move(nm));
+        break;
+      }
+    }
+  }
+  return out;
 }
 
 const TargetLibraryInfo &Client::libInfo() const {
@@ -3230,7 +3447,7 @@ bool Client::establishedBy(Function *E, Function *entry, const Cell &c, const Wi
 // field copied into it transitively, or, for a bound, to the field the
 // bound names.
 bool Client::fills(Function *F, const Cell &c) const {
-  if (!F || !readsInput(F))
+  if (!F || !opensFile(F))
     return false;
   const auto &cm = allCopies(F);
   std::set<Field> seen{fieldOf(c)};
@@ -3482,6 +3699,17 @@ Client::Plan Client::plan(const Witnesses &ws) const {
       if (!dup)
         fs.push_back(c);
     }
+    // Definition 3.8.6: a setting is the client's own choice, like a lever,
+    // at every entry that receives the object the lookup reads.
+    for (const Named &n : named(seq))
+      for (Function *F : W.entries) {
+        auto sf = signature(F);
+        if (std::none_of(sf.begin(), sf.end(), [&](const Param &p) { return held(p) && p.type == n.type; }))
+          continue;
+        auto &ns = P.named[F];
+        if (std::none_of(ns.begin(), ns.end(), [&](const Named &o) { return o.setter == n.setter && o.key == n.key; }))
+          ns.push_back(n);
+      }
     if (W.pass) {
       writerSet.insert(W.cover.begin(), W.cover.end());
       auto &ks = P.keyed[E];
@@ -3541,6 +3769,9 @@ void Client::grammar(Plan &P) const {
   for (const auto &[E, ks] : P.keyed)
     for (const auto &[W, k] : ks)
       want(W);
+  for (const auto &[E, ns] : P.named)
+    for (const Named &n : ns)
+      want(n.setter);
   for (std::vector<std::string> work(need.begin(), need.end()); !work.empty();) {
     std::string T = work.back();
     work.pop_back();
@@ -3594,7 +3825,7 @@ void Client::dispatch(const Witnesses &ws, Plan &P) const {
     for (Function *H : called)
       file = file || opensFile(H);
     std::vector<std::string> notes;
-    std::string gate;
+    std::set<std::string> gate;
     unsigned indirect = 0, open = 0;
     for (size_t i = 0; i + 1 < seq.size(); ++i) {
       Function *A = body(seq[i]), *T = body(seq[i + 1]);
@@ -3617,18 +3848,18 @@ void Client::dispatch(const Witnesses &ws, Plan &P) const {
       if (!ks.empty() && file)
         how += " key";
       if (file) {
-        Function *by = nullptr;
+        std::set<std::string> by;
         for (Function *H : called)
           for (Function *G : St)
-            if (!by && closureOf(H).count(G))
-              by = G;
-        if (by) {
-          how += " input:" + by->getName().str();
-          // The first input installer on the witness is the Π_I gate the
-          // search must open before later dispatch steps matter (H3).
-          if (gate.empty())
-            gate = by->getName().str();
-        }
+            if (closureOf(H).count(G))
+              by.insert(G->getName().str());
+        for (const std::string &g : by)
+          how += " input:" + g;
+        // The installers of the first input-dispatched edge on the witness
+        // are the Π_I gate the search must open before later dispatch steps
+        // matter (H3); any of them opens it.
+        if (gate.empty())
+          gate = by;
       }
       for (Function *W : setters) {
         bool by = false;
@@ -3643,8 +3874,9 @@ void Client::dispatch(const Witnesses &ws, Plan &P) const {
       notes.push_back("  D " + A->getName().str() + " -> " + T->getName().str() + " st " +
                       std::to_string(St.size()) + (how.empty() ? " OPEN" : how));
     }
-    if (!gate.empty() && std::find(P.stInstallers.begin(), P.stInstallers.end(), gate) == P.stInstallers.end())
-      P.stInstallers.push_back(gate);
+    for (const std::string &g : gate)
+      if (std::find(P.stInstallers.begin(), P.stInstallers.end(), g) == P.stInstallers.end())
+        P.stInstallers.push_back(g);
     P.obligations.push_back("obligations " + (seq.empty() ? std::string("-") : seq[0]) + " edges " +
                             std::to_string(seq.empty() ? 0 : seq.size() - 1) + " indirect " +
                             std::to_string(indirect) + " open " + std::to_string(open) + " file " +
@@ -3724,6 +3956,10 @@ void Client::report(const Plan &P, raw_ostream &out) const {
         out << " va " << op << " " << v;
       out << " : " << k.target << "\n";
     }
+  for (const auto &[E, ns] : P.named)
+    for (const Named &n : ns)
+      out << "named " << E->getName() << " " << n.setter->getName() << " obj " << n.obj << " \"" << n.key
+          << "\" value arg" << n.value << "\n";
   for (const WitnessPlan &W : P.witnesses) {
     std::map<Realize, unsigned> n;
     for (const Realized &r : W.cells)
@@ -4763,23 +4999,6 @@ void Client::emit(const Plan &P, Module &H) const {
   auto declare = [&](Function *F) {
     return H.getOrInsertFunction(F->getName(), F->getFunctionType());
   };
-  // The pointer formals of F that integer formal j bounds (A3): the ones
-  // F's code bounds by it, and without such evidence the byte buffer right
-  // before it. An unbounded length would let the library read past the
-  // client's buffer, an error no client makes.
-  auto lengthOf = [&](Function *F, unsigned j) {
-    std::vector<unsigned> out;
-    for (auto [b, k] : formalsOf(F).len)
-      if (k == j)
-        out.push_back(b);
-    if (out.empty() && j > 0 && F->getArg(j)->getType()->isIntegerTy() && F->getArg(j - 1)->getType()->isPointerTy()) {
-      auto sig = signature(F);
-      auto at = irParams(F);
-      if (at[j - 1] >= 0 && at[j] >= 0 && at[j] == at[j - 1] + 1 && sig[at[j - 1]].kind == Kind::Bytes)
-        out.push_back(j - 1);
-    }
-    return out;
-  };
   // Val(tau), the values a client can hold of source type tau.
   //   V-Int     a scalar is any bit pattern;
   //   V-Text    char* is a text of at most L characters, one of each class
@@ -5161,7 +5380,7 @@ void Client::emit(const Plan &P, Module &H) const {
           dataArg[i] = K.lastBytes;
           break;
         }
-      } else if (auto bs = lengthOf(F, i); T->isIntegerTy() && !bs.empty()) {
+      } else if (auto bs = boundBy(F, i); T->isIntegerTy() && !bs.empty()) {
         v = K.symbolic(C, T, "length");
         lengths.push_back({cast<CallInst>(cast<Instruction>(v)->getPrevNode()), bs});
         // The length counts elements or bytes; either way it stays within
@@ -5361,9 +5580,18 @@ void Client::emit(const Plan &P, Module &H) const {
         auto d = P.deps.find({pr.fn, T});
         if (d != P.deps.end())
           for (unsigned k = 0; k < depSlots; ++k) {
-            std::vector<std::function<void(IRBuilder<> &)>> pre{[](IRBuilder<> &) {}};
-            for (Function *W : d->second)
-              pre.push_back([&, W](IRBuilder<> &D) { call(D, W, "", -1); });
+            // §3.11 Definition O: (l_1 | ... | skip | d_1 | ...), the
+            // dependences that take the input before the skip.
+            std::vector<std::function<void(IRBuilder<> &)>> pre;
+            auto skip = std::find_if(d->second.begin(), d->second.end(),
+                                     [&](Function *W) { return channel(W) == Channel::None; });
+            for (auto it = d->second.begin(); it != d->second.end(); ++it) {
+              if (it == skip)
+                pre.push_back([](IRBuilder<> &) {});
+              pre.push_back([&, W = *it](IRBuilder<> &D) { call(D, W, "", -1); });
+            }
+            if (skip == d->second.end())
+              pre.push_back([](IRBuilder<> &) {});
             K.oneOf(C, pre, "depend");
           }
         call(C, pr.fn, T, pr.out);
@@ -5427,6 +5655,28 @@ void Client::emit(const Plan &P, Module &H) const {
     }
     C.CreateCall(declare(W), args);
   };
+  // §3.8 정의 3.8.6 이름 키 설정: entry 직전, entry가 받을 그 핸들 위에서
+  // S(o, κ, v)를 부르거나 건너뛴다. κ는 조회 지점이 짓는 그대로 짓고, v는 S가
+  // 받는 정수 전체에서 고른다.
+  auto nameSet = [&](IRBuilder<> &C, const Named &n) {
+    Value *key = C.CreateGlobalStringPtr(n.key);
+    if (n.init) {
+      AllocaInst *slot = K.entryAlloca(C, n.slot);
+      std::vector<Value *> as;
+      for (unsigned a = 0; a < n.initArgs.size(); ++a)
+        as.push_back(a == n.slotAt ? slot : a == n.textAt ? key : (Value *)n.initArgs[a]);
+      C.CreateCall(declare(n.init), as);
+      key = slot;
+    }
+    FunctionType *FT = n.setter->getFunctionType();
+    std::vector<Value *> args;
+    for (unsigned i = 0; i < FT->getNumParams(); ++i)
+      args.push_back(i == n.obj     ? obtain(C, n.type)
+                     : i == n.name  ? key
+                     : i == n.value ? K.symbolic(C, FT->getParamType(i), "named")
+                                    : (Value *)n.rest[i]);
+    C.CreateCall(declare(n.setter), args);
+  };
   {
     std::vector<std::function<void(IRBuilder<> &)>> alts;
     for (Function *E : P.entries)
@@ -5435,6 +5685,9 @@ void Client::emit(const Plan &P, Module &H) const {
         if (kit != P.keyed.end())
           for (const auto &[W, k] : kit->second)
             K.oneOf(C, {[&, W = W, &k = k](IRBuilder<> &A) { keySet(A, W, k); }, [](IRBuilder<> &) {}}, "key");
+        if (auto nit = P.named.find(E); nit != P.named.end())
+          for (const Named &n : nit->second)
+            K.oneOf(C, {[&](IRBuilder<> &A) { nameSet(A, n); }, [](IRBuilder<> &) {}}, "named");
         auto g = P.guards.find(E);
         auto f = P.files.find(E);
         call(C, E, "", -1, g == P.guards.end() ? nullptr : &g->second, f == P.files.end() ? nullptr : &f->second);

@@ -39,7 +39,9 @@
 #include <vector>
 
 namespace llvm {
+class DISubroutineType;
 class DIType;
+class Function;
 class GlobalVariable;
 class Module;
 class StructType;
@@ -55,6 +57,11 @@ void reset();
 // The source type of the object V addresses, or null.
 const llvm::DIType *pointee(const llvm::Value *V);
 
+// The source signature of F: its subprogram's, or, for a function the
+// program only declares, that of the member declaration of the same linkage
+// name a class description carries; null when neither exists.
+const llvm::DISubroutineType *signature(const llvm::Function &F);
+
 // The source type of a global's object, or null.
 const llvm::DIType *ofGlobal(const llvm::GlobalVariable &G);
 
@@ -69,6 +76,20 @@ std::map<std::string, std::set<std::optional<uint64_t>>> derived(const llvm::DIT
 // Whether a class D holds a vtable pointer at byte offset off, its own or a
 // base subobject's.
 bool vptrAt(const llvm::DIType *D, uint64_t off);
+
+// Whether D is a C++ class the program only declares. Clang emits a class
+// as a declaration in every unit only when it is dynamic with its key
+// function outside the program, or when no unit requires it complete; in
+// neither case does code here read its members, so a function loaded
+// through a pointer loaded from such an object is a vtable slot.
+bool foreign(const llvm::DIType *D);
+
+// D without typedefs and qualifiers.
+const llvm::DIType *bare(const llvm::DIType *D);
+
+// The slots of an object of type D that can hold a function pointer, each
+// named by the innermost record holding it and its byte offset there.
+std::vector<std::pair<std::string, uint64_t>> fnSlots(const llvm::DIType *D);
 
 // Whether a source type can hold a function pointer: a pointer to a
 // subroutine, a void pointer, or a record/array containing one. A vptr

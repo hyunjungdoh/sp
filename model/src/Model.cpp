@@ -1301,13 +1301,30 @@ int main(int argc, char **argv) {
   projectExports = Client::installedExports(dir);
   LLVMContext ctx;
   // The must side depends on the may side only through its witnesses and its
-  // call relation. With MAY_REUSE set, those of an earlier run in out-dir
-  // stand for it.
+  // call relation. With MAY_REUSE set, the witnesses of an earlier run in
+  // out-dir stand for the search; the call relation, which the index alone
+  // determines, is recomputed so that it covers the present modules.
   if (const char *r = std::getenv("MAY_REUSE"); r && *r && fs::exists(outDir / "witnesses.txt")) {
     calls::Table table;
-    if (!calls::read(table, outDir / "calls.txt")) {
-      errs() << "MAY_REUSE: no calls.txt in " << outDir.string() << "\n";
-      return 1;
+    {
+      SMDiagnostic e;
+      auto up = parseIRFile((dir / "upstream.bc").string(), e, ctx);
+      auto down = parseIRFile((dir / "se_lib" / "downstream.closure.bc").string(), e, ctx);
+      if (!up || !down) {
+        e.print("model", errs());
+        return 1;
+      }
+      closeModules(*down, *up, dir);
+      annotateLibcalls(*up);
+      annotateLibcalls(*down);
+      source::index(*down);
+      source::index(*up);
+      Model m(*down, *up, file, line);
+      m.interfaceNames = Client::publicInterface(*down, *up, dir);
+      m.index();
+      m.resolvePrecisely();
+      table = m.indirectTargets();
+      calls::write(table, outDir / "calls.txt");
     }
     std::vector<Witness> ws;
     {
@@ -1366,7 +1383,7 @@ int main(int argc, char **argv) {
   // The may answer is the set of satisfiable sequences, not one of them: the
   // sink is reachable when some member is. Each is the next satisfiable
   // sequence after the previous one; the set is finite because each
-  // sequence removes an edge into the sink.
+  // sequence removes the edge by which it leaves the interface.
   std::vector<Witness> witnesses;
   {
     std::ifstream st((outDir / "state.txt").string());
