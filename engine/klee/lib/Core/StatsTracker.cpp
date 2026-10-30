@@ -854,7 +854,8 @@ bool isSink(const Instruction *inst) {
   if (!cb || cb->arg_size() < 1)
     return false;
   const Function *callee = cb->getCalledFunction();
-  return callee && callee->getName() == "klee_warning_once" &&
+  return callee &&
+         (callee->getName() == "klee_warning_once" || callee->getName() == "klee_warning") &&
          sinkMarker(cb->getArgOperand(0));
 }
 

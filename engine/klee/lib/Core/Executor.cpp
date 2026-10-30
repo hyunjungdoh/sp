@@ -625,8 +625,10 @@ Executor::setModule(std::vector<std::unique_ptr<llvm::Module>> &modules,
   kmodule->optimiseAndPrepare(opts, preservedFunctions);
   kmodule->checkModule();
 
-  // 4.) Manifest the module
-  kmodule->manifest(interpreterHandler, StatsTracker::useStatistics());
+  // 4.) Manifest the module. Do not force assembly.ll just because
+  // statistics are on: dumping the full linked D∪U module as text dominates
+  // startup on large harnesses. Honour --output-source (default true).
+  kmodule->manifest(interpreterHandler, /*forceSourceOutput=*/false);
 
   specialFunctionHandler->bind();
 

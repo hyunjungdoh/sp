@@ -580,8 +580,14 @@ void SpecialFunctionHandler::handleWarningOnce(ExecutionState &state,
          "invalid number of arguments to klee_warning_once");
 
   std::string msg_str = readStringAtAddress(state, arguments[0]);
-  klee_warning_once(0, "%s: %s", state.stack.back().kf->function->getName().data(),
-                    msg_str.c_str());
+  // SINK-REACHED must always surface: klee_warning_once keys only on the
+  // format string, so an earlier once call in library code would suppress it.
+  if (msg_str == "SINK-REACHED")
+    klee_warning("%s: %s", state.stack.back().kf->function->getName().data(),
+                 msg_str.c_str());
+  else
+    klee_warning_once(0, "%s: %s", state.stack.back().kf->function->getName().data(),
+                      msg_str.c_str());
 }
 
 void SpecialFunctionHandler::handlePrintRange(ExecutionState &state,

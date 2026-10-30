@@ -211,7 +211,11 @@ void KModule::optimiseAndPrepare(
 }
 
 void KModule::manifest(InterpreterHandler *ih, bool forceSourceOutput) {
-  if (OutputSource || forceSourceOutput) {
+  // Honour --output-source only. Statistics used to force a full-module
+  // assembly.ll dump via forceSourceOutput; on large D∪U harnesses that
+  // dump dominates startup and is unused by the search.
+  (void)forceSourceOutput;
+  if (OutputSource) {
     std::unique_ptr<llvm::raw_fd_ostream> os(ih->openOutputFile("assembly.ll"));
     assert(os && !os->has_error() && "unable to open source output");
     *os << *module;

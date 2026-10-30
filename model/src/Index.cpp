@@ -468,7 +468,7 @@ void Model::noteZero(Type *Ty, const Suffix &suf) {
 // of the struct fields it lies at. D is the source type of the object C
 // initializes, when DWARF declares it.
 void Model::eachLeaf(Constant *C, Type *Ty, const Suffix &suf, const DIType *D,
-                     const std::function<void(Constant *, const Suffix &)> &leaf) {
+                     const std::function<void(Constant *, const Suffix &)> &leaf, bool smash) {
     if (!C)
       return;
     if (isa<ConstantPointerNull>(C) || isa<ConstantAggregateZero>(C))
@@ -482,9 +482,9 @@ void Model::eachLeaf(Constant *C, Type *Ty, const Suffix &suf, const DIType *D,
       uint64_t es = dl.getTypeAllocSize(ET).getFixedValue();
       for (unsigned i = 0; i < CDS->getNumElements(); ++i) {
         Suffix n = suf;
-        if (!n.empty() && es)
+        if (!n.empty() && es && !smash)
           n.back().off += (int64_t)i * (int64_t)es;
-        eachLeaf(CDS->getElementAsConstant(i), ET, n, source::element(D), leaf);
+        eachLeaf(CDS->getElementAsConstant(i), ET, n, source::element(D), leaf, smash);
       }
       return;
     }
@@ -493,7 +493,7 @@ void Model::eachLeaf(Constant *C, Type *Ty, const Suffix &suf, const DIType *D,
       auto named = namesFor(ST);
       if (named.empty()) {
         for (unsigned i = 0; i < S->getNumOperands(); ++i)
-          eachLeaf(S->getOperand(i), S->getOperand(i)->getType(), suf, nullptr, leaf);
+          eachLeaf(S->getOperand(i), S->getOperand(i)->getType(), suf, nullptr, leaf, smash);
         return;
       }
       // A declared source type names the one struct the constant is; the
@@ -509,7 +509,8 @@ void Model::eachLeaf(Constant *C, Type *Ty, const Suffix &suf, const DIType *D,
           n.push_back(Step{k, (int64_t)o});
           Type *E = N->getElementType(i);
           eachLeaf(S->getOperand(i), E, n,
-                   D ? source::member(D, o, E->isSized() ? dl.getTypeAllocSize(E).getFixedValue() : 0) : nullptr, leaf);
+                   D ? source::member(D, o, E->isSized() ? dl.getTypeAllocSize(E).getFixedValue() : 0) : nullptr, leaf,
+                   smash);
         }
       }
       return;
@@ -520,9 +521,9 @@ void Model::eachLeaf(Constant *C, Type *Ty, const Suffix &suf, const DIType *D,
       uint64_t es = ET ? dl.getTypeAllocSize(ET).getFixedValue() : 0;
       for (unsigned i = 0; i < A->getNumOperands(); ++i) {
         Suffix n = suf;
-        if (!n.empty() && es)
+        if (!n.empty() && es && !smash)
           n.back().off += (int64_t)i * (int64_t)es;
-        eachLeaf(A->getOperand(i), ET, n, source::element(D), leaf);
+        eachLeaf(A->getOperand(i), ET, n, source::element(D), leaf, smash);
       }
     }
   }
@@ -1573,9 +1574,12 @@ void Model::buildResolve() {
 
     // The access path of an address: the struct layers holding it, outer to
     // inner, each the layer's source type and the address's offset in it, up
-    // to the last loaded pointer. Layers outside an unknown offset (a variable
-    // array index) are not named; the layers inside it are. An address with no
-    // layer is into the objects its base pointer points to.
+    // to the last loaded pointer. The elements of a typed array are one
+    // element (array smashing): an index into an array, or over a typed
+    // pointer, adds nothing, so a[i].f, a[0].f and p[i].f name one field of
+    // the record holding a. Only a byte offset of unknown value is unknown, and
+    // layers outside it are not named. An address with no layer is into the
+    // objects its base pointer points to.
     struct Addr {
       Suffix path;
       Value *base = nullptr;
@@ -1589,10 +1593,10 @@ void Model::buildResolve() {
       auto idx = G->idx_begin();
       if (idx != G->idx_end()) {
         auto *CI = dyn_cast<ConstantInt>(*idx);
-        if (CI && T->isSized())
-          c.push_back(CI->getSExtValue() * (int64_t)dl.getTypeAllocSize(T).getFixedValue());
+        if (T->isIntegerTy(8))
+          c.push_back(CI ? std::optional<int64_t>(CI->getSExtValue()) : std::nullopt);
         else
-          c.push_back(std::nullopt);
+          c.push_back(T->isSized() ? std::optional<int64_t>(0) : std::nullopt);
         ++idx;
       }
       for (bool open = true; open;) {
@@ -1609,8 +1613,7 @@ void Model::buildResolve() {
           T = ST->getElementType(i);
           D = D ? source::member(D, o, T->isSized() ? dl.getTypeAllocSize(T).getFixedValue() : 0) : nullptr;
         } else if (auto *AT = dyn_cast<ArrayType>(T)) {
-          int64_t es = (int64_t)dl.getTypeAllocSize(AT->getElementType()).getFixedValue();
-          c.push_back(CI ? std::optional<int64_t>(CI->getSExtValue() * es) : std::nullopt);
+          c.push_back(0);
           T = AT->getElementType();
           D = D ? source::element(D) : nullptr;
         } else {
@@ -1917,7 +1920,7 @@ void Model::buildResolve() {
           if (!p.empty())
             add(cell(true, p), T);
         }
-      });
+      }, true);
     };
 
     for (Module *M : {&down, &up})
@@ -2237,16 +2240,25 @@ std::unordered_set<Function *> Model::reachSink() {
   }
 
 std::vector<Function *> Model::findStarts() {
+    // B_entry = { f ∈ I ∩ R(s) | ∄ c ∈ R(s) : (c → f) ∈ E }.
+    // When I is known, only another interface symbol may witness that f is a
+    // midpoint: a non-interface caller in R(s) is part of the library below
+    // the client and must not disqualify a public origin.
     std::vector<Function *> v;
     for (Function *E : exports) {
       if (!cone.count(E) || (!startNames.empty() && !startNames.count(E->getName().str())))
         continue;
       bool inside = false;
-      auto it = interfaceNames.empty() ? callersOf.find(E) : callersOf.end();
+      auto it = callersOf.find(E);
       if (it != callersOf.end())
-        for (Function *C : it->second)
-          if (cone.count(C))
-            inside = true;
+        for (Function *C : it->second) {
+          if (!cone.count(C))
+            continue;
+          if (!interfaceNames.empty() && !interfaceNames.count(C->getName().str()))
+            continue;
+          inside = true;
+          break;
+        }
       if (!inside)
         v.push_back(E);
     }
@@ -2312,14 +2324,12 @@ std::vector<Model::Path> Model::sequences(int seqPick) {
       if (!got)
         break;
       found.push_back(best);
-      // The client chooses only among interface calls, and the search
-      // explores the library below them, so a sequence is told apart from
-      // the others by the hop that leaves the interface.
-      for (size_t k = 1; k < best.fn.size(); ++k)
-        if (std::find(exports.begin(), exports.end(), best.fn[k]) == exports.end() || k + 1 == best.fn.size()) {
-          banned.insert({best.fn[k - 1], best.fn[k]});
-          break;
-        }
+      // Candidate n is the least path, by (indirect edges, length), whose
+      // call edge into s is not that of an earlier candidate: one candidate
+      // per edge (u -> s) of E in R(s), in cost order.
+      if (best.fn.size() < 2)
+        break;
+      banned.insert({best.fn[best.fn.size() - 2], best.fn.back()});
     }
     return found;
   }

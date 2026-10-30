@@ -717,8 +717,9 @@ class Model {
   void noteZero(Type *Ty, const Suffix &suf);
 
 
+  // smash: the elements of an array are one element (the resolution's cells).
   void eachLeaf(Constant *C, Type *Ty, const Suffix &suf, const DIType *D,
-                const std::function<void(Constant *, const Suffix &)> &leaf);
+                const std::function<void(Constant *, const Suffix &)> &leaf, bool smash = false);
   void walkInit(Constant *C, Type *Ty, const Suffix &suf, bool scalars, const DIType *D = nullptr);
 
 

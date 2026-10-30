@@ -1,29 +1,28 @@
 \section{Motivation}\label{sec:moti}
 % In this section, we formalize the problem addressed by \sys and illustrate why assessing exploitability through downstream applications requires recovering the calls and runtime state needed to trigger a vulnerable sink, as well as finding inputs that trigger it under that state.
-In this section, we formalize the problem addressed by \sys and then illustrate the importance of downstream configuration through a motivating example.
+In this section, we formalize the problem addressed by \sys and then illustrate the importance of \textit{downstream configuration context} through a motivating example.
 We begin by distinguishing two complementary contexts that determine whether a propagated vulnerability is triggered through a downstream application:
 \begin{itemize}
     \setlength\itemsep{0.0em}
-    \item \textbf{Data context} is the input delivered to the vulnerable
-    code.
-    \item \textbf{Configuration context} is the configuration state set by the downstream application, that affects how the upstream component processes the data context.
+    \item \textbf{Data context} is the input data delivered to the vulnerable upstream code.
+    \item \textbf{Configuration context} is the downstream execution context that enables the input to trigger the vulnerability.
 \end{itemize}
 Therefore, a propagated vulnerability is exploitable through the downstream application only when both contexts satisfy its triggering conditions.
 
 \subsection{Problem Statement}
 \label{subsec:problem}
-In this paper, we focus on determining whether both the data and configuration contexts satisfy the triggering conditions for a given upstream vulnerability and downstream application.
-The same data context (e.g., Upstream PoC) often fails under $D$'s default configuration $C_\bot$ but triggers under another externally controllable configuration in $\mathcal{C}_D$.
-Our goal is to recover such a configuration and a data context $X$ under which it triggers: 
+In this paper, we focus on recovering the configuration context required to trigger an upstream vulnerability through a downstream application.
+
+Let \(U\) denote the vulnerable upstream component, \(D\) the downstream application, \(X\) the data context, and \(C\) the configuration context. 
+Our goal is to recover a \(C\) under which the \(X\) triggers the vulnerability:
 \[
 \begin{aligned}
 \operatorname{Exploit}(U,D)
-\iff {} & \exists\,X \in \mathcal{X}_D,\;
-           \exists\,C \in \mathcal{C}_D: \\
+\iff {} & \exists X \in \mathcal{X}_D,\;
+           \exists C \in \mathcal{C}_D: \\
         & \operatorname{Trigger}(U,X,C).
 \end{aligned}
 \]
-
 % In this paper, we investigate whether vulnerabilities in upstream libraries remain exploitable through downstream applications. Let $U$ denote an upstream library containing a vulnerable sink $s$, and let $D$ denote a downstream application that uses $U$. Triggering $s$ through $D$ requires both suitable input data and the runtime state in which $U$ processes that data. We distinguish two factors that affect whether $s$ is triggered:
 % \begin{itemize}
 %     \setlength\itemsep{0.2em}
@@ -47,13 +46,92 @@ Our goal is to recover such a configuration and a data context $X$ under which i
 
 \subsection{Motivating Examples}
 \label{subsec:motivating}
-\noindent\textbf{Example 1)}
+
+To illustrate the importance of configuration context in assessing vulnerability exploitability, we use CVE-2026-24450 in \texttt{LibRaw} and its downstream client \texttt{OpenImageIO} (\texttt{OIIO}). The vulnerability affects \texttt{LibRaw} 0.21.1 and originates from an integer overflow in its floating-point DNG decoder.
+
+As shown in \autoref{lst:moti_vul}, \texttt{LibRaw} computes the allocation size in 64-bit arithmetic (line \#3) and checks it against \texttt{max\_raw\_memory\_mb} (line \#4). If the check passes, the size is recomputed in \texttt{calloc()} (line \#6), where integer overflow can yield an undersized buffer. A pointer into this buffer is passed to \texttt{read()} (line \#10), reaching the faulting \texttt{memmove} (line \#14). \texttt{LibRaw} fixed the vulnerability in commit \texttt{a58727c} by reusing the previously computed 64-bit size for allocation.
+
+In the downstream setting, however, the \texttt{OIIO} case shows that the presence of the vulnerable \texttt{LibRaw} code alone does not determine exploitability; the outcome depends on the configuration established by the downstream
+application.
+
+In \texttt{OIIO}, \texttt{raw:max\_raw\_memory\_mb} is a downstream configuration that controls \texttt{LibRaw}'s memory limit during decoding. This configuration takes effect when \texttt{OIIO} invokes \texttt{LibRaw::unpack()}, which eventually reaches the vulnerable DNG decoder shown in \autoref{lst:moti_vul}. Importantly, this downstream-provided value controls the allocation-size check that guards the vulnerable allocation: a large value allows the malicious input to pass the check and reach the vulnerable code, whereas a smaller value causes decoding to terminate earlier. Therefore, whether this configuration is applied before or after \texttt{unpack()} directly affects exploitability.
+
+\vspace{5px}
+\noindent\textbf{S1: Vulnerable but not exploitable.}
+In \texttt{OIIO} v3.1.12.0, this downstream configuration was applied only after \texttt{unpack()}. Consequently, \texttt{LibRaw} decoded the same malicious input under its default 2,048 MB limit and rejected it before reaching the vulnerable allocation.
+
+\vspace{5px}
+\noindent\textbf{S2: Exploitable under a downstream configuration.}
+Commit \texttt{f717fc7} moved the application of this configuration before \texttt{unpack()}, allowing the configured limit to affect decoding. With a value such as \texttt{raw:max\_raw\_memory\_mb=20000}, the same
+input can pass the size check and proceed to the vulnerable allocation, ultimately reaching the faulting \texttt{memmove}.
+
+\vspace{5px}
+\noindent\textbf{S3: Exploitability removed by constraining the configuration.}
+Following our report, commit \texttt{b112832} capped
+\texttt{raw:max\_raw\_memory\_mb} at 16,383 MB before
+\texttt{unpack()}. Under this cap, the same malicious input is again rejected before reaching the vulnerable allocation.
+
+\vspace{6.3px}
+Together, S1--S3 show that exploitability can change even when the upstream vulnerability and malicious input remain unchanged, solely because of the configuration established by the downstream application. Existing exploitability analyses do not adequately capture this configuration-dependent behavior and may therefore classify S2 as non-exploitable. We further examine this limitation of existing approaches in \autoref{sec:eval}.
+
+\begin{figure}[t]
+\begin{lstlisting}[caption=\label{lst:moti_vul}{Simplified vulnerability-triggering flow in \texttt{LibRaw} for CVE-2026-24450 (\texttt{src/decoders/fp\_dng.cpp}).}, language=C, frame=single, style=base, frame=, basicstyle=\fontsize{8.3}{9}\ttfamily\color{black}, deletekeywords={for}, mathescape, breakatwhitespace=true, breaklines=true]
+$\text{\quad\textcolor{citegray}{\detokenize{func: LibRaw::uncompressed_fp_dng_load_raw}}}$
+$\text{\quad\textcolor{black}{INT64 allocsz = INT64(tiles.tileCnt) * INT64(tiles.tileWidth)}}$$\text{\hspace{5.3em}* INT64(tiles.tileHeight) * INT64(ifd->samples)}$ $\text{\hspace{5.3em}* INT64(sizeof(float));}$
+$\text{\quad\textcolor{black}{if \detokenize{(allocsz >} INT64\detokenize{(imgdata.rawparams.}\textcolor{orange}{\detokenize{max_raw_memory_mb}})}}$$\text{\hspace{5.3em}\detokenize{* }INT64\detokenize{(1024 * 1024))}}$ 
+$\text{\quad\quad\quad\textcolor{black}{throw \detokenize{LIBRAW_EXCEPTION_TOOBIG;}}}$
+$\text{\quad\textcolor{black}{\detokenize{float_raw_image = (}float *)calloc\detokenize{(tiles.tileCnt }}}$$\text{\hspace{6.4em}\detokenize{* tiles.tileWidth * tiles.tileHeight}}$ $\text{\hspace{6.4em}\detokenize{* ifd->samples, sizeof(}float\detokenize{));}}$ 
+$\text{\quad\textcolor{black}{\detokenize{...}}}$
+$\text{\quad\textcolor{black}{int \detokenize{fullrowbytes = tiles.tileWidth * bytesps * ifd->samples;}}}$
+$\text{\quad\textcolor{black}{unsigned char *dst = fullrowbytes > inrowbytes ? rowbuf.data()}}$$\text{: (unsigned char *)\detokenize{&float_raw_image[(}}$ $\text{\detokenize{(y + row) * imgdata.sizes.raw_width + x) * ifd->samples];}}$
+$\text{\quad\textcolor{black}{input->read(dst, 1, fullrowbytes);}}$
+
+$\text{\quad\textcolor{citegray}{\detokenize{path: src/libraw_datastream.cpp}}}$
+$\text{\quad\textcolor{citegray}{\detokenize{func: LibRaw_buffer_datastream::read}}}$
+$\text{\quad\textcolor{black}{\textcolor{purple}{memmove} \detokenize{(ptr, buf + streampos, to_read);}\textcolor{citegray}{\hspace{0.5em}// ptr = dst}}}$
+\end{lstlisting}
+
+\begin{lstlisting}[caption=\label{lst:moti_oiio}{Configuration changes in \texttt{OpenImageIO} that alter the exploitability of CVE-2026-24450 (\texttt{src/raw.imageio/rawinput.cpp}).}, language=C, frame=single, style=base, frame=, basicstyle=\fontsize{8.3}{9}\ttfamily\color{black}, deletekeywords={for}, mathescape, breakatwhitespace=true, breaklines=true]
+$\text{\quad\textcolor{citegray}{\detokenize{func: RawInput::open_raw()}}}$
+$\text{\quad\textcolor{citegray}{/* \textcolor{purple}{\textbf{S1}}: before f717fc7 */}}$
+$\text{\quad\textcolor{black}{\detokenize{m_processor->unpack();}}}$
+$\text{\quad\textcolor{black}{\detokenize{m_processor->imgdata.rawparams.max_raw_memory_mb =}}}$$\text{\hspace{0.3em}\detokenize{config.get_int_attribute("}\textcolor{orange}{\detokenize{raw:max_raw_memory_mb}}", 2048);}$ 
+
+$\text{\quad\textcolor{citegray}{/* \textcolor{purple}{\textbf{S2}}: after f717fc7 */}}$
+$\text{\quad\textcolor{black}{\detokenize{m_processor->imgdata.rawparams.max_raw_memory_mb =}}}$$\text{\hspace{0.3em}\detokenize{config.get_int_attribute("}\textcolor{orange}{\detokenize{raw:max_raw_memory_mb}}", 2048);}$ 
+$\text{\quad\textcolor{black}{\detokenize{m_processor->unpack();}}}$
+
+$\text{\quad\textcolor{citegray}{/* \textcolor{purple}{\textbf{S3}}: after b112832 */}}$
+$\text{\quad\textcolor{black}{\textcolor{purple}{int} \detokenize{maxmem = config.get_int_attribute(}}}$$\text{\hspace{13.3em}\detokenize{"}\textcolor{orange}{\detokenize{raw:max_raw_memory_mb}}", 2048);}$ 
+$\text{\quad\textcolor{black}{\detokenize{m_processor->imgdata.rawparams.max_raw_memory_mb =}}}$$\text{\hspace{13.3em}\detokenize{std::min(maxmem, 16383);}}$ 
+$\text{\quad\textcolor{black}{\detokenize{m_processor->unpack();}}}$
+\end{lstlisting}
+%\vspace{0.1em}
+\end{figure}
+
+Accurately assessing such cases requires identifying the downstream configuration that affects vulnerability triggering. However, this is challenging for two main reasons.
+
+\PP{Challenge 1: Cross-boundary configuration context}
+The configuration context spans downstream and upstream components: the downstream application invokes the upstream library through API calls, often via indirect calls. 
+These calls make it difficult to recover the trigger call path across the boundary. 
+However, recovering the call path alone is insufficient. 
+The analysis must also recover the values and control-flow conditions that jointly determine whether the path is feasible across both modules~\cite{deng2025chainfuzz, li2025transferfuzz}.
+
+\PP{Challenge 2: Execution feasibility}
+% Even after the trigger path and its conditions are recovered, realizing them in an actual downstream execution remains challenging.
+% The data context can affect downstream control flow and internal state before reaching the upstream sink, while the configuration context determines how the data reaches and is processed by the vulnerable code.
+% Thus, the two contexts must be satisfied together in the same execution to trigger the vulnerability~\cite{cadar2008klee, ma2011directedse, luo2023selectfuzz}.
 
 
-\noindent\textbf{Example 2)}
 
 
 
+
+
+
+
+
+% ---------------
 % We illustrate these challenges using two upstream--downstream pairs.
 % The first shows why a downstream application may require a different call sequence and arguments from those in the upstream PoC.
 % The second shows why triggering the sink also requires carefully chosen explicit inputs.

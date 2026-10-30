@@ -5091,13 +5091,16 @@ void Client::emit(const Plan &P, Module &H) const {
     return ConstantPointerNull::get(p0);
   };
   std::function<void(IRBuilder<> &, Value *, const DIType *, unsigned, const Where &)> fields;
+  // Seed path = choice 0. A nullable pointer the plan can establish must
+  // therefore take the non-null arm first: otherwise the seed never installs
+  // the configuration the witness requires (config args stay null).
   auto nullOr = [&](IRBuilder<> &C, bool nullable, const std::function<Value *(IRBuilder<> &)> &make) -> Value * {
     if (!nullable)
       return make(C);
     AllocaInst *slot = K.entryAlloca(C, p0);
     K.oneOf(C,
-            {[&](IRBuilder<> &D) { D.CreateStore(ConstantPointerNull::get(p0), slot); },
-             [&](IRBuilder<> &D) { D.CreateStore(make(D), slot); }},
+            {[&](IRBuilder<> &D) { D.CreateStore(make(D), slot); },
+             [&](IRBuilder<> &D) { D.CreateStore(ConstantPointerNull::get(p0), slot); }},
             "null");
     return C.CreateLoad(p0, slot);
   };
