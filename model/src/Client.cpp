@@ -490,6 +490,19 @@ std::set<std::string> Client::publicInterface(Module &down, Module &up, const fs
   return names;
 }
 
+// P1 starts: interface functions the client can actually invoke with
+// producible held arguments. A symbol that is only null-callable for an
+// unproducible handle is not a start — sequences begin at a real entry so
+// φ is projected onto that entry's arguments (P1 ⇒ P2 without elevation).
+std::set<std::string> Client::entryInterface(Module &down, Module &up, const fs::path &dir) {
+  Client c(down, up, dir);
+  std::set<std::string> names;
+  for (Function *F : c.ifaceD)
+    if (c.entryCallable(F))
+      names.insert(F->getName().str());
+  return names;
+}
+
 std::set<std::string> Client::installedExports(const fs::path &dir) {
   std::ifstream js(dir / "surfaces.json");
   std::string text((std::istreambuf_iterator<char>(js)), std::istreambuf_iterator<char>());
@@ -2331,11 +2344,28 @@ bool Client::callable(Function *F) const {
   return true;
 }
 
+bool Client::entryCallable(Function *F) const {
+  if (!F->getSubprogram())
+    return false;
+  const auto &sig = signature(F);
+  auto at = irParams(F);
+  for (unsigned i = 0; i < at.size(); ++i) {
+    if (at[i] < 0)
+      continue;
+    const Param &p = sig[at[i]];
+    if (held(p) && !cost.count(p.type))
+      return false;
+  }
+  return true;
+}
+
 // The interface functions of D through which the client reaches the
-// sequence: E itself when it is one, otherwise the callable ones at the
-// least call distance from which E is reached.
+// sequence: E itself when it is an entryCallable one, otherwise the
+// entryCallable ones at the least call distance from which E is reached.
+// callable() alone is not enough: a π₀ that is only null-callable for an
+// unproducible handle would soft-accept and never elevate to the real E.
 std::vector<Function *> Client::entries(Function *E) const {
-  if (ifaceD.count(E) && callable(E))
+  if (ifaceD.count(E) && entryCallable(E))
     return {E};
   FnMap<FnSet> callers;
   for (const auto &kv : calls)
@@ -2351,7 +2381,7 @@ std::vector<Function *> Client::entries(Function *E) const {
     unsigned d = dist[G];
     if (d > found)
       break;
-    if (G != E && ifaceD.count(G) && callable(G)) {
+    if (G != E && ifaceD.count(G) && entryCallable(G)) {
       found = d;
       out.push_back(G);
       continue;
@@ -3816,14 +3846,17 @@ Client::Plan Client::plan(const Witnesses &ws) const {
       if (!dup)
         ls.push_back(l);
     }
-    for (const Cell &c : W.files) {
-      auto &fs = P.files[E];
-      bool dup = false;
-      for (const Cell &d : fs)
-        dup = dup || d.text == c.text;
-      if (!dup)
-        fs.push_back(c);
-    }
+    // File name cells install on the callable entry main calls (§4), which
+    // is an elevated E when π₀ itself is not callable — not on π₀ alone.
+    for (Function *F : W.entries)
+      for (const Cell &c : W.files) {
+        auto &fs = P.files[F];
+        bool dup = false;
+        for (const Cell &d : fs)
+          dup = dup || d.text == c.text;
+        if (!dup)
+          fs.push_back(c);
+      }
     // Definition 3.8.6: a setting is the client's own choice, like a lever,
     // at every entry that receives the object the lookup reads.
     for (const Named &n : named(seq))
@@ -3837,16 +3870,20 @@ Client::Plan Client::plan(const Witnesses &ws) const {
       }
     if (W.pass) {
       writerSet.insert(W.cover.begin(), W.cover.end());
-      auto &ks = P.keyed[E];
-      for (const auto &[F, k] : W.keyed) {
-        bool dup = false;
-        for (const auto &[G, o] : ks)
-          dup = dup || (G == F && o.tag == k.tag && o.tagV == k.tagV && o.preds == k.preds);
-        if (!dup)
-          ks.push_back({F, k});
+      // Key setters likewise bind to the elevated callable entry, so the
+      // harness that calls that entry installs them before the call.
+      for (Function *Ent : W.entries) {
+        auto &ks = P.keyed[Ent];
+        for (const auto &[F, k] : W.keyed) {
+          bool dup = false;
+          for (const auto &[G, o] : ks)
+            dup = dup || (G == F && o.tag == k.tag && o.tagV == k.tagV && o.preds == k.preds);
+          if (!dup)
+            ks.push_back({F, k});
+        }
+        if (ks.empty())
+          P.keyed.erase(Ent);
       }
-      if (ks.empty())
-        P.keyed.erase(E);
     }
     P.witnesses.push_back(std::move(W));
   }
@@ -3874,6 +3911,21 @@ Client::Plan Client::plan(const Witnesses &ws) const {
   P.writers.assign(writerSet.begin(), writerSet.end());
   grammar(P);
   dispatch(ws, P);
+  // §5 / P2: realized ⇔ entryCallable E exists (pass.iface) ∧ cell opens 0
+  // (pass) ∧ dispatch opens 0 ∧ the plan is not a vacuous elevation.
+  // A π₀ that is only null-callable elevates; if that E installs nothing
+  // (no cell, file, lever, key, or named), counting it as pass soft-accepts.
+  // Direct starts with zero client cells remain realized when dispatch is closed
+  // ("의무 없음" at a real entry). Elevated vacuous plans stay unrealized.
+  for (WitnessPlan &W : P.witnesses) {
+    bool install = !W.cells.empty() || !W.files.empty() || !W.levers.empty() || !W.keyed.empty();
+    for (Function *F : W.entries) {
+      auto nit = P.named.find(F);
+      if (nit != P.named.end() && !nit->second.empty())
+        install = true;
+    }
+    W.realized = W.pass && W.dispatchOpen == 0 && (W.direct || install);
+  }
   return P;
 }
 
@@ -3926,6 +3978,27 @@ void Client::grammar(Plan &P) const {
   }
 }
 
+// §3.7 / P1 gate: which indirect edges of seq Definition D leaves open when
+// the plan is the empty-φ plan at seq[0] (producers of the entry, no writers).
+std::vector<std::pair<std::string, std::string>> Client::openDispatchEdges(const std::vector<std::string> &seq) const {
+  if (seq.empty())
+    return {};
+  Plan P = plan({{seq, {}}});
+  std::vector<std::pair<std::string, std::string>> open;
+  for (const std::string &line : P.obligations) {
+    if (line.find(" OPEN") == std::string::npos || line.rfind("  D ", 0) != 0)
+      continue;
+    // "  D A -> B st N OPEN" or "  D A -> B st N OPEN ..."
+    std::string rest = line.substr(4);
+    auto arrow = rest.find(" -> ");
+    auto st = rest.find(" st ");
+    if (arrow == std::string::npos || st == std::string::npos || arrow >= st)
+      continue;
+    open.emplace_back(rest.substr(0, arrow), rest.substr(arrow + 4, st - arrow - 4));
+  }
+  return open;
+}
+
 // §2.4 Key and §3.7: an edge a -> b of a witness is indirect when a has no
 // call of b. Definition D realizes its dispatch by a key (1), by a call of
 // the harness installing b while the harness reads the input (2), or by a
@@ -3941,6 +4014,9 @@ void Client::dispatch(const Witnesses &ws, Plan &P) const {
     for (const auto &[W, k] : ks)
       setters.insert(W);
   std::set<std::string> keySeen;
+  // P.witnesses holds one plan per witness plan() did not skip, in ws order;
+  // plan() skips exactly the witnesses with no first function.
+  size_t wpi = 0;
   for (const auto &[seq, phi] : ws) {
     Function *E = seq.empty() ? nullptr : body(seq[0]);
     FnSet called = made;
@@ -4007,6 +4083,9 @@ void Client::dispatch(const Witnesses &ws, Plan &P) const {
                             std::to_string(indirect) + " open " + std::to_string(open) + " file " +
                             std::to_string(file ? 1 : 0));
     P.obligations.insert(P.obligations.end(), notes.begin(), notes.end());
+    // Realization (W.realized) is decided in plan() after named/files bind.
+    if (E && wpi < P.witnesses.size())
+      P.witnesses[wpi++].dispatchOpen = open;
   }
 }
 
@@ -4027,7 +4106,8 @@ void Client::report(const Plan &P, raw_ostream &out) const {
     return s;
   };
   for (Function *F : P.firsts) {
-    out << "first " << F->getName() << " iface " << ifaceD.count(F) << " callable " << callable(F) << " (" << sig(F) << ")";
+    out << "first " << F->getName() << " iface " << ifaceD.count(F) << " callable " << callable(F)
+        << " entry-callable " << entryCallable(F) << " (" << sig(F) << ")";
     const auto &ps = signature(F);
     auto at = irParams(F);
     for (unsigned i = 0; i < at.size(); ++i)
@@ -4089,7 +4169,8 @@ void Client::report(const Plan &P, raw_ostream &out) const {
     std::map<Realize, unsigned> n;
     for (const Realized &r : W.cells)
       ++n[r.how];
-    out << "witness " << W.first->getName() << " " << (W.pass ? "pass" : "open") << " iface " << W.iface;
+    out << "witness " << W.first->getName() << " " << (W.realized ? "realized" : W.pass ? "pass" : "open")
+        << " iface " << W.iface << " dispatch-open " << W.dispatchOpen;
     for (Realize r : {Realize::Own, Realize::Lever, Realize::Key, Realize::Write, Realize::Construct, Realize::File,
                       Realize::Open})
       out << " " << realizeName(r) << " " << n[r];
@@ -4106,6 +4187,8 @@ void Client::report(const Plan &P, raw_ostream &out) const {
     for (const std::string &e : W.excluded)
       out << "  excluded " << e << "\n";
   }
+  out << "realized " << std::count_if(P.witnesses.begin(), P.witnesses.end(), [](const WitnessPlan &W) { return W.realized; })
+      << " of " << P.witnesses.size() << "\n";
   for (const std::string &o : P.obligations)
     out << o << "\n";
   out << "establish " << estLog.size() << "\n";

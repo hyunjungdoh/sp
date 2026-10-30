@@ -84,10 +84,9 @@ public:
     // §3.5: the cell lies inside a D→U crossing actual, so it is part of the
     // state the client must build and hand across the boundary (Phi_boundary).
     bool boundary = false;
-    // §3.5: this witness has a D→U crossing (some resolved or unresolved
-    // boundary root), so the boundary projection applies: only boundary cells
-    // are client obligations. Without a crossing the projection is undefined
-    // and every cell stays an obligation.
+    // §3.5: this witness has a resolved D→U boundary root, so Φ_∂ applies:
+    // only boundary (and prefix/own) cells are client obligations. Unresolved
+    // roots alone do not enable the projection — every constrained cell stays.
     bool crossing = false;
     // §3.8 정리 B 보정: 첫 교차 이하의 D 함수가 경로 조건에서 읽은 셀(Φ_pre).
     bool prefix = false;
@@ -181,7 +180,16 @@ public:
     std::vector<std::string> excluded;
     // The function sequence the plan is for, when it answers a 정의 E query.
     std::vector<std::string> seq;
+    // §3.9: iface(callable entry exists) ∧ every obligation cell non-Open.
+    // Controls which writers and key setters the harness installs.
     bool pass = false;
+    // §3.7: indirect dispatch edges of this witness Definition D leaves open.
+    unsigned dispatchOpen = 0;
+    // §5 따름정리 (실패의 분리): the witness is a faithful program only when a
+    // callable interface entry reaches π₀ (pass), every cell obligation is
+    // discharged (pass), and no dispatch edge is open. An unrealized witness
+    // is a model gap, not a search gap: it opens the H3 gate.
+    bool realized = false;
   };
   using Witnesses = std::vector<std::pair<std::vector<std::string>, std::vector<Cell>>>;
   struct Plan {
@@ -234,14 +242,22 @@ public:
 
   Client(Module &down, Module &up, const fs::path &dir);
   static std::set<std::string> downstreamInterface(const fs::path &dir);
-  // I: exports of D that an installed header declares. Witnesses start here,
-  // the same functions the client calls. A dynamic symbol the header does
-  // not declare is not a start.
+  // I: exports of D that an installed header declares. The call graph and
+  // midpoint test use this set. A dynamic symbol the header does not
+  // declare is not in I.
   static std::set<std::string> publicInterface(llvm::Module &down, llvm::Module &up, const fs::path &dir);
+  // P1 start set: members of I whose held argument types are all client-
+  // producible (entryCallable). Witnesses begin only here so π₀ is a real
+  // client entry and φ lands on its arguments.
+  static std::set<std::string> entryInterface(llvm::Module &down, llvm::Module &up, const fs::path &dir);
   // Every symbol, function or data, exported or local, a library the closure
   // installs defines.
   static std::set<std::string> installedExports(const fs::path &dir);
   Plan plan(const Witnesses &ws) const;
+  // §3.7 / P1: indirect edges of seq that Definition D cannot realize with
+  // the producers and writers an empty-φ plan would install at seq[0].
+  // P1 keeps a path only when this set is empty (φ SAT is not enough).
+  std::vector<std::pair<std::string, std::string>> openDispatchEdges(const std::vector<std::string> &seq) const;
   void report(const Plan &P, raw_ostream &out) const;
   void emit(const Plan &P, Module &H) const;
   // Bounds of the client search: writer calls before the entry, and the
@@ -427,6 +443,10 @@ private:
   FnSet closure(Function *F) const;
   const FnSet &closureOf(Function *F) const;
   bool callable(Function *F) const;
+  // §P2 entry elevation: like callable, but every held argument type must be
+  // in cost. A null-only opaque formal does not make a hollow π₀ the client
+  // entry — that soft-accepts and skips the real E that installs φ/named.
+  bool entryCallable(Function *F) const;
   std::vector<Function *> entries(Function *E) const;
   std::vector<Function *> writers(const Cell &c) const;
   // Whether any defined function stores to the field (struct type, offset).

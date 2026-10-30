@@ -20,10 +20,13 @@ void Model::run(int seqPick, raw_ostream &out) {
     index();
     cone = reachSink();
     starts = findStarts();
+    hopBan.clear();
     out << "starts " << starts.size() << "\n";
     // Indexing is done. Resolve local-held pointers precisely from here on.
     resolveHeld = true;
-    for (int n = seqPick;; ++n) {
+    // n advances only on φ-UNSAT (next sink-edge diversity). Dispatch-open
+    // bans the bad hop and retries the same n under hopBan.
+    for (int n = seqPick;;) {
       auto paths = sequences(n);
       if ((int)paths.size() <= n) {
         out << "sequence " << n << " absent\n";
@@ -37,8 +40,28 @@ void Model::run(int seqPick, raw_ostream &out) {
       for (Function *F : path.fn)
         out << "fn " << F->getName() << " " << pretty(F->getName()) << "\n";
       inputs(path.fn, out);
-      if (solve(path.fn, out))
-        return;
+      if (!solve(path.fn, out)) {
+        ++n;
+        continue;
+      }
+      // P1: φ SAT is necessary but not sufficient. An indirect edge the
+      // client cannot realize (Definition D) is not a trigger path — ban it
+      // and re-search at the same n so hopBan can yield another root path.
+      if (openDispatch) {
+        auto open = openDispatch(path.fn);
+        if (!open.empty()) {
+          out << "dispatch-open " << open.size() << "\n";
+          bool grew = false;
+          for (const auto &e : open) {
+            out << "  open-edge " << e.first << " -> " << e.second << "\n";
+            grew = hopBan.insert(e).second || grew;
+          }
+          if (!grew)
+            ++n; // hop already banned but still selected — diversify
+          continue;
+        }
+      }
+      return;
     }
   }
 
@@ -2240,10 +2263,11 @@ std::unordered_set<Function *> Model::reachSink() {
   }
 
 std::vector<Function *> Model::findStarts() {
-    // B_entry = { f ∈ I ∩ R(s) | ∄ c ∈ R(s) : (c → f) ∈ E }.
-    // When I is known, only another interface symbol may witness that f is a
-    // midpoint: a non-interface caller in R(s) is part of the library below
-    // the client and must not disqualify a public origin.
+    // B_entry = { f ∈ I★ ∩ R(s) | ∄ c ∈ R(s) ∩ I : (c → f) ∈ E }.
+    // I★ = startNames when set (entryCallable subset of I); else I.
+    // Only another interface symbol may witness that f is a midpoint: a
+    // non-interface caller in R(s) is library-internal and must not
+    // disqualify a public origin.
     std::vector<Function *> v;
     for (Function *E : exports) {
       if (!cone.count(E) || (!startNames.empty() && !startNames.count(E->getName().str())))
@@ -2308,6 +2332,8 @@ std::vector<Model::Path> Model::sequences(int seqPick) {
             if (!cone.count(T) || T->isDeclaration())
               continue;
             if (banned.count({At, T}))
+              continue;
+            if (hopBan.count({At->getName().str(), T->getName().str()}))
               continue;
             if (std::find(cur.fn.begin(), cur.fn.end(), T) != cur.fn.end())
               continue;

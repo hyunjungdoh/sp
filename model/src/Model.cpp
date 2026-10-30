@@ -501,14 +501,20 @@ struct Witness {
 // entry formula (model lines). A model line with no fact is not an atom.
 // The may cell list is the formula only when this block has no model lines.
 Witness parseWitness(std::istream &st) {
-  Witness w;
+  Witness w, accepted;
   std::vector<Client::Cell> may, facts;
   // §3.5 정의 3.5.2: 이 시퀀스의 경계 근 R(π). 각 근은 (export 인자, 타입 경로)다.
   std::vector<std::pair<int, std::vector<std::string>>> roots;
-  // §3.5: 이 시퀀스에 D→U 교차가 있는가(해결·미해결 근 중 하나라도). 있으면 경계
-  // 투영이 정의되어 경계 셀만 의무다.
+  // Φ_∂ applies when the path has a D↔client object boundary: resolved
+  // boundary roots, or unresolved (D-allocated) roots. Then only boundary
+  // and prefix cells are client obligations; D-internal residual is not.
   bool crossing = false;
-  bool sawModel = false;
+  // Any non-return "model" line (including unknown). Valued atoms are those
+  // take() keeps; unknown lines are free vars, not φ atoms.
+  bool sawModelLine = false;
+  // A sequence followed by dispatch-open is not a P1 witness — φ SAT alone
+  // is not enough when Definition D leaves an indirect edge open.
+  bool rejected = false;
   // §3.8: prefix cells (root, type path, last offset) and the key setter that
   // precedes its "discharges" line.
   std::vector<std::tuple<int, std::vector<std::string>, int64_t>> prefixes;
@@ -578,17 +584,59 @@ Witness parseWitness(std::istream &st) {
       return;
     into.push_back(std::move(c));
   };
+  auto finish = [&](Witness &dst) {
+    // φ_π = residual entry formula. May-layer domains are not φ — use them
+    // only when the run emitted no model section (legacy / no residual).
+    dst.phi = sawModelLine ? facts : may;
+    if (sawModelLine)
+      for (const Client::Cell &m : may) {
+        if (!m.file)
+          continue;
+        bool have = false;
+        for (Client::Cell &c : dst.phi)
+          if (c.root == m.root && c.off == m.off && c.path == m.path) {
+            c.file = true;
+            have = true;
+            break;
+          }
+        if (!have)
+          dst.phi.push_back(m);
+      }
+    // Φ_∂: under crossing, only boundary/prefix cells are client obligations.
+    for (Client::Cell &c : dst.phi) {
+      c.crossing = crossing;
+      for (const auto &[root, typePath, off] : prefixes)
+        if (root == c.root && off == c.off && typePath == c.path)
+          c.prefix = true;
+      for (const auto &r : roots)
+        if (r.first == c.root && r.second.size() <= c.path.size() &&
+            std::equal(r.second.begin(), r.second.end(), c.path.begin())) {
+          c.boundary = true;
+          break;
+        }
+    }
+    if (dst.seq.empty())
+      dst.index = -1;
+  };
+  auto commit = [&]() {
+    if (rejected || w.index < 0 || w.seq.empty())
+      return;
+    finish(w);
+    accepted = w;
+  };
   for (std::string s; std::getline(st, s);) {
     std::istringstream in(s);
     std::string head;
     in >> head;
     if (head == "sequence") {
+      commit();
       w = Witness{};
       may.clear();
       facts.clear();
       roots.clear();
       crossing = false;
-      sawModel = false;
+      sawModelLine = false;
+      rejected = false;
       prefixes.clear();
       pendingKeyed.reset();
       std::string n, absent;
@@ -598,6 +646,12 @@ Witness parseWitness(std::istream &st) {
           w.index = (int)*k;
       continue;
     }
+    if (head == "dispatch-open") {
+      // P1 rejects this sequence: φ SAT ∧ open Definition-D edge.
+      rejected = true;
+      w = Witness{};
+      continue;
+    }
     if (w.index < 0)
       continue;
     if (head == "fn") {
@@ -605,7 +659,7 @@ Witness parseWitness(std::istream &st) {
       in >> name;
       w.seq.push_back(name);
     } else if (head == "boundary") {
-      // "boundary cells X of Y roots R unresolved U": 교차 존재 = R>0 또는 U>0.
+      // "boundary cells X of Y roots R unresolved U": Φ_∂ iff R>0 or U>0.
       for (std::string tok; in >> tok;)
         if (tok == "roots" || tok == "unresolved") {
           std::string n;
@@ -710,50 +764,14 @@ Witness parseWitness(std::istream &st) {
         if (!r.callee.empty() && !r.caller.empty() && !r.pred.empty())
           w.rets.push_back(std::move(r));
       } else {
-        sawModel = true;
+        // φ = residual path condition on entry cells. "unknown" ⇒ free, not an atom.
+        sawModelLine = true;
         take(s, facts);
       }
     }
   }
-  w.phi = sawModel ? facts : may;
-  // §2.4 Open·§7 환경 모델: 입력 파일 통로("f"로 열고 심볼릭 내용을 받는 셀)는
-  // 값 fact가 아니라 구조적 의무다. fact 층(model 라인)은 값만 싣고 file 속성은
-  // 싣지 않으므로, 파일 내용이 심볼릭이라 값이 unknown인 file 셀은 facts에서
-  // 통째로 빠진다. may 층은 file 셀을 항상 내보내므로, phi=facts일 때 그 file
-  // 셀을 (root, path, off)로 phi에 되살린다. 이미 있으면 file 표시만 켠다.
-  if (sawModel)
-    for (const Client::Cell &m : may) {
-      if (!m.file)
-        continue;
-      bool have = false;
-      for (Client::Cell &c : w.phi)
-        if (c.root == m.root && c.off == m.off && c.path == m.path) {
-          c.file = true;
-          have = true;
-          break;
-        }
-      if (!have)
-        w.phi.push_back(m);
-    }
-  // §3.5 정의 3.5.3 (경계 투영): 셀 c가 경계 셀인 것은 어떤 경계 근 r에 대해
-  // r.root = c.root이고 r의 타입 경로가 c의 경로의 접두(자기 포함)인 때다. 즉 c가
-  // 어떤 교차 실인자 안에 있는 셀일 때다. 접미가 빈 근은 인자 전체가 교차함을
-  // 뜻하므로 그 인자의 모든 셀이 경계다.
-  for (Client::Cell &c : w.phi) {
-    c.crossing = crossing;
-    for (const auto &[root, typePath, off] : prefixes)
-      if (root == c.root && off == c.off && typePath == c.path)
-        c.prefix = true;
-    for (const auto &r : roots)
-      if (r.first == c.root && r.second.size() <= c.path.size() &&
-          std::equal(r.second.begin(), r.second.end(), c.path.begin())) {
-        c.boundary = true;
-        break;
-      }
-  }
-  if (w.seq.empty())
-    w.index = -1;
-  return w;
+  commit();
+  return accepted;
 }
 
 // The client the witnesses direct, linked with D and U into client.bc.
@@ -1245,8 +1263,34 @@ int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, cons
     raw_fd_ostream cout((outDir / "client.txt").string(), ec);
     client.report(plan, cout);
   }
-  if (plan.entries.empty())
+  // Snapshot before linkInModule moves D/U: WitnessPlan::first would dangle.
+  std::vector<std::string> unrealizedLines;
+  for (const auto &W : plan.witnesses)
+    if (!W.realized)
+      unrealizedLines.push_back("unrealized " + (W.first ? W.first->getName().str() : "-") + " iface " +
+                                std::to_string(W.iface) + " pass " + std::to_string(W.pass) + " dispatch-open " +
+                                std::to_string(W.dispatchOpen) + "\n");
+  if (plan.witnesses.empty())
+    unrealizedLines.push_back("unrealized -\n");
+  auto writeUnrealized = [&]() {
+    // §5 따름정리: realized = 0 is a model gap (H3 open), never a closed
+    // program. No soft-accept on empty cells or a clean link alone.
+    if (unrealizedLines.empty())
+      return;
+    std::ofstream open((outDir / "client.open.txt").string(), std::ios::app);
+    for (const std::string &line : unrealizedLines)
+      open << line;
+    errs() << "open: no realized witness\n";
+  };
+  const bool anyRealized =
+      std::any_of(plan.witnesses.begin(), plan.witnesses.end(), [](const auto &W) { return W.realized; });
+  if (!anyRealized) {
+    writeUnrealized();
+    if (plan.entries.empty())
+      return rc;
+  } else if (plan.entries.empty()) {
     return rc;
+  }
   // The client fixes no result of the library: every byte the library reads
   // is the client's (arguments, callbacks, the file), so the path's
   // comparisons are decided by those bytes, for every witness at once.
@@ -1272,6 +1316,10 @@ int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, cons
   if (verifyModule(ch, &errs()))
     return 1;
   int r2 = finish(ch, ctx, outDir, "client", file, line);
+  // finish() rewrites client.open.txt from link reachability; re-assert the
+  // H3 gap when no witness is realized so a clean link cannot soft-accept.
+  if (!anyRealized)
+    writeUnrealized();
   return rc ? rc : r2;
 }
 
@@ -1321,6 +1369,7 @@ int main(int argc, char **argv) {
       source::index(*up);
       Model m(*down, *up, file, line);
       m.interfaceNames = Client::publicInterface(*down, *up, dir);
+      m.startNames = Client::entryInterface(*down, *up, dir);
       m.index();
       m.resolvePrecisely();
       table = m.indirectTargets();
@@ -1371,8 +1420,20 @@ int main(int argc, char **argv) {
   }
   source::index(*down);
   source::index(*up);
+  Client client(*down, *up, dir);
   Model model(*down, *up, file, line);
+  // I = header-declared exports (midpoint). I★ = entryCallable starts (P1).
   model.interfaceNames = Client::publicInterface(*down, *up, dir);
+  model.startNames = Client::entryInterface(*down, *up, dir);
+  // P1 feasibility = φ SAT ∧ no open Definition-D dispatch edge.
+  model.openDispatch = [&](const std::vector<Function *> &fn) {
+    std::vector<std::string> seq;
+    seq.reserve(fn.size());
+    for (Function *F : fn)
+      seq.push_back(F->getName().str());
+    return client.openDispatchEdges(seq);
+  };
+  errs() << "interface " << model.interfaceNames.size() << " entry-starts " << model.startNames.size() << "\n";
   model.run(seqPick, out);
   {
     const auto &st = source::stats();
@@ -1394,6 +1455,8 @@ int main(int argc, char **argv) {
     for (int n = w.seq.empty() ? -1 : w.index + 1; n >= 0;) {
       Model next(*down, *up, file, line);
       next.interfaceNames = model.interfaceNames;
+      next.startNames = model.startNames;
+      next.openDispatch = model.openDispatch;
       std::string buf;
       raw_string_ostream o(buf);
       next.run(n, o);

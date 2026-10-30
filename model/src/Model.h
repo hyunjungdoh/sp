@@ -440,12 +440,15 @@ inline bool ignorable(const Function *F) {
 
 class Model {
  public:
-  // D's interface I: exports an installed header declares. When known,
-  // sequences start only at these, the functions a client can call.
+  // D's interface I: exports an installed header declares. Midpoint tests
+  // and the call graph use I; starts use startNames (I★) when set.
   std::set<std::string> interfaceNames;
-  // When set, sequences start only at these interface functions (§3.9
-  // 정의 E: the calls of one harness).
+  // P1 starts B_entry ⊆ I★: entryCallable public functions only.
   std::set<std::string> startNames;
+  // P1: after φ SAT, reject paths whose indirect edges are still open under
+  // Definition D; those hops are banned and the search continues.
+  std::function<std::vector<std::pair<std::string, std::string>>(const std::vector<Function *> &)>
+      openDispatch;
   Model(Module &down, Module &up, StringRef file, unsigned line) : down(down), up(up), dl(down.getDataLayout()), sinkFile(file), sinkLine(line) {}
 
   void run(int seqPick, raw_ostream &out);
@@ -656,6 +659,8 @@ class Model {
   std::map<int, uint64_t> argFileLen;
   std::vector<Function *> starts;
   std::unordered_set<Function *> cone;
+  // Indirect hops rejected by openDispatch during this run; sequences() skips them.
+  std::set<std::pair<std::string, std::string>> hopBan;
   std::unordered_map<Function *, std::vector<Function *>> callersOf;
   std::map<Suffix, std::set<std::string>> facts;
   std::unordered_map<std::string, std::vector<StructType *>> namedByShape;
