@@ -505,9 +505,11 @@ Witness parseWitness(std::istream &st) {
   std::vector<Client::Cell> may, facts;
   // §3.5 정의 3.5.2: 이 시퀀스의 경계 근 R(π). 각 근은 (export 인자, 타입 경로)다.
   std::vector<std::pair<int, std::vector<std::string>>> roots;
-  // Φ_∂ applies when the path has a D↔client object boundary: resolved
-  // boundary roots, or unresolved (D-allocated) roots. Then only boundary
-  // and prefix cells are client obligations; D-internal residual is not.
+  // Φ_∂: project residual onto the client side of a *resolved* D↔U boundary.
+  // Trigger is |R(π)|>0 only. unresolved>0 means some base was not located; it
+  // does not identify a boundary root. Treating unresolved alone as crossing
+  // deleted entry-rooted guard cells (HEIF Track+172≠0, Track_Visual vtable)
+  // that Magick kept only because they also appeared as prefixcell.
   bool crossing = false;
   // Any non-return "model" line (including unknown). Valued atoms are those
   // take() keeps; unknown lines are free vars, not φ atoms.
@@ -659,9 +661,9 @@ Witness parseWitness(std::istream &st) {
       in >> name;
       w.seq.push_back(name);
     } else if (head == "boundary") {
-      // "boundary cells X of Y roots R unresolved U": Φ_∂ iff R>0 or U>0.
+      // "boundary cells X of Y roots R unresolved U": Φ_∂ iff R>0.
       for (std::string tok; in >> tok;)
-        if (tok == "roots" || tok == "unresolved") {
+        if (tok == "roots") {
           std::string n;
           if (in >> n)
             if (auto v = asI64(n); v && *v > 0)

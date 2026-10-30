@@ -557,17 +557,6 @@ static void appendAddr(Loc &b, const Suffix &extra) {
   b.pointee = false;
 }
 
-// The local a pointer addresses and its constant byte offset into it.
-static const AllocaInst *localBase(const DataLayout &dl, Value *V, int64_t &off) {
-  APInt d(64, 0);
-  Value *B = V->stripAndAccumulateConstantOffsets(dl, d, true);
-  auto *A = dyn_cast<AllocaInst>(B);
-  if (!A)
-    return nullptr;
-  off = d.getSExtValue();
-  return A;
-}
-
 static std::string pinKey(const Loc &o) {
     std::string k = std::to_string(o.arg);
     for (const Step &s : o.suf)
@@ -1194,6 +1183,8 @@ bool Model::cellLoc(Model::Mem &m, Value *V, Loc &out) const {
         const AllocaInst *Al = localBase(dl, L->getPointerOperand(), lo);
         if (isa<AllocaInst>(L->getPointerOperand()->stripPointerCasts()) && reloadLoc(m, L, out))
           return true;
+        if (packLoad(m, L, out))
+          return true;
         if (Al)
           return resolveHeld && L->getType()->isPointerTy() && slotHeld(m, Al, lo, L, out);
         if (L->getType()->isPointerTy() && go(L->getPointerOperand())) {
@@ -1267,6 +1258,66 @@ bool Model::cellLoc(Model::Mem &m, Value *V, Loc &out) const {
     return go(V);
   }
 
+const Argument *Model::packObject(Model::Mem &m, const Value *V, int64_t &off) const {
+    if (!V)
+      return nullptr;
+    APInt d(64, 0);
+    Value *B = const_cast<Value *>(V)->stripAndAccumulateConstantOffsets(dl, d, true);
+    off = d.getSExtValue();
+    if (auto *A = dyn_cast<Argument>(B))
+      return m.pack.count(A) ? A : nullptr;
+    auto *L = dyn_cast<LoadInst>(B);
+    if (!L)
+      return nullptr;
+    const auto *R = reaching(L);
+    if (!R)
+      return nullptr;
+    const Argument *one = nullptr;
+    for (const StoreInst *S : *R) {
+      const Value *sv = S->getValueOperand()->stripPointerCasts();
+      if (isa<ConstantPointerNull>(sv) || isa<UndefValue>(sv))
+        continue;
+      auto *A = dyn_cast<Argument>(sv);
+      if (!A || !m.pack.count(A))
+        return nullptr;
+      if (one && one != A)
+        return nullptr;
+      one = A;
+    }
+    return one;
+  }
+
+bool Model::packLoad(Model::Mem &m, const LoadInst *L, Loc &out) const {
+    if (!L)
+      return false;
+    int64_t off = 0;
+    if (const Argument *A = packObject(m, L->getPointerOperand(), off)) {
+      auto it = m.pack.find(A);
+      if (it != m.pack.end()) {
+        auto fit = it->second.find(off);
+        if (fit != it->second.end() && fit->second.loads == 0) {
+          out = fit->second.val;
+          return true;
+        }
+      }
+    }
+    const Value *P = L->getPointerOperand()->stripPointerCasts();
+    if (auto *L1 = dyn_cast<LoadInst>(P)) {
+      int64_t off1 = 0;
+      if (const Argument *A = packObject(m, L1->getPointerOperand(), off1)) {
+        auto it = m.pack.find(A);
+        if (it != m.pack.end()) {
+          auto fit = it->second.find(off1);
+          if (fit != it->second.end() && fit->second.loads == 1) {
+            out = fit->second.val;
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
 bool Model::locOf(Model::Mem &m, Value *V, Loc &out) const {
     std::unordered_set<const Value *> seen;
     bool cross = false;
@@ -1299,6 +1350,8 @@ bool Model::locOf(Model::Mem &m, Value *V, Loc &out) const {
         int64_t lo = 0;
         const AllocaInst *Al = localBase(dl, L->getPointerOperand(), lo);
         if (isa<AllocaInst>(L->getPointerOperand()->stripPointerCasts()) && reloadLoc(m, L, out))
+          return true;
+        if (packLoad(m, L, out))
           return true;
         if (Al)
           return resolveHeld && L->getType()->isPointerTy() && slotHeld(m, Al, lo, L, out);
@@ -1889,6 +1942,71 @@ void Model::bindFormals(Model::Mem &m, Function *F, const std::vector<std::optio
         m.loc[&A] = *args[i];
       ++i;
     }
+  }
+
+void Model::bindPacks(Model::Mem &m, Function *F, const std::vector<std::map<int64_t, PackField>> &packs) const {
+    unsigned i = 0;
+    for (Argument &A : F->args()) {
+      if (i < packs.size() && !packs[i].empty())
+        m.pack[&A] = packs[i];
+      ++i;
+    }
+  }
+
+std::map<int64_t, Model::PackField> Model::packOf(Model::Mem &m, const AllocaInst *A) const {
+    std::map<int64_t, PackField> pack;
+    if (!A)
+      return pack;
+    Function *F = const_cast<AllocaInst *>(A)->getFunction();
+    if (!F)
+      return pack;
+    for (Instruction &I : instructions(*F)) {
+      auto *S = dyn_cast<StoreInst>(&I);
+      if (!S)
+        continue;
+      int64_t off = 0;
+      if (localBase(dl, S->getPointerOperand(), off) != A)
+        continue;
+      Value *V = S->getValueOperand()->stripPointerCasts();
+      Loc L;
+      if (locOf(m, V, L)) {
+        pack[off] = PackField{L, 0};
+        continue;
+      }
+      int64_t slotOff = 0;
+      if (const AllocaInst *Slot = localBase(dl, V, slotOff)) {
+        Loc held;
+        if (slotHeld(const_cast<Mem &>(m), Slot, slotOff, S, held)) {
+          pack[off] = PackField{held, 1};
+          continue;
+        }
+        // slotHeld may miss before held memo fills; read the stores directly.
+        bool got = false;
+        Loc one;
+        for (User *U : const_cast<AllocaInst *>(Slot)->users()) {
+          auto *St = dyn_cast<StoreInst>(U);
+          if (!St || St->getValueOperand() == Slot)
+            continue;
+          int64_t o = 0;
+          if (localBase(dl, St->getPointerOperand(), o) != Slot || o != slotOff)
+            continue;
+          Loc h;
+          if (!locOf(m, St->getValueOperand(), h)) {
+            got = false;
+            break;
+          }
+          if (got && !(one == h)) {
+            got = false;
+            break;
+          }
+          one = h;
+          got = true;
+        }
+        if (got)
+          pack[off] = PackField{one, 1};
+      }
+    }
+    return pack;
   }
 
 void Model::notePins(Model::Mem &m, const Value *V) const {

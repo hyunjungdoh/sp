@@ -18,7 +18,7 @@ for c in "$@"; do
   # Skip assembly.ll: dumping the full linked module as text dominates
   # startup on large D∪U harnesses and is unused by measurement.
   stdbuf -oL -eL timeout $((T + 300)) /home/klee/klee_build/bin/klee \
-    --libc=klee --link-llvm-lib=/w/env/env.bc --external-calls=concrete \
+    --libc=klee --link-llvm-lib=/w/env/env.bc --external-calls=${EXTCALLS:-over-approx} \
     --kdalloc=false --search=nurs:sink --use-batching-search --sym-alloc-cap=${CAP:-65536} $KOPTS \
     --output-source=false \
     --max-time=${T}s --watchdog --max-memory=${MEM:-2500} \

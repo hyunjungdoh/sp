@@ -1488,10 +1488,9 @@
     }
     out << "boundary cells " << boundaryCells << " of " << cells.size()
         << " roots " << boundaryRoots.size() << " unresolved " << boundaryUnresolved << "\n";
-    // §3.5 정의 3.5.2: 경계 근 집합 R(π). 각 근은 export 인자 기준 접근 경로다.
-    // 클라이언트 의무(정의 6의 "제약된 셀")는 이 근 중 하나를 접두로 갖는 셀, 즉
-    // 경계 투영 Φ_∂뿐이다(정의 3.5.3). must 층은 이 선들로 각 셀의 경계 여부를
-    // 판정한다. 접미가 비면 인자 전체가 교차하므로 그 인자의 모든 셀이 경계다.
+    // R(π): resolved boundary roots (export-arg access paths). Φ_∂ projects
+    // residual onto cells under some r∈R only when |R|>0. unresolved counts
+    // are diagnostic; they do not enable that projection by themselves.
     for (const auto &r : boundaryRoots) {
       out << "boundaryroot arg" << r.first;
       for (const Step &s : r.second)
@@ -1506,11 +1505,12 @@
       for (const Step &st : c.second)
         out << " " << st.type << "+" << st.off;
     };
-    // §3.8 정리 B 보정 + Lemma W(정초된 첫 확립): 첫 교차 단계 이하에서 D 함수의
-    // 경로 조건이 읽은 셀(전위 셀)이 의무다. 단, 엔트리 자신의 클로저가 그 셀을
-    // 교차 전에 확실히(must) 쓴다면(자기 확립), 그 읽기는 클라이언트 값이 아니라
-    // 엔트리가 세운 값을 읽는 것이므로 전위 의무가 아니다(Lemma W). 그런 셀은
-    // 제외한다.
+    // Φ_pre (§3.5 정리 B 보정): Loc 판정된 셀 중, 첫 교차 이하 D 경로 조건이
+    // 읽은 것. Loc 합성(프레임·팩·GEP/load)으로 cells/stepEv에 오른 뒤, 여기서
+    // 클라이언트 의무로 올린다. Lemma W: 엔트리 클로저가 교차 전에 그 셀을
+    // must-constant store로 확립한 경우만 제외한다. kind 'd'는 값이 비는
+    // 추상 define이라 자기 확립이 아니다 — 넣으면 φ 제약(≠0 등)이 Φ_pre에서
+    // 떨어져 realize가 open으로 남는다.
     {
       std::set<Cell> pre, selfWritten;
       for (const auto &[si, evs] : stepEv) {
@@ -1525,9 +1525,6 @@
             pre.insert(e.cell);
             pre.insert(e.src);
           } else if (e.kind == 's' && e.mustExit && e.callMust) {
-            // 엔트리 클로저의 반환을 지배하는 store: 자기 확립.
-            selfWritten.insert(e.cell);
-          } else if (e.kind == 'd') {
             selfWritten.insert(e.cell);
           }
         }

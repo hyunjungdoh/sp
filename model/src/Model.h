@@ -160,6 +160,17 @@ inline bool constStep(const DataLayout &dl, GEPOperator *G, Step &st) {
 
 inline bool movesAddress(const Step &st) { return !st.type.empty() || st.off != 0; }
 
+// The local a pointer addresses and its constant byte offset into it.
+inline const AllocaInst *localBase(const DataLayout &dl, Value *V, int64_t &off) {
+  APInt d(64, 0);
+  Value *B = V->stripAndAccumulateConstantOffsets(dl, d, true);
+  auto *A = dyn_cast<AllocaInst>(B);
+  if (!A)
+    return nullptr;
+  off = d.getSExtValue();
+  return A;
+}
+
 inline std::optional<int64_t> asI64(const std::string &s) {
   if (s.empty())
     return std::nullopt;
@@ -869,8 +880,21 @@ class Model {
   std::vector<Path> sequences(int seqPick);
 
 
+  // A constant-offset field of a local object passed by address into a
+  // callee: the export Loc stored there, and how many loads of that field
+  // recover it (0 = the field holds the Loc; 1 = it holds the address of a
+  // local slot that holds the Loc). §3.1 maps callee accesses through such
+  // packs back to cells of f_0.
+  struct PackField {
+    Loc val;
+    int loads = 0;
+    bool operator==(const PackField &o) const { return val == o.val && loads == o.loads; }
+  };
+
   struct Mem {
     std::unordered_map<const Value *, Loc> loc;
+    // Formal that addresses a packed local: byte offset → field.
+    std::unordered_map<const Argument *, std::map<int64_t, PackField>> pack;
     // The value each store into a local wrote.
     std::unordered_map<const StoreInst *, Loc> stored;
     // slotHeld under these facts. A value stays one as facts grow; an
@@ -1017,6 +1041,11 @@ class Model {
 
   bool locOf(Mem &m, Value *V, Loc &out) const;
 
+  // Load of a packed formal field: loads==0 yields the Loc; loads==1 yields
+  // it after one further load of that result. The pack object may be the
+  // formal itself or a local reload of it.
+  bool packLoad(Mem &m, const LoadInst *L, Loc &out) const;
+  const Argument *packObject(Mem &m, const Value *V, int64_t &off) const;
 
   static bool sameSteps(const Suffix &a, const Suffix &b);
 
@@ -1054,6 +1083,12 @@ class Model {
 
   void bindFormals(Mem &m, Function *F, const std::vector<std::optional<Loc>> &args) const;
 
+  // Bind packed locals on formals: callee field loads resolve through pack.
+  void bindPacks(Mem &m, Function *F, const std::vector<std::map<int64_t, PackField>> &packs) const;
+
+  // Constant-offset stores into local A that name export Locs (directly or
+  // as the address of a slot that holds one). Empty when A is not such a pack.
+  std::map<int64_t, PackField> packOf(Mem &m, const AllocaInst *A) const;
 
   // Same as propagate, except a value returned by a call is a new object.
   void propagateObject(Mem &m, Function *F) const;

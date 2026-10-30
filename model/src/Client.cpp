@@ -948,6 +948,27 @@ void Client::buildStores() {
           for (const Field &s : src)
             if (d != s)
               cp[d].insert(s);
+        // A local update (store of a value computed from a load of the same
+        // field) is not an input write: §3.6's closed-world step applies only
+        // when the non-constant is neither a copy nor the field's own prior
+        // value. Increments and similar stay library state, not file content.
+        if (v == "*" && !copy && !fs.empty()) {
+          Value *X = S->getValueOperand();
+          while (auto *C = dyn_cast<CastInst>(X))
+            X = C->getOperand(0);
+          if (auto *BO = dyn_cast<BinaryOperator>(X)) {
+            for (unsigned i = 0; i < 2 && !copy; ++i) {
+              Value *Op = BO->getOperand(i);
+              while (auto *C = dyn_cast<CastInst>(Op))
+                Op = C->getOperand(0);
+              if (auto *L = dyn_cast<LoadInst>(Op))
+                for (const Field &s : fieldsOf(L->getPointerOperand()))
+                  for (const Field &d : fs)
+                    if (s == d)
+                      copy = true;
+            }
+          }
+        }
       } else if (auto *MS = dyn_cast<MemSetInst>(&I)) {
         P = MS->getRawDest();
         auto *b = dyn_cast<ConstantInt>(MS->getValue());
@@ -4039,7 +4060,13 @@ void Client::dispatch(const Witnesses &ws, Plan &P) const {
     for (Function *H : called)
       file = file || opensFile(H);
     std::vector<std::string> notes;
-    std::set<std::string> gate;
+    // Π_I must name installers that select THIS witness's callees. Taking the
+    // first input edge's St over-approxes polymorphic slots (every Decoder_*
+    // for get_decoded_frame) and steers search into installers off the witness.
+    // Magick's first edge was already size-1 (RegisterTIFFImage); HEIF's is
+    // size-14. Keep the smallest non-empty input-installer sets on the witness
+    // — those are the most specific gates the path actually needs.
+    std::vector<std::set<std::string>> inputGates;
     unsigned indirect = 0, open = 0;
     for (size_t i = 0; i + 1 < seq.size(); ++i) {
       Function *A = body(seq[i]), *T = body(seq[i + 1]);
@@ -4069,11 +4096,8 @@ void Client::dispatch(const Witnesses &ws, Plan &P) const {
               by.insert(G->getName().str());
         for (const std::string &g : by)
           how += " input:" + g;
-        // The installers of the first input-dispatched edge on the witness
-        // are the Π_I gate the search must open before later dispatch steps
-        // matter (H3); any of them opens it.
-        if (gate.empty())
-          gate = by;
+        if (!by.empty())
+          inputGates.push_back(std::move(by));
       }
       for (Function *W : setters) {
         bool by = false;
@@ -4087,6 +4111,15 @@ void Client::dispatch(const Witnesses &ws, Plan &P) const {
       open += how.empty();
       notes.push_back("  D " + A->getName().str() + " -> " + T->getName().str() + " st " +
                       std::to_string(St.size()) + (how.empty() ? " OPEN" : how));
+    }
+    std::set<std::string> gate;
+    if (!inputGates.empty()) {
+      size_t best = inputGates[0].size();
+      for (const auto &g : inputGates)
+        best = std::min(best, g.size());
+      for (const auto &g : inputGates)
+        if (g.size() == best)
+          gate.insert(g.begin(), g.end());
     }
     for (const std::string &g : gate)
       if (std::find(P.stInstallers.begin(), P.stInstallers.end(), g) == P.stInstallers.end())

@@ -81,14 +81,13 @@ public:
     std::vector<std::string> values;
     // The cell names or reads the client's input file.
     bool file = false;
-    // §3.5: the cell lies inside a D→U crossing actual, so it is part of the
-    // state the client must build and hand across the boundary (Phi_boundary).
+    // Client Φ = Φ_∂ ∪ Φ_pre ∪ own, from one Loc judgment along π:
+    // formal/GEP/load/call (incl. packed locals) → cell → R(π) or D-prefix read.
+    // §3.5 Φ_∂: inside a resolved crossing actual (boundaryroot).
     bool boundary = false;
-    // §3.5: this witness has a resolved D→U boundary root, so Φ_∂ applies:
-    // only boundary (and prefix/own) cells are client obligations. Unresolved
-    // roots alone do not enable the projection — every constrained cell stays.
+    // §3.5: |R(π)|>0 so Φ_∂ projects; unresolved alone does not set this.
     bool crossing = false;
-    // §3.8 정리 B 보정: 첫 교차 이하의 D 함수가 경로 조건에서 읽은 셀(Φ_pre).
+    // §3.5 Φ_pre: D path condition before first cross read this Loc-cell.
     bool prefix = false;
   };
   // §3.8 정의 3.8.4 키 세터 레버: 인터페이스 W(…, 태그 = tag, …, 가변 인자)가 셀

@@ -11,7 +11,12 @@
     ptrSpan.clear();
     size_t residual = seq.size() - 1;
     std::vector<std::vector<std::optional<Loc>>> frames(seq.size());
+    // Loc transfer along π (§3.1/3.5): each hop maps actuals to f_0 cells —
+    // direct Loc, or a packed local whose constant fields hold Locs. Same
+    // judgment feeds cells, R(π), and Φ_pre; it is not a CVE-specific hop.
+    std::vector<std::vector<std::map<int64_t, PackField>>> packs(seq.size());
     frames[0].resize(seq[0]->arg_size());
+    packs[0].resize(seq[0]->arg_size());
     for (unsigned i = 0; i < seq[0]->arg_size(); ++i)
       frames[0][i] = Loc{(int)i, {}};
     size_t mapped = 1;
@@ -105,6 +110,7 @@
       const std::vector<std::optional<Loc>> &at = frames[si];
       Mem m;
       bindFormals(m, F, at);
+      bindPacks(m, F, packs[si]);
       propagate(m, F);
       for (Instruction &I : instructions(*F)) {
         auto *CB = dyn_cast<CallBase>(&I);
@@ -146,6 +152,7 @@
       }
       CallBase *edge = nullptr;
       std::vector<std::optional<Loc>> nextArgs;
+      std::vector<std::map<int64_t, PackField>> nextPacks;
       std::vector<Act> nextActs;
       bool edgeLocated = false;
       bool edgeConcrete = false;
@@ -201,13 +208,62 @@
           }
         }
         std::vector<std::optional<Loc>> got;
+        std::vector<std::map<int64_t, PackField>> gotPacks;
         std::vector<Act> gotActs;
         bool any = false;
         bool concrete = true;
+        std::function<bool(Value *, std::map<int64_t, PackField> &)> resolvePack =
+            [&](Value *Op, std::map<int64_t, PackField> &pk) -> bool {
+          Op = Op->stripPointerCasts();
+          if (auto *A = dyn_cast<Argument>(Op); A && A->getParent() == F) {
+            unsigned ai = A->getArgNo();
+            if (ai < packs[si].size() && !packs[si][ai].empty()) {
+              pk = packs[si][ai];
+              return true;
+            }
+            if (auto it = m.pack.find(A); it != m.pack.end() && !it->second.empty()) {
+              pk = it->second;
+              return true;
+            }
+          }
+          int64_t baseOff = 0;
+          if (const AllocaInst *Al = localBase(dl, Op, baseOff); Al && baseOff == 0) {
+            pk = packOf(m, Al);
+            return !pk.empty();
+          }
+          if (auto *Ld = dyn_cast<LoadInst>(Op)) {
+            if (const auto *R = reaching(Ld)) {
+              const Argument *one = nullptr;
+              std::map<int64_t, PackField> onePk;
+              for (const StoreInst *S : *R) {
+                Value *sv = const_cast<Value *>(S->getValueOperand()->stripPointerCasts());
+                if (isa<ConstantPointerNull>(sv) || isa<UndefValue>(sv))
+                  continue;
+                std::map<int64_t, PackField> cand;
+                if (!resolvePack(sv, cand) || cand.empty())
+                  return false;
+                auto *A = dyn_cast<Argument>(sv);
+                if (one && A && one != A)
+                  return false;
+                if (A)
+                  one = A;
+                if (!onePk.empty() && onePk != cand)
+                  return false;
+                onePk = std::move(cand);
+              }
+              if (!onePk.empty()) {
+                pk = std::move(onePk);
+                return true;
+              }
+            }
+          }
+          return false;
+        };
         for (Value *Op : CB->args()) {
           Act a;
           Value *bare = Op->stripPointerCasts();
           Loc L;
+          std::map<int64_t, PackField> pk;
           if (auto *Fn = dyn_cast<Function>(bare)) {
             a.fn = Fn->getName().str();
             a.address = false;
@@ -238,10 +294,15 @@
                 break;
               V = C->getOperand(0);
             }
+          } else if (resolvePack(Op, pk)) {
+            // Packed local: not itself an export Loc, but its fields are.
+            a.missing = false;
+            any = true;
           }
           if (a.missing)
             concrete = false;
           got.push_back(a.loc);
+          gotPacks.push_back(std::move(pk));
           gotActs.push_back(std::move(a));
         }
         int rank = (concrete ? 2 : 0) + (any ? 1 : 0);
@@ -249,6 +310,7 @@
         if (!edge || rank > best) {
           edge = CB;
           nextArgs = std::move(got);
+          nextPacks = std::move(gotPacks);
           nextActs = std::move(gotActs);
           edgeLocated = any;
           edgeConcrete = concrete;
@@ -258,9 +320,14 @@
       }
       if (edge)
         stepGoal[si] = edge;
-      // Fold only when the call into the next function passes cells or
-      // constants and this function is a bundle of constant-offset stores.
-      bool bundle = edge && edgeConcrete && summarizes(F, at, sumCache, sumStack, Next);
+      // Fold only when the call into the next function passes export Locs (not
+      // merely a packed local) and this function is a bundle of constant-offset
+      // stores. Packs still propagate frames so deeper cells map back to f_0.
+      bool edgeExport = false;
+      for (const auto &a : nextArgs)
+        if (a)
+          edgeExport = true;
+      bool bundle = edge && edgeConcrete && edgeExport && summarizes(F, at, sumCache, sumStack, Next);
       if (!bundle && !failed) {
         residual = si;
         failed = true;
@@ -286,8 +353,11 @@
         }
       }
       frames[si + 1].assign(Next->arg_size(), std::nullopt);
+      packs[si + 1].assign(Next->arg_size(), {});
       for (size_t i = 0; i < nextArgs.size() && i < frames[si + 1].size(); ++i)
         frames[si + 1][i] = nextArgs[i];
+      for (size_t i = 0; i < nextPacks.size() && i < packs[si + 1].size(); ++i)
+        packs[si + 1][i] = std::move(nextPacks[i]);
       atAct[si + 1] = std::move(nextActs);
       if (atAct[si + 1].size() < Next->arg_size())
         atAct[si + 1].resize(Next->arg_size());
@@ -457,6 +527,7 @@
     auto memAt = [&](size_t si) -> Mem & {
       if (!memReady[si]) {
         bindFormals(mems[si], seq[si], frames[si]);
+        bindPacks(mems[si], seq[si], packs[si]);
         propagate(mems[si], seq[si]);
         memReady[si] = 1;
       }
@@ -988,6 +1059,61 @@
       };
       using State = std::map<std::string, Val>;
       std::map<size_t, std::pair<Function *, std::unordered_set<const BasicBlock *>>> stepChoice;
+      // Field (type, off) → (constant store values, has non-const). Lazily
+      // filled only for fields a path actually tests, and only in ctors plus
+      // the step function — a full-module walk made OpenImageIO-sized cases
+      // much slower than before.
+      std::map<std::pair<std::string, int64_t>, std::pair<std::set<std::string>, bool>> fieldStores;
+      auto noteStore = [&](Function *G, const std::pair<std::string, int64_t> &want) {
+        if (!G || G->isDeclaration())
+          return;
+        const DataLayout &DL = G->getParent()->getDataLayout();
+        auto &slot = fieldStores[want];
+        for (Instruction &I : instructions(*G)) {
+          auto *S = dyn_cast<StoreInst>(&I);
+          if (!S)
+            continue;
+          Value *P = S->getPointerOperand()->stripPointerCasts();
+          auto *GEP = dyn_cast<GEPOperator>(P);
+          if (!GEP || !GEP->hasAllConstantIndices() || GEP->getNumIndices() < 2)
+            continue;
+          auto *StrTy = dyn_cast<StructType>(GEP->getSourceElementType());
+          if (!StrTy || !StrTy->hasName() || StrTy->getName() != want.first)
+            continue;
+          auto *Idx = dyn_cast<ConstantInt>(GEP->getOperand(2));
+          if (!Idx || Idx->getZExtValue() >= StrTy->getNumElements())
+            continue;
+          int64_t off = (int64_t)DL.getStructLayout(StrTy)->getElementOffset((unsigned)Idx->getZExtValue());
+          if (off != want.second)
+            continue;
+          if (auto *C = dyn_cast<ConstantInt>(S->getValueOperand()))
+            slot.first.insert(dec(C));
+          else if (isa<ConstantPointerNull>(S->getValueOperand()))
+            slot.first.insert("0");
+          else
+            slot.second = true;
+        }
+      };
+      std::set<std::pair<std::string, int64_t>> fieldReady;
+      auto ensureField = [&](Function *step, const std::pair<std::string, int64_t> &f) {
+        if (f.first.empty() || !fieldReady.insert(f).second)
+          return;
+        noteStore(step, f);
+        // Itanium ctors only (C1/C2), matching the type name — not the whole module.
+        std::string needle = f.first;
+        if (needle.rfind("class.", 0) == 0)
+          needle = needle.substr(6);
+        else if (needle.rfind("struct.", 0) == 0)
+          needle = needle.substr(7);
+        for (Function &G : *step->getParent()) {
+          if (G.isDeclaration())
+            continue;
+          StringRef n = G.getName();
+          if (!n.contains(needle) || !(n.contains("C1") || n.contains("C2")))
+            continue;
+          noteStore(&G, f);
+        }
+      };
       // §3.5 정의 P: need is the requirement on the cells at the goal (the
       // entry of the next step). On a path that meets it, need becomes the
       // requirement at this step's entry.
@@ -1161,6 +1287,38 @@
         auto under = [](const std::string &k, const std::string &p) {
           return k == p || (k.size() > p.size() && k.compare(0, p.size(), p) == 0 && k[p.size()] == '|');
         };
+        // §3.5 정의 P: seed entry State with must-constants the object carries
+        // into the step. When every constant store to a tested field is 0
+        // (ctors) and the field is also written non-constantly (loop
+        // increment), the shortest path cannot assume ≠0 at entry.
+        State seed;
+        {
+          auto leafField = [](const std::string &k) -> std::pair<std::string, int64_t> {
+            auto p = k.rfind('|');
+            std::string last = p == std::string::npos ? k : k.substr(p + 1);
+            if (!last.empty() && last.back() == '*')
+              last.pop_back();
+            auto at = last.rfind('@');
+            if (at == std::string::npos)
+              return {};
+            auto o = asI64(last.substr(at + 1));
+            if (!o)
+              return {};
+            return {last.substr(0, at), *o};
+          };
+          for (const std::string &k : tested) {
+            auto f = leafField(k);
+            if (f.first.empty())
+              continue;
+            ensureField(F, f);
+            auto it = fieldStores.find(f);
+            if (it == fieldStores.end())
+              continue;
+            if (!it->second.second || it->second.first.size() != 1 || !it->second.first.count("0"))
+              continue;
+            seed[k] = Val{'k', "0", {}};
+          }
+        }
         auto effects = [&](const BasicBlock *B, State &st, bool toGoal) {
           for (Instruction &I : *const_cast<BasicBlock *>(B)) {
             if (toGoal && goals.count(&I))
@@ -1255,8 +1413,8 @@
             State st;
             int prev;
           };
-          std::vector<Node> nodes{{entry, State{}, -1}};
-          std::set<std::pair<const BasicBlock *, std::string>> seen{{entry, ""}};
+          std::vector<Node> nodes{{entry, seed, -1}};
+          std::set<std::pair<const BasicBlock *, std::string>> seen{{entry, spell(seed)}};
           std::deque<int> q{0};
           while (!q.empty()) {
             int n = q.front();
@@ -2104,6 +2262,7 @@
         }
         Mem m;
         bindFormals(m, F, frames[si]);
+        bindPacks(m, F, packs[si]);
         propagateObject(m, F);
         stepChoice[si] = {F, feasiblePath(F, goals, m, chosenPath(F, goals), &need)};
       }
@@ -2510,6 +2669,14 @@
                     if (F != seq[curStep])
                       stepEv[curStep].push_back(std::move(ev));
                   }
+                } else {
+                  // §3.5 정의 P: a non-constant store makes kind 'a'. Emit a
+                  // define so later path conditions constrain the step-made
+                  // value, not the entry value (Φ_pre). Without this, a loop
+                  // increment after a ≠0 branch left ≠0 on the entry node.
+                  ev.kind = 'd';
+                  ev.vals.clear();
+                  stepEv[curStep].push_back(std::move(ev));
                 }
               }
               if (const Value *root = asRoot(S->getValueOperand())) {
@@ -2675,8 +2842,11 @@
       };
       std::map<Function *, std::vector<Site>> sites;
       std::map<Function *, const std::vector<std::optional<Loc>> *> frameOf;
-      for (size_t i = 0; i < mapped && i < seq.size(); ++i)
+      std::map<Function *, const std::vector<std::map<int64_t, PackField>> *> packOfFn;
+      for (size_t i = 0; i < mapped && i < seq.size(); ++i) {
         frameOf[seq[i]] = &frames[i];
+        packOfFn[seq[i]] = &packs[i];
+      }
       std::vector<std::pair<Function *, int>> q;
       std::unordered_set<Function *> seenFn;
       std::vector<Function *> fnOrder;
@@ -2774,6 +2944,8 @@
         if (fr != frameOf.end()) {
           Mem m;
           bindFormals(m, F, *fr->second);
+          if (auto pf = packOfFn.find(F); pf != packOfFn.end())
+            bindPacks(m, F, *pf->second);
           Loc L;
           if (locOf(m, V, L) && !L.suf.empty())
             return L;
