@@ -838,7 +838,28 @@ std::vector<std::pair<std::string, int64_t>> Client::fieldsOf(Value *P) const {
   auto *G = dyn_cast<GEPOperator>(P);
   if (!G || (G->hasAllZeroIndices() && G->getNumIndices() < 2))
     return {};
-  return source::levels(G, dl);
+  auto out = source::levels(G, dl);
+  if (!out.empty())
+    return out;
+  // Optimised IR addresses a field as a byte GEP (i8*, constant offset).
+  // Recover the source record and offset from π(base) and the byte displacement.
+  if (!G->hasAllConstantIndices() || G->getNumIndices() != 1)
+    return out;
+  Type *ST = G->getSourceElementType();
+  if (!ST->isIntegerTy(8) && !ST->isIntegerTy(1))
+    return out;
+  auto *CI = dyn_cast<ConstantInt>(G->getOperand(1));
+  if (!CI)
+    return out;
+  int64_t off = CI->getSExtValue() * (int64_t)dl.getTypeAllocSize(ST).getFixedValue();
+  const DIType *D = source::pointee(G->getPointerOperand());
+  std::string n = source::name(D);
+  if (n.empty())
+    return out;
+  if (n.rfind("struct.", 0) != 0 && n.rfind("class.", 0) != 0)
+    n = "struct." + n;
+  out.push_back({n, off});
+  return out;
 }
 
 // Call edges (§3.10): a direct call is its callee, an indirect call goes to
@@ -873,6 +894,25 @@ Function *Client::body(const std::string &name) const {
 // Each constant-offset GEP a store writes through names the field at every
 // struct level its indices pass: (S, offset of the address inside S).
 void Client::buildStores() {
+  // TBAA on a store names the record and byte offset when the address is a
+  // byte GEP (optimised IR). Operand 0 is the base type node, operand 2 the
+  // offset; the base node's name is the source struct (C11 6.5p7).
+  auto tbaaField = [&](const Instruction &I) -> std::vector<Field> {
+    const MDNode *T = I.getMetadata(LLVMContext::MD_tbaa);
+    if (!T || T->getNumOperands() < 3)
+      return {};
+    const MDNode *B = dyn_cast<MDNode>(T->getOperand(0));
+    auto *O = mdconst::dyn_extract<ConstantInt>(T->getOperand(2));
+    auto *N = B && B->getNumOperands() ? dyn_cast<MDString>(B->getOperand(0)) : nullptr;
+    if (!N || !O)
+      return {};
+    std::string n = N->getString().str();
+    if (n.empty() || n == "omnipotent char" || n == "any pointer" || n == "Simple C/C++ TBAA")
+      return {};
+    if (n.rfind("struct.", 0) != 0 && n.rfind("class.", 0) != 0)
+      n = "struct." + n;
+    return {{n, O->getSExtValue()}};
+  };
   for (const auto &kv : bodies) {
     Function *F = kv.second;
     auto &out = stores[F];
@@ -882,12 +922,16 @@ void Client::buildStores() {
       Value *P = nullptr;
       std::string v = "*";
       bool copy = false;
+      std::vector<Field> fs;
       if (auto *S = dyn_cast<StoreInst>(&I)) {
         P = S->getPointerOperand();
         v = abstractValue(S->getValueOperand());
         std::set<Field> src = copySources(S);
         copy = !src.empty();
-        for (const Field &d : fieldsOf(P))
+        fs = fieldsOf(P);
+        if (fs.empty())
+          fs = tbaaField(I);
+        for (const Field &d : fs)
           for (const Field &s : src)
             if (d != s)
               cp[d].insert(s);
@@ -895,11 +939,33 @@ void Client::buildStores() {
         P = MS->getRawDest();
         auto *b = dyn_cast<ConstantInt>(MS->getValue());
         v = b && b->isZero() ? "0" : "*";
-      } else if (auto *MI = dyn_cast<MemIntrinsic>(&I))
+        fs = fieldsOf(P);
+        if (fs.empty())
+          fs = tbaaField(I);
+        // A typed zero-fill with no field GEP still zeros every offset in the
+        // object (GetImageInfo's memset of ImageInfo).
+        if (fs.empty() && b && b->isZero())
+          if (const DIType *D = source::pointee(MS->getRawDest())) {
+            std::string n = source::name(D);
+            if (!n.empty()) {
+              if (n.rfind("struct.", 0) != 0 && n.rfind("class.", 0) != 0)
+                n = "struct." + n;
+              auto *L = dyn_cast<ConstantInt>(MS->getLength());
+              int64_t len = L && L->getBitWidth() <= 64 ? L->getSExtValue() : INT64_MAX;
+              ranges[F].push_back({n, 0, len});
+            }
+          }
+      } else if (auto *MI = dyn_cast<MemIntrinsic>(&I)) {
         P = MI->getRawDest();
+        fs = fieldsOf(P);
+        if (fs.empty())
+          fs = tbaaField(I);
+      }
       if (!P)
         continue;
-      for (const auto &f : fieldsOf(P)) {
+      if (fs.empty())
+        fs = fieldsOf(P);
+      for (const auto &f : fs) {
         out.insert({f, v});
         if (v == "*" && !copy)
           in.insert(f);
@@ -907,7 +973,7 @@ void Client::buildStores() {
       if (auto *MI = dyn_cast<MemIntrinsic>(&I)) {
         auto *L = dyn_cast<ConstantInt>(MI->getLength());
         int64_t len = L && L->getBitWidth() <= 64 ? L->getSExtValue() : INT64_MAX;
-        for (const auto &f : fieldsOf(P))
+        for (const auto &f : fs)
           ranges[F].push_back({f.first, f.second, len});
       }
     }
@@ -3299,15 +3365,29 @@ std::vector<Function *> Client::writeCandidates(Function *E, const std::vector<F
 
 // The calls of the harness that can write c before or inside the entry: the
 // entry, the producers of c's held root, and the calls they depend on.
+// Every held layer on c's path is an object the harness must produce when it
+// builds that root (Λ3): its producers' stores establish that layer's fields
+// (e.g. AcquireCustomStreamInfo writing CustomStreamInfo.signature).
 std::vector<Function *> Client::harnessStarts(Function *E, Function *entry, const Cell &c) const {
   std::vector<Function *> out{entry};
-  auto pit = producers.find(heldType(E, c.root));
-  if (pit != producers.end())
+  std::set<std::string> have;
+  auto addType = [&](std::string T) {
+    if (T.rfind("struct.", 0) == 0)
+      T = T.substr(7);
+    if (T.empty() || !have.insert(T).second)
+      return;
+    auto pit = producers.find(T);
+    if (pit == producers.end())
+      return;
     for (const Producer &pr : pit->second) {
       out.push_back(pr.fn);
-      for (Function *D : dependences(pr.fn, heldType(E, c.root)))
+      for (Function *D : dependences(pr.fn, T))
         out.push_back(D);
     }
+  };
+  addType(heldType(E, c.root));
+  for (const std::string &t : c.path)
+    addType(t);
   return out;
 }
 
@@ -3361,6 +3441,51 @@ bool Client::establishedBy(Function *E, Function *entry, const Cell &c, const Wi
   Field f = fieldOf(c);
   if (!everStored(f.first, f.second))
     return true;
+  // Λ3 by a producer of a held layer on c's path: that producer stores a
+  // constant that satisfies φ_c into the field. The harness already calls
+  // the producer to build the handle; no may-path query is required.
+  auto layerType = [](std::string T) {
+    if (T.rfind("struct.", 0) == 0)
+      T = T.substr(7);
+    return T;
+  };
+  auto sameField = [&](const Field &g) {
+    if (g.second != f.second)
+      return false;
+    if (g.first == f.first)
+      return true;
+    return layerType(g.first) == layerType(f.first);
+  };
+  std::vector<std::string> layers{heldType(E, c.root)};
+  for (const std::string &t : c.path)
+    layers.push_back(layerType(t));
+  for (const std::string &T : layers) {
+    if (T.empty())
+      continue;
+    auto pit = producers.find(T);
+    if (pit == producers.end())
+      continue;
+    for (const Producer &pr : pit->second) {
+      for (Function *G : closureOf(pr.fn)) {
+        auto sit = stores.find(G);
+        if (sit != stores.end())
+          for (const auto &[g, v] : sit->second)
+            if (sameField(g) && v != "*" && satisfies(v, c)) {
+              at = G->getName().str();
+              return true;
+            }
+        // A zero memset of the object covers every field in its byte range.
+        if (auto rit = ranges.find(G); rit != ranges.end())
+          for (const auto &[ty, off, len] : rit->second)
+            if (sameField({ty, off}) ||
+                (layerType(ty) == layerType(f.first) && off <= f.second && f.second - off < len))
+              if (satisfies("0", c)) {
+                at = G->getName().str();
+                return true;
+              }
+      }
+    }
+  }
   bool up = upOnly(f);
   if (!entry || (!up && !(c.boundary || c.prefix)))
     return false;
