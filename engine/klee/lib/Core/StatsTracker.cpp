@@ -1060,6 +1060,12 @@ void StatsTracker::computeSinkDistance() {
   // sp.wit !{k, p}. Toward the sink, a call in a may enter a witness
   // function c when (a, c) is in E_W or c heads a witness, and a non-witness
   // function only when a is not a witness function.
+  //
+  // Guidance uses only the primary witness (k = 0): the first sat sequence
+  // may wrote to state.txt. The union of every sat witness opens may
+  // shortcuts between unrelated π (e.g. a short Write path and a Read path
+  // to the same sink); the search then ignores the π the harness closed.
+  // Secondary witnesses stay in metadata; they do not shape T_wit.
   std::map<unsigned, std::map<unsigned, std::vector<Function *>>> chains;
   for (Function &F : *m) {
     SmallVector<MDNode *, 2> mds;
@@ -1074,8 +1080,15 @@ void StatsTracker::computeSinkDistance() {
   std::set<const Function *> witFns, witHeads;
   std::set<std::pair<const Function *, const Function *>> witEdges;
   unsigned witGaps = 0;
-  for (auto &[k, chain] : chains) {
-    for (auto &[p, fs] : chain) {
+  unsigned primaryK = 0;
+  auto primary = chains.find(0);
+  if (primary == chains.end() && !chains.empty()) {
+    primary = chains.begin();
+    primaryK = primary->first;
+  }
+  if (primary != chains.end()) {
+    const auto &chain = primary->second;
+    for (const auto &[p, fs] : chain) {
       witFns.insert(fs.begin(), fs.end());
       if (p == 0)
         witHeads.insert(fs.begin(), fs.end());
@@ -1085,7 +1098,8 @@ void StatsTracker::computeSinkDistance() {
           for (Function *c : next->second)
             witEdges.insert({a, c});
     }
-    witGaps += chain.size() != chain.rbegin()->first + 1;
+    if (!chain.empty())
+      witGaps += chain.size() != chain.rbegin()->first + 1;
   }
   auto witDescends = [&](unsigned id, const Function *c) {
     const Function *a = byId[id]->getFunction();
@@ -1368,9 +1382,9 @@ void StatsTracker::computeSinkDistance() {
                "(by slot %u; indirect calls %u, narrowed %u, empty %u)",
                sinks, reachable, reachableSlot, indirect, narrowed,
                callRelation.empty);
-  klee_message("nurs:sink witnesses %zu, functions %zu, edges %zu, gaps %u, "
-               "instructions that reach along them %u",
-               chains.size(), witFns.size(), witEdges.size(), witGaps,
+  klee_message("nurs:sink witnesses %zu (guide k=%u), functions %zu, edges %zu, "
+               "gaps %u, instructions that reach along them %u",
+               chains.size(), primaryK, witFns.size(), witEdges.size(), witGaps,
                reachableWit);
   klee_message("nurs:sink installers %zu, instructions that reach one %u",
                stFns.size(), reachableSt);

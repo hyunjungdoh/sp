@@ -1495,6 +1495,62 @@ std::vector<unsigned> Client::boundBy(Function *F, unsigned j) const {
   return out;
 }
 
+void Client::ensureIoReach() const {
+  if (ioReachReady)
+    return;
+  ioReachReady = true;
+  static const std::set<std::string> open{"fopen", "fopen64", "freopen", "open", "open64", "openat", "creat"};
+  static const std::set<StringRef> io{"read",   "pread",    "pread64",       "readv",   "preadv",
+                                      "recv",   "recvfrom", "recvmsg",       "fread",   "fread_unlocked",
+                                      "fgetc",  "getc",     "getc_unlocked", "getchar", "fgets",
+                                      "fgetws", "getline",  "getdelim",      "mmap",    "mmap64"};
+  FnMap<FnSet> preds;
+  for (const auto &kv : calls)
+    for (Function *C : kv.second)
+      preds[C].insert(kv.first);
+  std::vector<Function *> openWork, readWork;
+  for (const auto &kv : bodies) {
+    Function *F = kv.second;
+    bool hitOpen = false, hitRead = false;
+    for (Instruction &I : instructions(*F)) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB)
+        continue;
+      auto *C = dyn_cast<Function>(CB->getCalledOperand()->stripPointerCasts());
+      if (!C)
+        continue;
+      if (!hitOpen && open.count(bareName(C->getName().str())))
+        hitOpen = true;
+      if (!hitRead && io.count(C->getName()))
+        hitRead = true;
+      if (hitOpen && hitRead)
+        break;
+    }
+    if (hitOpen) {
+      reachesOpen.insert(F);
+      openWork.push_back(F);
+    }
+    if (hitRead) {
+      reachesRead.insert(F);
+      readWork.push_back(F);
+    }
+  }
+  auto flood = [&](std::vector<Function *> &work, FnSet &reach) {
+    while (!work.empty()) {
+      Function *G = work.back();
+      work.pop_back();
+      auto it = preds.find(G);
+      if (it == preds.end())
+        continue;
+      for (Function *P : it->second)
+        if (reach.insert(P).second)
+          work.push_back(P);
+    }
+  };
+  flood(openWork, reachesOpen);
+  flood(readWork, reachesRead);
+}
+
 Client::Channel Client::channel(Function *F) const {
   if (auto it = channelOf.find(F); it != channelOf.end())
     return it->second;
@@ -1514,14 +1570,10 @@ Client::Channel Client::channel(Function *F) const {
       if (byteSequence(ts[i]) && isa_and_nonnull<DIBasicType>(strip(ts[i + 1])))
         return channelOf[F] = Channel::Passed;
   }
-  static const std::set<std::string> open{"fopen", "fopen64", "freopen", "open", "open64", "openat", "creat"};
-  for (Function *G : closureOf(F))
-    for (Instruction &I : instructions(*G))
-      if (auto *CB = dyn_cast<CallBase>(&I))
-        if (auto *C = dyn_cast<Function>(CB->getCalledOperand()->stripPointerCasts()))
-          if (open.count(bareName(C->getName().str())))
-            return channelOf[F] = Channel::Named;
-  return channelOf[F] = readsInput(F) ? Channel::Named : Channel::None;
+  ensureIoReach();
+  if (reachesOpen.count(F) || reachesRead.count(F))
+    return channelOf[F] = Channel::Named;
+  return channelOf[F] = Channel::None;
 }
 
 unsigned Client::callCost(Function *F) const {
@@ -2285,10 +2337,17 @@ void Client::buildProducers() {
     }
     // §3.11 Definition O: a producer that takes the input comes first, then
     // the cheaper one, then the one that leaves fewer values to the client.
-    std::sort(producers[kv.first].begin(), producers[kv.first].end(), [&](const Producer &a, const Producer &b) {
-      return std::make_tuple(channel(a.fn), a.cost, freeArgs(a.fn), a.fn->getName()) <
-             std::make_tuple(channel(b.fn), b.cost, freeArgs(b.fn), b.fn->getName());
-    });
+    // Precompute keys once — channel() used to run closureOf per comparison.
+    using Key = std::tuple<Channel, unsigned, unsigned, std::string>;
+    std::vector<std::pair<Key, Producer>> keyed;
+    keyed.reserve(producers[kv.first].size());
+    for (const Producer &p : producers[kv.first])
+      keyed.push_back({{channel(p.fn), p.cost, freeArgs(p.fn), p.fn->getName().str()}, p});
+    std::sort(keyed.begin(), keyed.end(),
+              [](const auto &a, const auto &b) { return a.first < b.first; });
+    producers[kv.first].clear();
+    for (auto &e : keyed)
+      producers[kv.first].push_back(std::move(e.second));
   }
 }
 
@@ -2869,17 +2928,8 @@ bool Client::carries(Function *W, const Cell &c, Function *E) const {
 bool Client::readsInput(Function *F) const {
   if (auto it = readsOf.find(F); it != readsOf.end())
     return it->second;
-  static const std::set<StringRef> io{"read",   "pread",    "pread64",       "readv",   "preadv",
-                                      "recv",   "recvfrom", "recvmsg",       "fread",   "fread_unlocked",
-                                      "fgetc",  "getc",     "getc_unlocked", "getchar", "fgets",
-                                      "fgetws", "getline",  "getdelim",      "mmap",    "mmap64"};
-  for (Function *G : closureOf(F))
-    for (Instruction &I : instructions(*G))
-      if (auto *CB = dyn_cast<CallBase>(&I))
-        if (Function *C = CB->getCalledFunction())
-          if (io.count(C->getName()))
-            return readsOf[F] = true;
-  return readsOf[F] = false;
+  ensureIoReach();
+  return readsOf[F] = reachesRead.count(F) > 0;
 }
 
 bool Client::storesInput(Function *F, const Field &f) const {
@@ -3121,13 +3171,104 @@ std::string Client::MustState::at(const Field &f) const {
   return "";
 }
 
+const BitVector &Client::modsBelow(Function *F) const {
+  if (fieldAt.empty()) {
+    for (const auto &[G, fs] : mods)
+      for (const Field &f : fs)
+        if (fieldId.emplace(f, fieldAt.size()).second) {
+          fieldsOfType[f.first].push_back({f.second, (unsigned)fieldAt.size()});
+          fieldAt.push_back(f);
+        }
+    for (auto &[T, v] : fieldsOfType)
+      std::sort(v.begin(), v.end());
+  }
+  if (auto it = sccOf.find(F); it != sccOf.end())
+    return sccMods[it->second];
+  // Tarjan over calls from F; an SCC's bits are its own mods and its
+  // callees' finished SCCs.
+  auto callees = [&](Function *G) -> const FnSet * {
+    auto it = calls.find(G);
+    return it == calls.end() ? nullptr : &it->second;
+  };
+  struct Frame {
+    Function *f;
+    const FnSet *succ;
+    FnSet::const_iterator next;
+  };
+  DenseMap<Function *, unsigned> index, low;
+  DenseSet<Function *> onStack;
+  std::vector<Function *> stack;
+  std::vector<Frame> frames;
+  auto enter = [&](Function *G) {
+    index[G] = low[G] = index.size();
+    stack.push_back(G);
+    onStack.insert(G);
+    const FnSet *s = callees(G);
+    frames.push_back({G, s, s ? s->begin() : FnSet::const_iterator{}});
+  };
+  enter(F);
+  while (!frames.empty()) {
+    Frame &fr = frames.back();
+    if (fr.succ && fr.next != fr.succ->end()) {
+      Function *C = *fr.next++;
+      if (sccOf.count(C))
+        continue;
+      if (!index.count(C))
+        enter(C);
+      else if (onStack.count(C))
+        low[fr.f] = std::min(low[fr.f], index[C]);
+      continue;
+    }
+    Function *G = fr.f;
+    frames.pop_back();
+    if (!frames.empty())
+      low[frames.back().f] = std::min(low[frames.back().f], low[G]);
+    if (low[G] != index[G])
+      continue;
+    std::vector<Function *> members;
+    Function *M;
+    do {
+      M = stack.back();
+      stack.pop_back();
+      onStack.erase(M);
+      members.push_back(M);
+    } while (M != G);
+    BitVector bits(fieldAt.size());
+    for (Function *X : members) {
+      if (auto m = mods.find(X); m != mods.end())
+        for (const Field &f : m->second)
+          bits.set(fieldId.at(f));
+      if (const FnSet *s = callees(X))
+        for (Function *C : *s)
+          if (auto c = sccOf.find(C); c != sccOf.end())
+            bits |= sccMods[c->second];
+    }
+    unsigned id = sccMods.size();
+    sccMods.push_back(std::move(bits));
+    for (Function *X : members)
+      sccOf[X] = id;
+  }
+  return sccMods[sccOf.at(F)];
+}
+
 // 정의 M: a forward must analysis over the fields, the greatest fixed point
 // of the meet that keeps a field only where both sides give one constant.
 const Client::MustSummary *Client::mustOnReturn(Function *F) const {
+  if (!F || F->isDeclaration())
+    return nullptr;
+  // One body per name (D∪U). Keying by raw Function* lets the same
+  // symbol's down and up copies each start a full analysis and recurse
+  // into each other — OIIO blows the stack / heap in Client construction.
+  if (Function *B = body(F->getName().str()))
+    F = B;
+  // Placeholder in mustOf while busy: a recursive edge returns the empty
+  // summary instead of re-entering (mustBusy alone is not enough when two
+  // Function* share a name across modules).
   if (auto it = mustOf.find(F); it != mustOf.end())
     return &it->second;
-  if (!F || F->isDeclaration() || !mustBusy.insert(F).second)
-    return nullptr;
+  if (!mustBusy.insert(F).second)
+    return &mustOf[F];
+  MustSummary &S = mustOf[F];
   struct Flow {
     MustState s;
     std::vector<FormalWrite> writes;
@@ -3191,10 +3332,21 @@ const Client::MustSummary *Client::mustOnReturn(Function *F) const {
       return "#" + std::to_string(A->getArgNo());
     return abstractValue(V);
   };
-  auto setField = [](MustState &s, const Field &f, const std::string &v) {
+  // A hole only shadows a fill; on a field no fill covers it is invisible to
+  // at(), to a meet (equal fills on both sides), and to a later fill (which
+  // clears holes it covers), and holding it makes every block's state carry
+  // all a callee may touch.
+  auto covered = [](const MustState &s, const Field &f) {
+    for (const MustFill &x : s.fills)
+      if (x.type == f.first && f.second >= x.off && f.second - x.off < x.len)
+        return true;
+    return false;
+  };
+  auto setField = [&covered](MustState &s, const Field &f, const std::string &v) {
     if (v == "*") {
       s.fixed.erase(f);
-      s.holes.insert(f);
+      if (covered(s, f))
+        s.holes.insert(f);
     } else {
       s.fixed[f] = v;
       s.holes.erase(f);
@@ -3276,10 +3428,19 @@ const Client::MustSummary *Client::mustOnReturn(Function *F) const {
     for (unsigned j : S->clobbers)
       if (j < CB->arg_size())
         write(fl, CB->getArgOperand(j), INT64_MAX, -1, "*");
-    for (Function *G : closureOf(D))
-      if (auto m = mods.find(G); m != mods.end())
-        for (const Field &f : m->second)
-          setField(fl.s, f, "*");
+    const BitVector &below = modsBelow(D);
+    std::vector<Field> lost;
+    for (const auto &[f, v] : fl.s.fixed)
+      if (auto id = fieldId.find(f); id != fieldId.end() && below.test(id->second))
+        lost.push_back(f);
+    for (const MustFill &x : fl.s.fills)
+      if (auto t = fieldsOfType.find(x.type); t != fieldsOfType.end())
+        for (auto it = std::lower_bound(t->second.begin(), t->second.end(), std::make_pair(x.off, 0u));
+             it != t->second.end() && it->first - x.off < x.len; ++it)
+          if (below.test(it->second))
+            lost.push_back(fieldAt[it->second]);
+    for (const Field &f : lost)
+      setField(fl.s, f, "*");
     for (const MustFill &x : S->post.fills)
       fill(fl.s, {{x.type, x.off}}, x.len, x.val);
     for (const Field &f : S->post.holes)
@@ -3364,13 +3525,12 @@ const Client::MustSummary *Client::mustOnReturn(Function *F) const {
     if (isa<ReturnInst>(BB->getTerminator()))
       if (auto it = outOf.find(BB); it != outOf.end())
         ret = ret ? meet(*ret, it->second) : it->second;
-  mustBusy.erase(F);
-  MustSummary &S = mustOf[F];
   if (ret && !changed) {
     S.post = std::move(ret->s);
     S.writes = std::move(ret->writes);
     S.clobbers = std::move(ret->clobbers);
   }
+  mustBusy.erase(F);
   return &S;
 }
 
@@ -3690,8 +3850,10 @@ Client::WitnessPlan Client::realize(Function *E, const std::vector<Cell> &phi, c
     for (const Cell *c : ob)
       if (contradicts(F, *c)) {
         barred.insert(F);
-        W.excluded.push_back(F->getName().str() + " " + c->type + "+" + std::to_string(c->off) + " " +
-                             mustOnReturn(F)->post.at(fieldOf(*c)));
+        std::string got;
+        if (const MustSummary *MS = mustOnReturn(F))
+          got = MS->post.at(fieldOf(*c));
+        W.excluded.push_back(F->getName().str() + " " + c->type + "+" + std::to_string(c->off) + " " + got);
         return false;
       }
     return true;
@@ -4060,12 +4222,15 @@ void Client::dispatch(const Witnesses &ws, Plan &P) const {
     for (Function *H : called)
       file = file || opensFile(H);
     std::vector<std::string> notes;
-    // Π_I must name installers that select THIS witness's callees. Taking the
-    // first input edge's St over-approxes polymorphic slots (every Decoder_*
-    // for get_decoded_frame) and steers search into installers off the witness.
-    // Magick's first edge was already size-1 (RegisterTIFFImage); HEIF's is
-    // size-14. Keep the smallest non-empty input-installer sets on the witness
-    // — those are the most specific gates the path actually needs.
+    // Π_I (DESIGN-D): mark every installer on the witness's *first*
+    // input-dispatch edge (`input:F`) that carries a choice (below).
+    // Do not shrink to later edges' smaller
+    // St sets — those are nested inits (jinit_*) that never appear in a keyed
+    // dispatch table, so gateKeys stays empty and the codec init on the first
+    // edge (TIFFInitJPEGCommon / RegisterTIFFImage) is never approached as T_st.
+    // Marking the whole first-edge St is intentional: any one of them opens the
+    // gate; picking a singleton by set size made the choice order-dependent
+    // (HEIF) and dropped the table-keyed installer (libtiff JPEG).
     std::vector<std::set<std::string>> inputGates;
     unsigned indirect = 0, open = 0;
     for (size_t i = 0; i + 1 < seq.size(); ++i) {
@@ -4080,6 +4245,18 @@ void Client::dispatch(const Witnesses &ws, Plan &P) const {
       if (direct)
         continue;
       ++indirect;
+      // The targets an indirect site of A that may call T may call. One
+      // target that several installers all install is no choice: a method
+      // every subclass inherits has every subclass constructor in St. A sole
+      // installer of a sole target is still a step the input must take.
+      std::set<std::string> choices;
+      for (Instruction &I : instructions(*A))
+        if (auto *CB = dyn_cast<CallBase>(&I); CB && klee::calls::indirect(*CB)) {
+          const auto &tg = targets.of(*CB);
+          if (std::any_of(tg.begin(), tg.end(), [&](Function *G) { return G->getName() == T->getName(); }))
+            for (Function *G : tg)
+              choices.insert(G->getName().str());
+        }
       std::vector<std::string> ks = keysOf(T);
       for (const std::string &k : ks)
         if (P.keys.size() < 16 && keySeen.insert(k).second)
@@ -4096,7 +4273,7 @@ void Client::dispatch(const Witnesses &ws, Plan &P) const {
               by.insert(G->getName().str());
         for (const std::string &g : by)
           how += " input:" + g;
-        if (!by.empty())
+        if (!by.empty() && !(choices.size() == 1 && St.size() > 1))
           inputGates.push_back(std::move(by));
       }
       for (Function *W : setters) {
@@ -4110,17 +4287,12 @@ void Client::dispatch(const Witnesses &ws, Plan &P) const {
       }
       open += how.empty();
       notes.push_back("  D " + A->getName().str() + " -> " + T->getName().str() + " st " +
-                      std::to_string(St.size()) + (how.empty() ? " OPEN" : how));
+                      std::to_string(St.size()) + " tg " + std::to_string(choices.size()) +
+                      (how.empty() ? " OPEN" : how));
     }
     std::set<std::string> gate;
-    if (!inputGates.empty()) {
-      size_t best = inputGates[0].size();
-      for (const auto &g : inputGates)
-        best = std::min(best, g.size());
-      for (const auto &g : inputGates)
-        if (g.size() == best)
-          gate.insert(g.begin(), g.end());
-    }
+    if (!inputGates.empty())
+      gate.insert(inputGates[0].begin(), inputGates[0].end());
     for (const std::string &g : gate)
       if (std::find(P.stInstallers.begin(), P.stInstallers.end(), g) == P.stInstallers.end())
         P.stInstallers.push_back(g);
@@ -5999,8 +6171,15 @@ void Client::emit(const Plan &P, Module &H) const {
     C.CreateCall(declare(n.setter), args);
   };
   {
+    // Primary witness entry only. The plan still records every witness entry
+    // for obligations/report, but main must not oneOf across them: equal
+    // weight on Write when the primary π₀ is Read burns the concolic budget
+    // off the guided path (nurs:sink / sp.wit k=0).
+    std::vector<Function *> entries = P.entries;
+    if (!P.firsts.empty())
+      entries = {P.firsts.front()};
     std::vector<std::function<void(IRBuilder<> &)>> alts;
-    for (Function *E : P.entries)
+    for (Function *E : entries)
       alts.push_back([&, E](IRBuilder<> &C) {
         auto kit = P.keyed.find(E);
         if (kit != P.keyed.end())

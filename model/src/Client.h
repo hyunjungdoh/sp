@@ -6,6 +6,9 @@
 #include <optional>
 #include <tuple>
 
+#include "llvm/ADT/BitVector.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Dominators.h"
@@ -348,6 +351,12 @@ private:
   enum class Channel { Passed, Named, None };
   Channel channel(Function *F) const;
   mutable FnMap<Channel> channelOf;
+  // Functions that reach fopen/read-family calls: one reverse BFS over
+  // `calls`, not a fresh closureOf per channel()/readsInput() query.
+  void ensureIoReach() const;
+  mutable bool ioReachReady = false;
+  mutable FnSet reachesOpen;
+  mutable FnSet reachesRead;
   bool opensFile(Function *F) const { return channel(F) != Channel::None; }
   // The pointer formals of F that integer formal j bounds (A3).
   std::vector<unsigned> boundBy(Function *F, unsigned j) const;
@@ -497,6 +506,15 @@ private:
   };
   mutable FnMap<MustSummary> mustOf;
   mutable FnSet mustBusy;
+  // The fields F or anything it reaches may modify, one bit per field of
+  // fieldAt, shared by an SCC of the call relation. Materialising closureOf
+  // per callee instead holds a name-ordered set per function: OIIO, GBs.
+  const llvm::BitVector &modsBelow(Function *F) const;
+  mutable std::vector<Field> fieldAt;
+  mutable std::map<Field, unsigned> fieldId;
+  mutable std::map<std::string, std::vector<std::pair<int64_t, unsigned>>> fieldsOfType;
+  mutable llvm::DenseMap<Function *, unsigned> sccOf;
+  mutable std::vector<llvm::BitVector> sccMods;
   mutable std::unique_ptr<TargetLibraryInfoImpl> libImpl;
   mutable std::unique_ptr<TargetLibraryInfo> libSpec;
   const TargetLibraryInfo &libInfo() const;
