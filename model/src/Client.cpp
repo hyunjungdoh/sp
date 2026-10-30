@@ -3939,6 +3939,14 @@ void Client::grammar(Plan &P) const {
       if (held(p) && cost.count(p.type))
         need.insert(p.type);
   };
+  auto wantType = [&](std::string t) {
+    if (t.rfind("struct.", 0) == 0)
+      t = t.substr(7);
+    else if (t.rfind("class.", 0) == 0)
+      t = t.substr(6);
+    if (cost.count(t) && producers.count(t))
+      need.insert(t);
+  };
   for (Function *F : P.entries)
     want(F);
   for (Function *F : P.writers)
@@ -3949,6 +3957,11 @@ void Client::grammar(Plan &P) const {
   for (const auto &[E, ns] : P.named)
     for (const Named &n : ns)
       want(n.setter);
+  // Nested held objects φ names under an entry argument (e.g. CustomStreamInfo
+  // under ImageInfo) are not entry formals, but the harness must still make them.
+  for (const WitnessPlan &W : P.witnesses)
+    for (const Realized &r : W.cells)
+      wantType(r.cell.type);
   for (std::vector<std::string> work(need.begin(), need.end()); !work.empty();) {
     std::string T = work.back();
     work.pop_back();
@@ -5723,6 +5736,70 @@ void Client::emit(const Plan &P, Module &H) const {
           }
         });
       K.oneOf(C, wit, "witness");
+    }
+    // Held producers leave nested pointer fields null. If φ names a nested
+    // held type under an entry argument (ImageInfo.custom_stream →
+    // CustomStreamInfo for CustomStreamToImage), install that object and
+    // fill its pointer fields (reader callbacks) before the call — otherwise
+    // the static path dies on the library's null assert and nurs:sink never
+    // gets to walk π.
+    if (std::find(P.entries.begin(), P.entries.end(), F) != P.entries.end()) {
+      auto norm = [](std::string t) {
+        if (t.rfind("struct.", 0) == 0)
+          t = t.substr(7);
+        else if (t.rfind("class.", 0) == 0)
+          t = t.substr(6);
+        return t;
+      };
+      std::set<std::string> need;
+      for (const WitnessPlan &W : P.witnesses) {
+        bool here = W.first == F;
+        for (Function *E : W.entries)
+          here = here || E == F;
+        if (!here)
+          continue;
+        for (const Realized &r : W.cells) {
+          std::string k = norm(r.cell.type);
+          if (make.count(k))
+            need.insert(k);
+        }
+      }
+      if (!need.empty()) {
+        auto ps = signature(F);
+        auto atp = irParams(F);
+        for (unsigned i = 0; i < args.size() && i < FT->getNumParams(); ++i) {
+          if (atp[i] < 0 || !held(ps[atp[i]]) || !args[i]->getType()->isPointerTy())
+            continue;
+          auto cit = composite.find(ps[atp[i]].type);
+          if (cit == composite.end())
+            continue;
+          for (const DIDerivedType *M : members(cit->second)) {
+            const DIType *BT = strip(M->getBaseType());
+            if (!isPointer(BT))
+              continue;
+            auto *Pointee = def(cast<DIDerivedType>(BT)->getBaseType());
+            if (!Pointee)
+              continue;
+            std::string pk = typeKey(Pointee);
+            if (!need.count(pk) || !make.count(pk))
+              continue;
+            int64_t o = (int64_t)(M->getOffsetInBits() / 8);
+            Value *slot = C.CreateGEP(C.getInt8Ty(), args[i], C.getInt64(o));
+            Value *cur = C.CreateLoad(p0, slot);
+            Value *child = obtain(C, pk);
+            // Producer sets the representation invariant; fields() installs
+            // the function pointers φ/the callee will null-check (reader).
+            // Prefer the complete composite: the argument field's pointee is
+            // often only a forward declaration in this CU.
+            const DIType *full = Pointee;
+            if (auto fit = composite.find(pk); fit != composite.end())
+              full = fit->second;
+            fields(C, child, full, objectDepth, Where{F, i, {}, o, false});
+            Value *use = C.CreateSelect(C.CreateICmpEQ(cur, ConstantPointerNull::get(p0)), child, cur);
+            C.CreateStore(use, slot);
+          }
+        }
+      }
     }
     Value *r = C.CreateCall(declare(F), args);
     if (!makesT.empty() && outAt == -1 && r->getType()->isPointerTy())

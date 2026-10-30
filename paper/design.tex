@@ -1,14 +1,14 @@
 \section{Design of \sys}
 \label{sec:design}
 
-In this section, we describe the design of \sys, which assesses whether a vulnerability in an upstream library is exploitable through a downstream library.
-\sys recovers the calls and runtime state needed to reach the vulnerable code, and then searches for inputs that trigger it.
+\sys assesses whether a vulnerability in an upstream library can be triggered through a downstream application.
+To do so, it recovers how a client can reach the vulnerable code and establish the required runtime state, and then searches for input data that triggers the vulnerability.
 
 \PP{Overview}
-\autoref{fig:overview} shows the workflow of \sys, which comprises three phases.
-In P1, \sys recovers trigger paths, i.e., call sequences from a public API of the downstream library $D$ to the vulnerable code in the upstream library $U$, together with the conditions those sequences require.
-In P2, \sys generates a client harness that invokes the recovered API sequence and establishes the runtime state those conditions demand.
-In P3, \sys performs concolic execution on the harness to find concrete inputs that trigger the vulnerability.
+\autoref{fig:overview} shows the workflow of \sys, which consists of three phases.
+P1 recovers trigger paths from a public API of the downstream application $D$ to the vulnerable code in the upstream library $U$, together with the conditions required to execute each path.
+P2 generates a client harness that follows a recovered path and establishes the required state through the public API of $D$.
+P3 performs concolic execution on the harness to find input data that triggers the vulnerability.
 
 \begin{figure}[t]
 \centering
@@ -20,112 +20,145 @@ In P3, \sys performs concolic execution on the harness to find concrete inputs t
 \subsection{Recovering Trigger Paths (P1)}
 \label{subsec:p1}
 
-P1 addresses C1 by recovering the configuration context of the sink $s$ across the $D$--$U$ boundary.
-The context is a pair $(\pi,\varphi_\pi)$.
-The \emph{trigger call path} $\pi=f_0\rightarrow\cdots\rightarrow f_n$ runs from a public API of $D$ to the function containing $s$ in $U$, and the condition $\varphi_\pi$ specifies when that path can execute under one shared entry state.
-\sys recovers the path and the condition in turn, then keeps only paths whose indirect calls a real client of $D$ can set up.
+P1 recovers how a client can reach the sink $s$ across the $D$--$U$ boundary.
+A \emph{trigger call path} $\pi=f_0\rightarrow\cdots\rightarrow f_n$ represents a sequence of calls from a public API of $D$ to the function containing $s$ in $U$.
+Its path condition $\varphi_\pi$ specifies the conditions that must hold for this sequence to execute.
 
-\begin{enumerate}
-    \item \textbf{Trigger call path.} $D$ often reaches $U$ through indirect calls (function pointers, callbacks, virtual calls), which a call graph of explicit callees cannot see.
-    \sys therefore links each store of a function address to the indirect calls that later load it.
-    It starts paths only from the outermost public APIs of $D$ that a client can actually invoke with arguments it can construct.
-    \item \textbf{Feasibility.} Values and branch conditions along $\pi$ must hold jointly under that single entry state, and every indirect call on $\pi$ must be one the client can configure.
-    \sys maps memory accesses back to locations derived from the entry arguments so one satisfiability check covers both modules, and it discards indirect call edges that no client API sequence can establish.
-\end{enumerate}
+A call graph alone does not tell whether a client can execute a path.
+It may miss edges introduced by indirect calls, include functions that a client cannot call directly, or contain paths whose branch conditions and indirect-call targets cannot be satisfied.
+P1 addresses these issues by completing the call graph, identifying valid entry points, and checking path feasibility.
 
 \PP{Resolving Cross-Boundary Indirect Calls}
 Consider a callback that $D$ registers by storing a function address in an object field.
-$U$ later loads that address and calls through it, so the edge between the two modules never appears in a direct call graph.
-\sys recovers such edges by linking each function-address store to the indirect calls that load the same location.
+When $U$ later loads that address and calls the function, the call graph lacks the corresponding edge because the call is indirect.
+To recover such edges, \sys performs a field-sensitive, flow-insensitive points-to analysis on function pointers.
 
-For this purpose, \sys runs a field-sensitive, flow-insensitive points-to analysis restricted to function pointers.
-Let a location $\ell=(o,\alpha)$ be an object $o$ and a field $\alpha$ within it, so a store into one field is never confused with another.
-Let $\mathcal{L}$ be the set of locations and $\mathcal{F}$ the set of functions in $D$ and $U$.
-For each $\ell\in\mathcal{L}$, $\operatorname{Pt}(\ell)\subseteq\mathcal{F}$ is the set of functions whose addresses may be stored at $\ell$.
-The analysis proceeds in three steps.
-\begin{enumerate}
-    \item For each store of a function address, add that function to $\operatorname{Pt}(\ell)$ of the target location.
-    \item Propagate these sets along memory and pointer flows until a fixed point.
-    \item Relate locations with compatible field paths, since the same storage can be accessed at different levels of an object.
-\end{enumerate}
+Let $\ell=(o,\alpha)$ denote a memory location, where $o$ identifies an object and $\alpha$ identifies a field within that object.
+This representation distinguishes function pointers stored in different fields.
+Let $\mathcal{L}$ be the set of abstract locations and $\mathcal{F}$ the set of functions defined in $D$ and $U$.
+For each location $\ell\in\mathcal{L}$, $\operatorname{Pt}(\ell)\subseteq\mathcal{F}$ contains the functions whose addresses may be stored at $\ell$.
 
-Using the result, \sys adds a call-graph edge from each indirect call that loads from $\ell$ to every type-compatible function in $\operatorname{Pt}(\ell)$.
-An empty set yields no edge.
-Virtual calls are resolved over the possible derived classes of the receiver.
+The analysis first records function addresses stored in memory and then propagates them through stores, loads, and pointer flows until reaching a fixed point.
+It also relates locations with compatible field paths to account for accesses to the same storage through different levels of an object.
+For each indirect call, \sys adds an edge to every type-compatible function in the points-to set of the location from which the callee is loaded.
+Virtual calls are resolved using the possible derived classes of the receiver.
 These edges complete the call graph $G=(V,E)$ across the $D$--$U$ boundary.
 
 \PP{Identifying Entry Points}
-$G$ shows how $s$ can be reached, but not where a client can \emph{start}.
-A valid start must satisfy two conditions.
+The completed call graph shows how the sink can be reached, but a client cannot start execution at an arbitrary function in $D$.
+A valid starting point must be part of the public interface and must have arguments that a client can construct.
 
-\begin{enumerate}
-    \item \textbf{Outermost among public APIs.}
-    If a public function $f$ is called by another public function $c$ that also reaches $s$, starting at $f$ would skip $c$'s setup.
-    Internal (non-exported) callers do not disqualify $f$: they are part of $D$'s implementation below the client API.
-    \item \textbf{Constructible arguments.}
-    Export and a header declaration are not enough.
-    If any argument that the client must supply as an owned object or handle has a type the client cannot construct (e.g., an opaque handle with no public constructor), no well-formed client can call $f$, and projecting path conditions onto $f$'s arguments would be meaningless.
-\end{enumerate}
+Let $I$ denote the public interface of $D$, consisting of symbols exported by its shared library and declared in its installed headers.
+We consider two requirements when selecting entry points.
 
-Let $I$ be the public interface of $D$: symbols that $D$'s shared library exports and that $D$'s installed headers declare.
-Let $I^{\star}\subseteq I$ be those functions for which every client-owned object or handle argument has a constructible type.
-Let $R(s)=\{v\in V\mid v\leadsto s\}$ be the functions that can reach $s$ on $G$.
-\sys selects entry points as
+First, an entry point must be an outermost public API that reaches $s$.
+If another public API calls it and also reaches $s$, starting from the inner function would skip the setup performed by its caller.
+Calls from internal functions do not disqualify an entry point, since those functions are part of the implementation of $D$.
+
+Second, the client must be able to construct its object and handle arguments.
+For example, an opaque handle without a public constructor cannot be supplied directly by a client.
+
+Let $I^\star\subseteq I$ be the set of public functions whose client-supplied object and handle arguments have types that the client can construct.
+Let $R(s)=\{v\in V\mid v\leadsto s\}$ be the set of functions that can reach $s$ in $G$.
+\sys selects entry points as follows.
 \[
 B_{\mathrm{entry}} =
 \left\{
-f\in I^{\star}\cap R(s)
+f\in I^\star\cap R(s)
 \;\middle|\;
 \nexists c\in R(s)\cap I:(c\rightarrow f)\in E
 \right\}.
 \]
-Each selected function is a root a client can actually call, and path conditions are stated over its arguments.
-\sys enumerates candidate paths from these entry points to the function containing $s$.
-A public symbol outside $I^{\star}$ may still appear later on a path as an internal step; it is never the first function of $\pi$.
+
+A public function that does not satisfy the argument requirement may still appear later in a path; it is excluded only as the starting point.
+\sys then enumerates paths from the selected entry points to the function containing $s$.
 
 \PP{Checking Path Feasibility}
-A call-graph path alone does not tell whether a client can follow it.
-\sys therefore separates \emph{value feasibility} from \emph{setup feasibility}.
+Even if a path exists in the call graph, a client may not be able to execute it.
+P1 therefore checks whether the path conditions can be satisfied and whether the client can set up the indirect calls along the path.
 
-\paragraph{Value feasibility.}
-Under one entry state at $f_0\in B_{\mathrm{entry}}$, (i)~each call on $\pi$ must be reached through the appropriate branches, and (ii)~each indirect call must load the callee that $\pi$ designates.
-\sys encodes both as a path condition
+\textbf{Value feasibility.}
+For a path $\pi$ starting at $f_0\in B_{\mathrm{entry}}$, the execution must take the required branches and each indirect call must load the target specified by $\pi$.
+\sys expresses these requirements as a path condition:
 \[
 \varphi_\pi =
 \varphi_{\mathrm{control}}\land
 \varphi_{\mathrm{dispatch}},
 \]
-where $\varphi_{\mathrm{control}}$ is the conjunction of those branch conditions and $\varphi_{\mathrm{dispatch}}$ constrains each indirect-call slot to the designated target.
+where $\varphi_{\mathrm{control}}$ represents the required branch conditions and $\varphi_{\mathrm{dispatch}}$ specifies the targets of indirect calls.
 
-To state $\varphi_\pi$ over the entry state, \sys works backward from the sink.
-\begin{enumerate}
-    \item Collect the requirements of each function and propagate them to its caller, so branch choices stay consistent with the state the caller passes.
-    \item Represent each relevant memory access as a \emph{cell} $(i,\alpha)$: the $i$-th argument of $f_0$ together with a constant field path $\alpha$ from that argument.
-    Accesses in callees are mapped back to these cells across calls, so deep conditions become conditions on values available at $f_0$.
-    \item State the requirements of indirect calls over the same cells used to resolve their targets.
-\end{enumerate}
+These conditions may depend on values passed through several functions.
+To express them in terms of the state available at $f_0$, \sys propagates the requirements backward from the sink through the call path.
+It represents each relevant memory access as a \emph{cell} $(i,\alpha)$, where $i$ identifies an argument of $f_0$ and $\alpha$ is a constant field path from that argument.
+When a callee accesses memory through its arguments, \sys maps the access back to the corresponding cell at $f_0$.
+This allows conditions encountered deeper in the call path to be expressed over the entry arguments.
+The same cells are used to express the requirements on indirect-call targets.
+Finally, \sys checks the satisfiability of $\varphi_\pi$ with a static constraint solver and discards paths with unsatisfiable conditions.
 
-\sys then checks satisfiability of $\varphi_\pi$ on those cells with a static constraint solver.
-If $\varphi_\pi$ is unsatisfiable, the path is discarded.
+\textbf{Setup feasibility.}
+Satisfiable path conditions do not guarantee that a client can execute the indirect calls along the path.
+For each indirect call, the client must be able to install the required callee in its call slot before the call takes place.
 
-\paragraph{Setup feasibility.}
-Even when $\varphi_\pi$ is satisfiable, an indirect edge on $\pi$ is usable only if a real client of $D$ can \emph{install} the chosen callee before the call runs.
-\sys treats an indirect edge as client-setuppable when at least one of the following holds (the same mechanisms P2 later uses in the harness):
-\begin{enumerate}
-    \item A \emph{name-based selector}: the client passes a constant string (format name, codec id, \ldots) that the library uses to choose the callee.
-    \item An \emph{input-driven registration}: while $D$ reads the client's input, it runs a routine that stores the callee into the call slot.
-    \item An \emph{explicit API write}: the client calls a public setter that stores the callee (or otherwise configures the slot).
-\end{enumerate}
-If $\varphi_\pi$ is satisfiable but some indirect edge is not client-setuppable, \sys excludes that edge from further path search and tries another candidate.
-Only when $\varphi_\pi$ is satisfiable \emph{and} every indirect edge is client-setuppable does \sys emit $(\pi,\varphi_\pi)$.
+A client interacts with $D$ through the values it passes, the input it supplies, and the public APIs it calls.
+Accordingly, \sys considers three ways in which a client can install an indirect-call target:
+(i)~by passing a value, such as a format string or codec identifier, that $D$ uses to select the callee;
+(ii)~by supplying input that causes $D$ to install the callee while processing it; or
+(iii)~by calling a public API that installs the callee or configures the call slot.
 
-The emitted pair is still a static (may) result: it shows a client-callable entry, jointly consistent entry conditions, and setuppable indirect calls---not that executing the path with some input reaches $s$.
-These pairs are passed to P2, which builds a harness that establishes the required state, and to P3, which searches for triggering inputs.
+We call an indirect edge \emph{client-configurable} if its target can be installed through one of these channels along $\pi$.
+If none of the channels can install the target, \sys discards the path and continues searching for alternatives that avoid the edge or allow its target to be installed.
+This model considers clients that interact with $D$ through its public interface; it does not cover clients that directly modify internal state, such as by patching a global variable.
 
-\subsection{Generating Harness (P2)}
+\subsection{Harness Synthesis (P2)}
 \label{subsec:p2}
 
+P2 generates a \emph{client harness} from a path and its condition $(\pi,\varphi_\pi)$ recovered by P1.
+The harness must perform the API calls along $\pi$ and establish the memory values required by $\varphi_\pi$.
+This requires determining which public API operations can set each required value and how to obtain the objects and handles needed to call those APIs.
 
+\PP{Mapping Constraints to API Operations}
+Each constraint in $\varphi_\pi$ refers to a cell $(i,\alpha)$ rooted at an argument of the entry function $f_0$.
+P2 examines how each cell obtains its value and identifies an API operation that can establish the required value.
+
+Some cells can be controlled directly through an argument or branch guard of $f_0$.
+Others are initialized by arguments passed to a public constructor.
+If $D$ accesses a cell through a name or key, the harness can use a public setter to establish the corresponding binding before the lookup.
+When these options are unavailable, P2 searches for public setters that write to the required fields.
+It also considers cells initialized by functions along $\pi$ and cells populated when $D$ reads client-supplied input.
+
+The required values determine how the harness uses these operations.
+For constructor arguments, equality constraints specify the values to pass, while inequality constraints are retained as assumptions.
+For fields that require explicit writes, P2 selects public setters that cover the required cells, subject to a budget of at most $K$ calls.
+
+If P2 cannot identify an API operation or input that establishes a required value, it marks the pair as a \emph{model gap} and excludes it.
+Without such an operation, the harness cannot satisfy $\varphi_\pi$.
+
+\PP{Recovering API Dependencies}
+\textcolor{red}{예시 넣기}
+The operations identified above may require objects or opaque handles that a client cannot create directly.
+For example, a setter may require a handle returned by another public API.
+P2 therefore analyzes the public API to determine how the objects and handles required by the harness can be obtained.
+
+A required handle may be returned by several public functions.
+Each such function may, in turn, require multiple arguments or other handles.
+P2 represents these dependencies using an AND--OR grammar: the alternative functions that can produce a handle form an OR choice, while the arguments and prerequisite API calls required by each function form an AND dependency.
+Expanding this representation gives the API calls needed to construct the handles required by the entry function and the state-setting operations.
+
+\PP{Generating the Harness}
+P2 combines the required API operations and their dependencies to generate a straight-line harness with a fixed call schedule and bounded choices.
+The harness first calls the public functions needed to construct the required objects and handles.
+It then performs the state-setting operations identified above and invokes the selected entry function $f_0$.
+When multiple functions can construct the same handle or multiple entry points satisfy the same requirements, P2 retains these alternatives for P3.
+
+The harness uses values that a client can provide.
+Integers and enums range over their declared bit widths, while text arguments are selected from a finite set distinguished by the callee.
+Opaque handles are obtained through the public API, and public structures and other pointers are constructed within fixed bounds.
+When required, function-pointer arguments are supplied with a type-compatible generic callback.
+Input-file arguments are connected to symbolic input, and client-controllable branch conditions are enforced through value selection or assumptions.
+Indirect calls along $\pi$ are configured through the same value, input, and API channels checked by P1.
+
+The harness fixes the API calls and memory stores needed to establish $\varphi_\pi$, while leaving input bytes, unconstrained scalar values, and the remaining API choices symbolic.
+P3 explores these choices to find an execution that follows $\pi$ to the sink $s$.
 
 \subsection{Concolic Execution (P3)}
 \label{subsec:p3}
