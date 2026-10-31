@@ -3908,10 +3908,17 @@
         }
       };
       using Terms = std::set<Term>;
-      std::map<std::string, Terms> evDone, evRound, evPrev;
-      std::set<std::string> evBusy;
+      // A value's key is (function, value, environment, call string); equal
+      // environments and call strings share one id.
+      using EvKey = std::tuple<const Function *, const Value *, unsigned, unsigned>;
+      std::map<EvKey, Terms> evDone, evRound, evPrev;
+      std::set<EvKey> evBusy;
+      bool evCycle = false;
+      std::map<std::vector<Terms>, unsigned> envIds;
+      std::map<std::set<std::string>, unsigned> activeIds;
       std::unordered_set<const Function *> active;
       std::set<std::string> activeNames;
+      unsigned activeId = activeIds.try_emplace(activeNames, 0).first->second;
       std::map<const AllocaInst *, std::string> localName;
       auto nameOf = [&](const AllocaInst *A) -> const std::string & {
         auto it = localName.find(A);
@@ -3932,28 +3939,18 @@
         return false;
       };
       auto envKey = [&](const Function *F, const Value *V, const std::vector<Terms> &env) {
-        std::string k = std::to_string(reinterpret_cast<uintptr_t>(F)) + "/" + std::to_string(reinterpret_cast<uintptr_t>(V));
-        for (const Terms &ts : env) {
-          k += "|";
-          for (const Term &t : ts) {
-            k += "{" + std::to_string(t.arg) + (t.val ? "v" : "a") + t.lname;
-            for (const Step &s : t.suf)
-              k += ";" + s.type + "@" + std::to_string(s.off) + (s.deref ? "*" : "");
-            k += "}";
-          }
-        }
-        k += "#";
-        for (const std::string &a : activeNames)
-          k += a + ",";
-        return k;
+        unsigned e = envIds.try_emplace(env, (unsigned)envIds.size()).first->second;
+        return EvKey{F, V, e, activeId};
       };
       auto enter = [&](Function *T) {
         active.insert(T);
         activeNames.insert(T->getName().str());
+        activeId = activeIds.try_emplace(activeNames, (unsigned)activeIds.size()).first->second;
       };
       auto leave = [&](Function *T) {
         active.erase(T);
         activeNames.erase(T->getName().str());
+        activeId = activeIds.try_emplace(activeNames, (unsigned)activeIds.size()).first->second;
       };
       std::function<Terms(Function *, Value *, const std::vector<Terms> &)> ev;
       std::function<Terms(Function *, const std::vector<Terms> &, const AllocaInst *)> storesTo;
@@ -4011,12 +4008,13 @@
       ev = [&](Function *F, Value *V, const std::vector<Terms> &env) -> Terms {
         if (!V)
           return {};
-        std::string k = envKey(F, V, env);
+        const EvKey k = envKey(F, V, env);
         if (auto it = evDone.find(k); it != evDone.end())
           return it->second;
         if (auto it = evRound.find(k); it != evRound.end())
           return it->second;
         if (!evBusy.insert(k).second) {
+          evCycle = true;
           auto it = evPrev.find(k);
           return it == evPrev.end() ? Terms{} : it->second;
         }
@@ -4126,8 +4124,11 @@
         evPrev.clear();
         for (;;) {
           evRound.clear();
+          evCycle = false;
           Terms r = ev(F, V, env);
-          if (evRound == evPrev) {
+          // A round that read no previous approximation computed exact
+          // values; the next round would repeat it.
+          if (!evCycle || evRound == evPrev) {
             evDone.insert(evRound.begin(), evRound.end());
             evRound.clear();
             return r;

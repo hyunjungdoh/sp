@@ -12,12 +12,7 @@ void Model::run(int seqPick, raw_ostream &out) {
       out << "sink none\n";
       return;
     }
-    // Experiment gate: when set, resolve local-held pointers eagerly during the
-    // index passes too, so one binary can show the index output is identical
-    // with or without the staging. Off by default.
-    if (const char *e = std::getenv("SP_EAGER_HELD"); e && *e)
-      resolveHeld = true;
-    index();
+    prepare();
     cone = reachSink();
     starts = findStarts();
     hopBan.clear();
@@ -82,6 +77,18 @@ void Model::index() {
     buildCallers();
   }
 
+void Model::prepare() {
+    if (indexed)
+      return;
+    // Experiment gate: when set, resolve local-held pointers eagerly during the
+    // index passes too, so one binary can show the index output is identical
+    // with or without the staging. Off by default.
+    if (const char *e = std::getenv("SP_EAGER_HELD"); e && *e)
+      resolveHeld = true;
+    index();
+    indexed = true;
+  }
+
 int Model::pathBudget(bool probe) {
   const char *pb = std::getenv(probe ? "SP_PROBE_PATHS" : "SP_PATHS");
   return pb && *pb ? std::max(1, std::atoi(pb)) : (probe ? 256 : 32);
@@ -129,10 +136,19 @@ std::vector<Function *> Model::findSinks() {
   }
 
 Suffix Model::suffix(Value *V) const {
+    if (!V)
+      return {};
+    auto [memo, added] = suffixMemo.try_emplace(V);
+    if (!added)
+      return memo->second;
+    Suffix s = suffixOf(V);
+    suffixMemo[V] = s;
+    return s;
+  }
+
+Suffix Model::suffixOf(Value *V) const {
     Suffix s;
     std::unordered_set<const Value *> seen;
-    if (!V)
-      return s;
     {
       Value *U = V;
       while (auto *C = dyn_cast<CastInst>(U))

@@ -1227,9 +1227,9 @@ void markStInstallers(Module &M, const std::vector<std::string> &names) {
 // The may query of Definition E, three-valued: 1 a satisfiable sequence from
 // starts reaches file:line, 0 every sequence was tried and none is, -1 when
 // the path budget ran out or the line is not a sink.
-int probeReach(Module &down, Module &up, const std::set<std::string> &iface, const std::string &f, unsigned l,
+int probeReach(const Model &prepared, const std::set<std::string> &iface, const std::string &f, unsigned l,
                const std::set<std::string> &starts, bool exact = false) {
-  Model m(down, up, f, l);
+  Model m(prepared, f, l);
   m.interfaceNames = iface;
   m.startNames = starts;
   m.exactStarts = exact;
@@ -1289,6 +1289,9 @@ int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, cons
     return std::chrono::duration<double, std::milli>(Clock::now() - t).count();
   };
   const std::set<std::string> iface = Client::publicInterface(*down2, *up2, dir);
+  Model prepared(*down2, *up2, file, line);
+  prepared.interfaceNames = iface;
+  prepared.prepare();
   // reach/probe are deterministic in the fixed D/U modules, so identical
   // (file, line, starts[, from]) queries recompute the same full may-analysis.
   // establishedBy fires the same query for every entry sharing a start set, so
@@ -1315,7 +1318,7 @@ int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, cons
       queryMs += ms;
       errs() << "query " << f << ":" << l << " starts " << starts.size() << " ms " << (long)ms << "\n";
     }};
-    Model m(*down2, *up2, f, l);
+    Model m(prepared, f, l);
     m.interfaceNames = iface;
     m.startNames = starts;
     m.exactStarts = true;
@@ -1339,7 +1342,7 @@ int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, cons
       return it->second;
     ++probes;
     const auto t0 = Clock::now();
-    int r = probeReach(*down2, *up2, iface, f, l, starts, true);
+    int r = probeReach(prepared, iface, f, l, starts, true);
     double ms = msSince(t0);
     probeMs += ms;
     errs() << "probe " << f << ":" << l << " starts " << starts.size() << " r " << r << " ms " << (long)ms << "\n";
@@ -1352,7 +1355,7 @@ int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, cons
       return it->second;
     ++probes;
     const auto t0 = Clock::now();
-    int r = probeReach(*down2, *up2, iface, f, l, starts, true);
+    int r = probeReach(prepared, iface, f, l, starts, true);
     double ms = msSince(t0);
     probeMs += ms;
     errs() << "probe-from " << *starts.begin() << " " << f << ":" << l << " r " << r << " ms " << (long)ms << "\n";
@@ -1525,13 +1528,20 @@ int main(int argc, char **argv) {
   source::index(*down);
   source::index(*up);
   Client client(*down, *up, dir);
-  Model model(*down, *up, file, line);
+  Model prepared(*down, *up, file, line);
   // I = header-declared exports (midpoint). I★ = entryCallable starts (P1).
-  model.interfaceNames = Client::publicInterface(*down, *up, dir);
+  prepared.interfaceNames = Client::publicInterface(*down, *up, dir);
+  prepared.prepare();
+  Model model(prepared, file, line);
+  model.interfaceNames = prepared.interfaceNames;
   model.startNames = Client::entryInterface(*down, *up, dir);
+  std::map<std::tuple<std::string, unsigned, std::set<std::string>>, int> p1Probes;
   client.probe = [&, iface = model.interfaceNames](const std::string &f, unsigned l,
                                                    const std::set<std::string> &starts) {
-    return probeReach(*down, *up, iface, f, l, starts);
+    auto key = std::make_tuple(f, l, starts);
+    if (auto it = p1Probes.find(key); it != p1Probes.end())
+      return it->second;
+    return p1Probes[key] = probeReach(prepared, iface, f, l, starts);
   };
   // P1 feasibility = φ SAT ∧ no open Definition-D dispatch edge.
   model.openDispatch = [&](const std::vector<Function *> &fn) {
@@ -1573,7 +1583,7 @@ int main(int argc, char **argv) {
     const char *wb = std::getenv("SP_WITNESS_PATHS");
     const int scan = wb && *wb ? std::max(1, std::atoi(wb)) : 128;
     for (int n = w.seq.empty() ? -1 : w.index + 1; n >= 0 && n < scan;) {
-      Model next(*down, *up, file, line);
+      Model next(prepared, file, line);
       next.interfaceNames = model.interfaceNames;
       next.startNames = model.startNames;
       next.openDispatch = model.openDispatch;

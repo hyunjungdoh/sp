@@ -159,6 +159,13 @@ struct Model::FlowIndex {
   std::map<const Function *, std::shared_ptr<Tree>> trees;
 };
 
+Model::Model(const Model &prepared, StringRef file, unsigned line) : Model(prepared) {
+  sinkFile = file;
+  sinkLine = line;
+  if (flowIdx)
+    flowIdx = std::make_shared<FlowIndex>(*flowIdx);
+}
+
 bool Model::pairRead(Function *D, unsigned p, unsigned n) const {
   if (!D || D->isDeclaration() || p >= D->arg_size() || n >= D->arg_size())
     return false;

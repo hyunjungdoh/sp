@@ -57,6 +57,8 @@ uint64_t Model::scalarWidth(StringRef type, int64_t pos) const {
   }
 
 void Model::emit(Module &H) const {
+    // Planted returns erased calls since solving; their addresses may be reused.
+    suffixMemo.clear();
     if (!entry)
       return;
     LLVMContext &ctx = H.getContext();

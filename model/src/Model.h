@@ -501,6 +501,12 @@ class Model {
   std::function<std::vector<std::pair<std::string, std::string>>(const std::vector<Function *> &)>
       openDispatch;
   Model(Module &down, Module &up, StringRef file, unsigned line) : down(down), up(up), dl(down.getDataLayout()), sinkFile(file), sinkLine(line) {}
+  // A prepared model aimed at another sink. The index is a function of the
+  // modules and interfaceNames only, so the copy runs without rebuilding it;
+  // the modules must not have changed since prepare().
+  Model(const Model &prepared, StringRef file, unsigned line);
+  // The index run() would build first, built once for copies to share.
+  void prepare();
 
   void run(int seqPick, raw_ostream &out);
   // The index run builds before its search, and the precise resolution of
@@ -517,6 +523,7 @@ class Model {
   const DataLayout &dl;
   StringRef sinkFile;
   unsigned sinkLine;
+  bool indexed = false;
   std::vector<Function *> sinks;
   std::map<Suffix, std::vector<Suffix>> besidePtr;
   std::map<Suffix, std::vector<Function *>> builderOf;
@@ -536,6 +543,7 @@ class Model {
   // object and scalars, without those whose every caller is an initializer.
   std::vector<InitSite> initializers(const std::string &type, const std::set<int64_t> &cells) const;
   mutable std::map<std::pair<std::string, std::set<int64_t>>, std::vector<InitSite>> initMemo;
+  mutable std::unordered_map<const Value *, Suffix> suffixMemo;
   // The reaching-definition resolution of a pointer a local holds (slotHeld)
   // is a property the harness needs at sequence-solving time, not in the
   // eager index passes that only map operands to formals. It is off during
@@ -751,6 +759,7 @@ class Model {
 
 
   Suffix suffix(Value *V) const;
+  Suffix suffixOf(Value *V) const;
 
 
 
