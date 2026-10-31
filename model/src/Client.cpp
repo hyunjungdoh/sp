@@ -4784,6 +4784,7 @@ Client::WitnessPlan Client::realize(Function *E, const std::vector<Cell> &phi, c
     }
     return false;
   };
+  std::vector<Realized> carried;
   auto compose = [&](Realized &target, const WitnessPlan *via, const std::string &where) {
     std::vector<Function *> runs = via->cover;
     for (const std::string &n : via->seq)
@@ -4823,6 +4824,18 @@ Client::WitnessPlan Client::realize(Function *E, const std::vector<Cell> &phi, c
       if (realizable(E, k) && admitted(body(k.fn)))
         addKeyed(body(k.fn), k);
     W.levers.insert(W.levers.end(), via->levers.begin(), via->levers.end());
+    // Λ3 (DESIGN §3.11): a branch-dependent installer writes the required value
+    // only on one branch (e.g. jinit_upsampler stores h2v2_upsample iff
+    // !do_fancy && !jsimd). The via plan that reaches that store carries the
+    // selecting conditions in its own cells, but composing only its levers/keys
+    // dropped them, so the harness called the installer without forcing the
+    // branch and KLEE installed the fancy/simd sibling that never reaches the
+    // sink. Carry the via's conditions as obligations too. They are collected
+    // and merged after every compose (below), not spliced into W.cells here:
+    // the clash check above iterates W.cells, so a cell added by one via would
+    // otherwise be tested against a sibling via and spuriously refute it.
+    for (const Realized &vr : via->cells)
+      carried.push_back(vr);
     std::string line = where + " via";
     for (const std::string &n : via->seq)
       line += " " + n;
@@ -4832,6 +4845,17 @@ Client::WitnessPlan Client::realize(Function *E, const std::vector<Cell> &phi, c
   };
   for (const auto &[i, v] : vias)
     compose(W.cells[i], v.first, v.second);
+  // Merge the branch-selecting obligations carried by composed vias, after all
+  // clash checks have run against the original cells. They are non-Open, so they
+  // extend install work (closing the installer's branch) without flipping pass.
+  for (const Realized &vr : carried) {
+    bool dup = false;
+    for (const Realized &wr : W.cells)
+      dup = dup || (wr.cell.type == vr.cell.type && wr.cell.off == vr.cell.off && wr.cell.op == vr.cell.op &&
+                    wr.cell.values == vr.cell.values);
+    if (!dup)
+      W.cells.push_back(vr);
+  }
   W.pass = W.iface;
   for (const auto *rs : {&W.cells, &W.returns})
     for (const Realized &r : *rs)

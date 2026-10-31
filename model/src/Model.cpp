@@ -1289,10 +1289,22 @@ int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, cons
     return std::chrono::duration<double, std::milli>(Clock::now() - t).count();
   };
   const std::set<std::string> iface = Client::publicInterface(*down2, *up2, dir);
-  client.reach = [&](const std::string &f, unsigned l, const std::set<std::string> &starts,
-                     int from) -> std::optional<Client::Reached> {
+  // reach/probe are deterministic in the fixed D/U modules, so identical
+  // (file, line, starts[, from]) queries recompute the same full may-analysis.
+  // establishedBy fires the same query for every entry sharing a start set, so
+  // without memoization the plan phase re-runs Model::run dozens of times on the
+  // same target. Cache the result the first time and serve copies after.
+  auto reachCache =
+      std::make_shared<std::map<std::tuple<std::string, unsigned, std::set<std::string>, int>,
+                                std::optional<Client::Reached>>>();
+  auto probeCache = std::make_shared<std::map<std::tuple<std::string, unsigned, std::set<std::string>>, int>>();
+  client.reach = [&, reachCache](const std::string &f, unsigned l, const std::set<std::string> &starts,
+                                 int from) -> std::optional<Client::Reached> {
     if (from >= Model::pathBudget(false))
       return std::nullopt;
+    auto ckey = std::make_tuple(f, l, starts, from);
+    if (auto it = reachCache->find(ckey); it != reachCache->end())
+      return it->second;
     ++queries;
     const auto t0 = Clock::now();
     struct Tally {
@@ -1317,18 +1329,21 @@ int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, cons
     std::istringstream in(buf);
     Witness w = parseWitness(in);
     if (w.seq.empty())
-      return std::nullopt;
+      return (*reachCache)[ckey] = std::nullopt;
     ++reached;
-    return Client::Reached{w.seq, w.phi, w.keyed, clientRets(w), w.index};
+    return (*reachCache)[ckey] = Client::Reached{w.seq, w.phi, w.keyed, clientRets(w), w.index};
   };
-  client.probe = [&](const std::string &f, unsigned l, const std::set<std::string> &starts) {
+  client.probe = [&, probeCache](const std::string &f, unsigned l, const std::set<std::string> &starts) {
+    auto ckey = std::make_tuple(f, l, starts);
+    if (auto it = probeCache->find(ckey); it != probeCache->end())
+      return it->second;
     ++probes;
     const auto t0 = Clock::now();
     int r = probeReach(*down2, *up2, iface, f, l, starts, true);
     double ms = msSince(t0);
     probeMs += ms;
     errs() << "probe " << f << ":" << l << " starts " << starts.size() << " r " << r << " ms " << (long)ms << "\n";
-    return r;
+    return (*probeCache)[ckey] = r;
   };
   std::map<std::tuple<std::string, unsigned, std::set<std::string>>, int> probedFrom;
   client.probeFrom = [&](const std::string &f, unsigned l, const std::set<std::string> &starts) {
