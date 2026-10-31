@@ -484,6 +484,18 @@ class Model {
   std::set<std::string> interfaceNames;
   // P1 starts B_entry ⊆ I★: entryCallable public functions only.
   std::set<std::string> startNames;
+  // A refutation query (Definition D ∘ E): it must exhaust the paths to be
+  // conclusive, so it draws on its own, larger path budget.
+  bool probeBudget = false;
+  // The paths one run tries from its first index (SP_PATHS, or
+  // SP_PROBE_PATHS for a refutation query).
+  static int pathBudget(bool probe);
+  // 정의 R: the sequences start at exactly startNames, internal functions
+  // included, not at the interface functions among them.
+  bool exactStarts = false;
+  // The input lines inputs() prints. A nested query reads only the
+  // sequence, its cells and keys, which inputs() neither prints nor changes.
+  bool emitInputs = true;
   // P1: after φ SAT, reject paths whose indirect edges are still open under
   // Definition D; those hops are banned and the search continues.
   std::function<std::vector<std::pair<std::string, std::string>>(const std::vector<Function *> &)>
@@ -698,7 +710,9 @@ class Model {
   std::map<int, uint64_t> argFileLen;
   std::vector<Function *> starts;
   std::unordered_set<Function *> cone;
-  // Indirect hops rejected by openDispatch during this run; sequences() skips them.
+  // Indirect hops rejected by openDispatch during this run; sequences() skips
+  // them. An empty caller bans every indirect call of the target: its
+  // installation is refuted, so no dispatch reaches it.
   std::set<std::pair<std::string, std::string>> hopBan;
   std::unordered_map<Function *, std::vector<Function *>> callersOf;
   std::map<Suffix, std::set<std::string>> facts;
@@ -906,6 +920,13 @@ class Model {
   };
 
   std::vector<Path> sequences(int seqPick);
+  // Yen's enumeration state: the paths found in cost order (A) and the
+  // candidates not yet taken (B), valid for the hopBan they were built under.
+  std::vector<Path> yenA;
+  std::vector<std::tuple<int, size_t, uint64_t, std::vector<Function *>>> yenB;
+  std::set<std::vector<Function *>> yenSeen;
+  size_t yenBanSize = SIZE_MAX;
+  uint64_t yenTicket = 0;
 
 
   // A constant-offset field of a local object passed by address into a

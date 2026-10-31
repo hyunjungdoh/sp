@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Model.h"
+#include <climits>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -108,6 +109,12 @@ public:
     int64_t off = -1;
     bool covers(const Cell &c) const { return root == c.root && off == c.off && path == c.path; }
   };
+  // 정의 R: a call on the witness whose result the path compares, the
+  // obligation `callee pred k` at caller:line.
+  struct Ret {
+    std::string callee, pred, k, caller;
+    unsigned line = 0;
+  };
   // §3.8 정의 3.8.6 이름 키 설정: 조회 G(o, κ, d)가 읽는 이름 κ의 값을
   // 클라이언트가 같은 o 위의 세터 S(o, κ, v)로 정한다. κ는 조회 지점이 짓는
   // 그대로 짓는다: init이 있으면 slot 크기의 칸을 init(…, κ, …)로 채우고, 없으면
@@ -158,6 +165,8 @@ public:
     // The call the realization relies on: the producer of a lever, the key
     // setter, the covering writer, or the call that reads the input.
     Function *by = nullptr;
+    // For an open cell, the condition that left it open.
+    std::string why;
   };
   struct WitnessPlan {
     Function *first = nullptr;
@@ -172,6 +181,8 @@ public:
     // Realization: one per obligation cell, the write cover, and the key
     // setter calls the Key cells use.
     std::vector<Realized> cells;
+    // 정의 R: one per return obligation of the witness, realized like a cell.
+    std::vector<Realized> returns;
     std::vector<Function *> cover;
     std::vector<std::pair<Function *, Keyed>> keyed;
     // §3.9 정의 E: per Construct cell established by a store, the store's
@@ -232,15 +243,28 @@ public:
 
   // §3.8: the key setters of each witness, aligned with plan()'s witnesses.
   std::vector<std::vector<Keyed>> keyedIn;
-  // §3.9 정의 E: the may layer's first satisfiable sequence from one of the
-  // start functions to a source line, or none.
+  // 정의 R: the return obligations of each witness, aligned likewise.
+  std::vector<std::vector<Ret>> retsIn;
+  // §3.9 정의 E: the may layer's first satisfiable sequence, at path index
+  // `from` or later in cost order, from one of the start functions to a
+  // source line, or none within the path budget.
   struct Reached {
     std::vector<std::string> seq;
     std::vector<Cell> phi;
     std::vector<Keyed> keyed;
+    std::vector<Ret> rets;
+    int index = -1;
   };
-  std::function<std::optional<Reached>(const std::string &file, unsigned line, const std::set<std::string> &starts)>
+  std::function<std::optional<Reached>(const std::string &file, unsigned line, const std::set<std::string> &starts,
+                                       int from)>
       reach;
+  // The same may query, three-valued: 1 a satisfiable sequence reaches the
+  // line, 0 every sequence was tried and none is satisfiable, -1 unknown
+  // (budget exhausted or no such line).
+  std::function<int(const std::string &file, unsigned line, const std::set<std::string> &starts)> probe;
+  // 정의 R: the same three-valued query from exactly the given functions,
+  // internal ones included.
+  std::function<int(const std::string &file, unsigned line, const std::set<std::string> &starts)> probeFrom;
 
   Client(Module &down, Module &up, const fs::path &dir);
   static std::set<std::string> downstreamInterface(const fs::path &dir);
@@ -437,6 +461,12 @@ private:
   Kind classify(const DIType *T, std::string &key) const;
   Value *fieldAddress(Value *P) const;
   std::vector<std::pair<std::string, int64_t>> fieldsOf(Value *P) const;
+  // The fields access I makes through address P: the field GEPs of P, else
+  // the record and offset I's TBAA names (the byte GEPs of optimised IR).
+  std::vector<std::pair<std::string, int64_t>> accessFields(const Instruction &I, Value *P) const;
+  // The record a zero-fill writes whole when its address has no field: the
+  // source type the address points to, from offset 0 for its length.
+  static std::optional<std::tuple<std::string, int64_t, int64_t>> zeroFill(const MemSetInst &MS);
   // §3.10 the call relation the may layer resolved, read from the marks.
   klee::calls::Targets targets;
   void buildCalls();
@@ -468,6 +498,9 @@ private:
 
   // §3.9 facts. A field is the last (struct type, offset) step of a cell.
   using Field = std::pair<std::string, int64_t>;
+  // Some function in fns' closures may store the field (a store or a memory
+  // intrinsic over it, the same field abstraction as everStored).
+  bool mayStore(const std::vector<Function *> &fns, const Field &f) const;
   static Field fieldOf(const Cell &c) { return {c.type, c.off}; }
   // The integer values of a cell's atom, false when one is not a constant.
   static bool intValues(const Cell &c, std::vector<int64_t> &vs);
@@ -570,15 +603,38 @@ private:
   // Key setters for fields that an establish sequence compares against a
   // constant (Φ_pre held cells may omitted when both branch sides reach).
   std::vector<Keyed> keyedGatesAlong(const std::vector<std::string> &seq, Function *E) const;
+  // §3.8.4 tag-dispatch setters, and §3.8.5 tag → (field, mask) raises from
+  // constant registries at bit-OR sites (TIFFSetFieldBit shape).
+  // §3.7 ∘ 정의 E: T's installation is refuted from the harness calls when T
+  // is installed only by stores of its address and probe proves none of
+  // those stores reachable from starts.
+  bool installRefuted(Function *T, const std::set<std::string> &starts) const;
+  mutable std::map<std::pair<std::string, std::set<std::string>>, bool> refutedOf;
+  void ensureTagSetters() const;
+  void ensureRegistryRaises() const;
+  mutable std::map<Field, std::vector<Keyed>> tagSettersOf;
+  mutable bool tagSettersReady = false;
+  mutable std::map<int64_t, std::vector<std::pair<Field, uint64_t>>> raisesOfTag;
+  mutable bool registryReady = false;
   // Per query (file, line, starts): absent while computing (a cycle), then
   // the plan of the reaching sequence when it passes, else null.
   mutable std::map<std::tuple<std::string, unsigned, std::set<std::string>>, std::unique_ptr<WitnessPlan>> estOf;
-  mutable std::set<std::tuple<std::string, unsigned, std::set<std::string>>> estBusy;
+  // Queries being computed, with their stack depth. estLow is the least
+  // depth of a busy query met since the innermost open query began: a
+  // failure that met a busy ancestor holds only under that ancestor's
+  // provisional failure and is not cached.
+  mutable std::map<std::tuple<std::string, unsigned, std::set<std::string>>, int> estBusy;
+  mutable int estLow = INT_MAX;
   // One line per query, for the report: the position and the answer.
   mutable std::vector<std::string> estLog;
   bool fills(Function *F, const Cell &c) const;
   Function *inputFiller(Function *E, Function *entry, const Cell &c) const;
-  WitnessPlan realize(Function *E, const std::vector<Cell> &phi, const std::vector<Keyed> &keyed) const;
+  // decide: only whether the plan passes is wanted, so realization stops at
+  // the first open obligation (no later step reopens a cell as non-open).
+  WitnessPlan realize(Function *E, const std::vector<Cell> &phi, const std::vector<Keyed> &keyed,
+                      const std::vector<Ret> &rets, bool decide = false) const;
+  int returnedBy(const Ret &r, std::string &why, std::set<std::string> &busy) const;
+  mutable std::map<std::string, std::pair<int, std::string>> retOf;
   // The grammar the harness carries, and §3.7 for its indirect edges.
   void grammar(Plan &P) const;
   void dispatch(const Witnesses &ws, Plan &P) const;

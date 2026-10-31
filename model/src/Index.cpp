@@ -24,9 +24,19 @@ void Model::run(int seqPick, raw_ostream &out) {
     out << "starts " << starts.size() << "\n";
     // Indexing is done. Resolve local-held pointers precisely from here on.
     resolveHeld = true;
-    // n advances only on φ-UNSAT (next sink-edge diversity). Dispatch-open
-    // bans the bad hop and retries the same n under hopBan.
+    // n advances only on φ-UNSAT (the next simple path in cost order).
+    // Dispatch-open bans the bad hop and retries the same n under hopBan.
+    // At most `budget` paths are tried per run; running out of them is not
+    // the absence of a satisfiable path and is reported as such.
+    const int budget = pathBudget(probeBudget);
     for (int n = seqPick;;) {
+      if (n >= seqPick + budget) {
+        out << "sequence " << n << " absent\n";
+        out << "paths-budget " << budget << "\n";
+        entry = nullptr;
+        solvedCells.clear();
+        return;
+      }
       auto paths = sequences(n);
       if ((int)paths.size() <= n) {
         out << "sequence " << n << " absent\n";
@@ -39,7 +49,8 @@ void Model::run(int seqPick, raw_ostream &out) {
       out << "sequence " << n << "\n";
       for (Function *F : path.fn)
         out << "fn " << F->getName() << " " << pretty(F->getName()) << "\n";
-      inputs(path.fn, out);
+      if (emitInputs)
+        inputs(path.fn, out);
       if (!solve(path.fn, out)) {
         ++n;
         continue;
@@ -70,6 +81,11 @@ void Model::index() {
     exports = findExports();
     buildCallers();
   }
+
+int Model::pathBudget(bool probe) {
+  const char *pb = std::getenv(probe ? "SP_PROBE_PATHS" : "SP_PATHS");
+  return pb && *pb ? std::max(1, std::atoi(pb)) : (probe ? 256 : 32);
+}
 
 Function *Model::define(StringRef name) const {
     auto body = [&](Module &M) -> Function * {
@@ -2269,6 +2285,12 @@ std::vector<Function *> Model::findStarts() {
     // non-interface caller in R(s) is library-internal and must not
     // disqualify a public origin.
     std::vector<Function *> v;
+    if (exactStarts) {
+      for (const std::string &n : startNames)
+        if (Function *F = define(n); F && cone.count(F))
+          v.push_back(F);
+      return v;
+    }
     for (Function *E : exports) {
       if (!cone.count(E) || (!startNames.empty() && !startNames.count(E->getName().str())))
         continue;
@@ -2290,7 +2312,51 @@ std::vector<Function *> Model::findStarts() {
     return v;
   }
 
+// The simple call paths from a start to a sink, in order of (indirect
+// edges, length), the first seqPick + 1 of them (Yen's k shortest simple
+// paths). A sequence whose φ is unsatisfiable is followed by the next path
+// of the whole set, not only by one entering s through another edge: two
+// paths may share their last edges and differ in a prefix that decides φ
+// (e.g. reaching a parser through the header read rather than the finish
+// call). A path ends at the first sink it reaches.
 std::vector<Model::Path> Model::sequences(int seqPick) {
+    using Hop = std::pair<Function *, Function *>;
+    auto isSink = [&](Function *F) { return std::find(sinks.begin(), sinks.end(), F) != sinks.end(); };
+    // The calls of At in program order, each callee once, indirect only if
+    // no direct call reaches it.
+    std::unordered_map<Function *, std::vector<std::pair<Function *, bool>>> adjMemo;
+    auto adj = [&](Function *At) -> const std::vector<std::pair<Function *, bool>> & {
+      auto [it, added] = adjMemo.try_emplace(At);
+      if (!added)
+        return it->second;
+      auto &out = it->second;
+      for (Instruction &I : instructions(*At)) {
+        auto *CB = dyn_cast<CallBase>(&I);
+        if (!CB)
+          continue;
+        bool indirect = CB->getCalledFunction() == nullptr;
+        for (Function *T : targetsOf(CB)) {
+          if (!cone.count(T) || T->isDeclaration())
+            continue;
+          if (hopBan.count({At->getName().str(), T->getName().str()}))
+            continue;
+          if (indirect && hopBan.count({std::string(), T->getName().str()}))
+            continue;
+          auto e = std::find_if(out.begin(), out.end(), [&](const auto &p) { return p.first == T; });
+          if (e == out.end())
+            out.push_back({T, indirect});
+          else
+            e->second = e->second && indirect;
+        }
+      }
+      return out;
+    };
+    auto hopIndirect = [&](Function *A, Function *B) {
+      for (const auto &[T, ind] : adj(A))
+        if (T == B)
+          return ind;
+      return false;
+    };
     struct Item {
       int indirect = 0;
       size_t length = 0;
@@ -2300,62 +2366,106 @@ std::vector<Model::Path> Model::sequences(int seqPick) {
         return std::tie(indirect, length, ord) > std::tie(o.indirect, o.length, o.ord);
       }
     };
-    using Hop = std::pair<Function *, Function *>;
-    std::set<Hop> banned;
-    std::vector<Path> found;
-    for (int n = 0; n <= seqPick; ++n) {
+    // Least path from the sources to a sink avoiding the removed nodes and
+    // edges; a path of one node when a source is itself a sink.
+    auto shortest = [&](const std::vector<Function *> &from, const std::unordered_set<Function *> &gone,
+                        const std::set<Hop> &cut) -> std::optional<Item> {
       uint64_t ticket = 0;
       std::priority_queue<Item, std::vector<Item>, std::greater<Item>> q;
-      for (Function *E : starts)
-        q.push(Item{0, 1, ticket++, {E}});
+      for (Function *E : from)
+        if (!gone.count(E))
+          q.push(Item{0, 1, ticket++, {E}});
       std::unordered_set<Function *> expanded;
-      Path best;
-      bool got = false;
       while (!q.empty()) {
         Item cur = q.top();
         q.pop();
         Function *At = cur.fn.back();
         if (!expanded.insert(At).second)
           continue;
-        if (std::find(sinks.begin(), sinks.end(), At) != sinks.end()) {
-          best = Path{cur.fn, cur.indirect};
-          got = true;
-          break;
-        }
-        for (Instruction &I : instructions(*At)) {
-          auto *CB = dyn_cast<CallBase>(&I);
-          if (!CB)
+        if (isSink(At))
+          return cur;
+        for (const auto &[T, indirect] : adj(At)) {
+          if (gone.count(T) || cut.count({At, T}))
             continue;
-          auto ts = targetsOf(CB);
-          bool indirect = CB->getCalledFunction() == nullptr;
-          for (Function *T : ts) {
-            if (!cone.count(T) || T->isDeclaration())
-              continue;
-            if (banned.count({At, T}))
-              continue;
-            if (hopBan.count({At->getName().str(), T->getName().str()}))
-              continue;
-            if (std::find(cur.fn.begin(), cur.fn.end(), T) != cur.fn.end())
-              continue;
-            Item nxt = cur;
-            nxt.fn.push_back(T);
-            nxt.length = nxt.fn.size();
-            if (indirect)
-              ++nxt.indirect;
-            nxt.ord = ticket++;
-            q.push(std::move(nxt));
-          }
+          if (std::find(cur.fn.begin(), cur.fn.end(), T) != cur.fn.end())
+            continue;
+          Item nxt = cur;
+          nxt.fn.push_back(T);
+          nxt.length = nxt.fn.size();
+          if (indirect)
+            ++nxt.indirect;
+          nxt.ord = ticket++;
+          q.push(std::move(nxt));
         }
       }
-      if (!got)
-        break;
-      found.push_back(best);
-      // Candidate n is the least path, by (indirect edges, length), whose
-      // call edge into s is not that of an earlier candidate: one candidate
-      // per edge (u -> s) of E in R(s), in cost order.
-      if (best.fn.size() < 2)
-        break;
-      banned.insert({best.fn[best.fn.size() - 2], best.fn.back()});
+      return std::nullopt;
+    };
+    auto costOf = [&](const std::vector<Function *> &fn) {
+      int ind = 0;
+      for (size_t i = 0; i + 1 < fn.size(); ++i)
+        ind += hopIndirect(fn[i], fn[i + 1]);
+      return ind;
+    };
+    // A hop banned since the last call changes the graph: start over.
+    if (yenBanSize != hopBan.size()) {
+      yenA.clear();
+      yenB.clear();
+      yenSeen.clear();
+      yenTicket = 0;
+      yenBanSize = hopBan.size();
     }
-    return found;
+    auto takeB = [&]() {
+      auto best = std::min_element(yenB.begin(), yenB.end());
+      std::vector<Function *> fn = std::get<3>(*best);
+      int ind = std::get<0>(*best);
+      yenB.erase(best);
+      yenA.push_back(Path{std::move(fn), ind});
+    };
+    if (yenA.empty()) {
+      auto first = shortest(starts, {}, {});
+      if (!first)
+        return {};
+      yenSeen.insert(first->fn);
+      yenA.push_back(Path{first->fn, first->indirect});
+    }
+    while ((int)yenA.size() <= seqPick) {
+      const std::vector<Function *> &last = yenA.back().fn;
+      // Spur at each node of the last path, and at the virtual root before
+      // its start (spur index -1: another start).
+      for (int i = -1; i + 1 < (int)last.size(); ++i) {
+        std::vector<Function *> root(last.begin(), last.begin() + (i + 1));
+        std::set<Hop> cut;
+        std::unordered_set<Function *> gone(root.begin(), root.end());
+        std::vector<Function *> from;
+        if (i < 0) {
+          std::set<Function *> used;
+          for (const Path &p : yenA)
+            used.insert(p.fn.front());
+          for (Function *E : starts)
+            if (!used.count(E))
+              from.push_back(E);
+        } else {
+          Function *spur = root.back();
+          gone.erase(spur);
+          from.push_back(spur);
+          for (const Path &p : yenA)
+            if (p.fn.size() > root.size() && std::equal(root.begin(), root.end(), p.fn.begin()))
+              cut.insert({spur, p.fn[root.size()]});
+        }
+        auto tail = shortest(from, gone, cut);
+        if (!tail)
+          continue;
+        std::vector<Function *> fn = root;
+        if (i >= 0)
+          fn.pop_back();
+        fn.insert(fn.end(), tail->fn.begin(), tail->fn.end());
+        if (!yenSeen.insert(fn).second)
+          continue;
+        yenB.emplace_back(costOf(fn), fn.size(), yenTicket++, std::move(fn));
+      }
+      if (yenB.empty())
+        break;
+      takeB();
+    }
+    return yenA;
   }

@@ -8,6 +8,7 @@
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Module.h"
 
+#include <algorithm>
 #include <map>
 #include <set>
 #include <unordered_map>
@@ -518,46 +519,112 @@ std::string container(const GEPOperator *G, const DataLayout &dl) {
   return key(pointee(G->getPointerOperand()), S, dl);
 }
 
+// The fields the address G may name at every struct level its indices pass:
+// (S, offset of the address inside S). A variable index into an array of N
+// elements may select any element, so it contributes the offsets
+// {i * size | 0 <= i < N}; the address then names each of them. Struct
+// indices are always constant. The leading index steps over whole objects
+// of the source type and must be constant (the object is otherwise unknown).
 std::vector<std::pair<std::string, int64_t>> levels(const GEPOperator *G, const DataLayout &dl) {
   std::vector<std::pair<std::string, int64_t>> out;
-  if (!G->hasAllConstantIndices())
-    return out;
-  APInt total(dl.getIndexSizeInBits(G->getPointerAddressSpace()), 0);
-  if (!G->accumulateConstantOffset(dl, total))
-    return out;
   Type *T = G->getSourceElementType();
   const DIType *D = pointee(G->getPointerOperand());
-  int64_t rest = total.getSExtValue();
   auto idx = G->idx_begin();
-  if (idx != G->idx_end()) {
-    if (!T->isSized())
-      return out;
-    rest -= cast<ConstantInt>(*idx)->getSExtValue() * (int64_t)dl.getTypeAllocSize(T);
-    ++idx;
-    if (rest < 0)
-      return out;
-  }
+  if (idx == G->idx_end() || !T->isSized() || !isa<ConstantInt>(*idx))
+    return out;
+  bool sameObject = cast<ConstantInt>(*idx)->isZero();
+  ++idx;
+  // Per step below the leading index: the level's struct (if named) and the
+  // offsets the step may add.
+  struct Step {
+    std::string at;
+    std::vector<int64_t> adds;
+  };
+  std::vector<Step> steps;
+  const size_t maxElems = 256;
   for (;;) {
     auto *STy = dyn_cast<StructType>(T);
+    Step s;
     if (STy && STy->hasName())
-      out.push_back({key(D, STy, dl), rest});
-    if (idx == G->idx_end())
+      s.at = key(D, STy, dl);
+    if (idx == G->idx_end()) {
+      steps.push_back(std::move(s));
       break;
-    int64_t i = cast<ConstantInt>(*idx)->getSExtValue();
+    }
+    Value *V = *idx;
     ++idx;
     if (STy) {
+      auto *CI = dyn_cast<ConstantInt>(V);
+      if (!CI)
+        return out;
+      int64_t i = CI->getSExtValue();
       if (!STy->isSized() || i < 0 || (unsigned)i >= STy->getNumElements())
-        break;
+        return out;
       uint64_t o = dl.getStructLayout(STy)->getElementOffset((unsigned)i);
-      rest -= (int64_t)o;
+      s.adds.push_back((int64_t)o);
       T = STy->getElementType((unsigned)i);
       D = D ? member(D, o, T->isSized() ? dl.getTypeAllocSize(T) : 0) : nullptr;
     } else if (auto *AT = dyn_cast<ArrayType>(T)) {
-      rest -= i * (int64_t)dl.getTypeAllocSize(AT->getElementType());
+      int64_t sz = (int64_t)dl.getTypeAllocSize(AT->getElementType());
+      if (auto *CI = dyn_cast<ConstantInt>(V))
+        s.adds.push_back(CI->getSExtValue() * sz);
+      else {
+        uint64_t n = AT->getNumElements();
+        if (n == 0 || n > maxElems)
+          return out;
+        for (uint64_t i = 0; i < n; ++i)
+          s.adds.push_back((int64_t)i * sz);
+      }
       T = AT->getElementType();
       D = D ? element(D) : nullptr;
     } else
+      return out;
+    steps.push_back(std::move(s));
+  }
+  // The offset inside the struct of step k is the sum of the adds of the
+  // steps after it; a variable step makes it a set.
+  std::vector<int64_t> below{0};
+  for (size_t k = steps.size(); k-- > 0;) {
+    if (!steps[k].at.empty())
+      for (int64_t r : below)
+        if (r >= 0)
+          out.push_back({steps[k].at, r});
+    if (k == 0)
       break;
+    const std::vector<int64_t> &adds = steps[k - 1].adds;
+    std::vector<int64_t> next;
+    next.reserve(below.size() * adds.size());
+    for (int64_t a : adds)
+      for (int64_t r : below)
+        next.push_back(a + r);
+    if (next.size() > maxElems * 4)
+      return {};
+    std::sort(next.begin(), next.end());
+    next.erase(std::unique(next.begin(), next.end()), next.end());
+    below = std::move(next);
+  }
+  std::reverse(out.begin(), out.end());
+  // `below` now holds the offsets of the address inside the source object.
+  // When that object is itself a field reached by a GEP of the same object
+  // (leading index 0; e.g. &s->arr then &arr[i]), the address lies at those
+  // offsets past the base's fields at every level of the base.
+  if (sameObject) {
+    const Value *B = G->getPointerOperand();
+    while (auto *O = dyn_cast<Operator>(B)) {
+      if (O->getOpcode() != Instruction::BitCast && O->getOpcode() != Instruction::AddrSpaceCast)
+        break;
+      B = O->getOperand(0);
+    }
+    if (auto *BG = dyn_cast<GEPOperator>(B)) {
+      std::vector<std::pair<std::string, int64_t>> base;
+      for (const auto &[S, r] : levels(BG, dl))
+        for (int64_t t : below)
+          base.push_back({S, r + t});
+      if (base.size() > maxElems * 4)
+        return out;
+      base.insert(base.end(), out.begin(), out.end());
+      return base;
+    }
   }
   return out;
 }

@@ -30,6 +30,7 @@
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/TargetParser/Triple.h"
 
+#include <charconv>
 #include <cstdio>
 #include <functional>
 #include <queue>
@@ -634,7 +635,7 @@ void Client::buildCallbackTypes() {
       if (!CB || CB->getCalledFunction())
         continue;
       if (auto *L = dyn_cast<LoadInst>(CB->getCalledOperand()->stripPointerCasts()))
-        for (const auto &f : fieldsOf(L->getPointerOperand()))
+        for (const auto &f : accessFields(*L, L->getPointerOperand()))
           callAt.emplace(f, CB->getFunctionType());
     }
   std::function<FunctionType *(Function *, unsigned, std::set<std::pair<Function *, unsigned>> &)> flow =
@@ -645,7 +646,7 @@ void Client::buildCallbackTypes() {
       if (auto *S = dyn_cast<StoreInst>(&I)) {
         if (formalOf(S->getValueOperand()) != (int)i)
           continue;
-        for (const auto &f : fieldsOf(S->getPointerOperand())) {
+        for (const auto &f : accessFields(*S, S->getPointerOperand())) {
           auto it = callAt.find(f);
           if (it != callAt.end())
             return it->second;
@@ -753,7 +754,7 @@ void Client::buildNullFields() {
             if (auto *F = dyn_cast<LoadInst>(S->getValueOperand()->stripPointerCasts()))
               loads.push_back(F);
     for (LoadInst *X : loads)
-      for (const auto &f : fieldsOf(X->getPointerOperand()))
+      for (const auto &f : accessFields(*X, X->getPointerOperand()))
         out.insert(f);
     return out;
   };
@@ -801,7 +802,7 @@ void Client::buildFieldLengths() {
             if (auto *S = dyn_cast<StoreInst>(W); S && S->getPointerOperand()->stripPointerCasts() == Al)
               work.push_back(S->getValueOperand());
         } else
-          for (const auto &f : fieldsOf(L->getPointerOperand()))
+          for (const auto &f : accessFields(*L, L->getPointerOperand()))
             out.insert(f);
       } else if (auto *C = dyn_cast<CastInst>(U)) {
         work.push_back(C->getOperand(0));
@@ -844,8 +845,9 @@ Value *Client::fieldAddress(Value *P) const {
   return P;
 }
 
-// The fields (S, off) a constant-offset GEP addresses, one per struct level
-// its indices pass, innermost last. A GEP of one zero index only
+// The fields (S, off) a GEP may address, at every struct level its indices
+// (and those of the GEP it indexes into) pass, innermost last; a variable
+// array index names every element. A GEP of one zero index only
 // reinterprets the pointer; the first field's GEP has a second index.
 std::vector<std::pair<std::string, int64_t>> Client::fieldsOf(Value *P) const {
   P = fieldAddress(P);
@@ -905,28 +907,48 @@ Function *Client::body(const std::string &name) const {
   return it == bodies.end() ? nullptr : it->second;
 }
 
+std::vector<Client::Field> Client::accessFields(const Instruction &I, Value *P) const {
+  std::vector<Field> fs = fieldsOf(P);
+  if (!fs.empty())
+    return fs;
+  // TBAA operand 0 is the base type node, operand 2 the offset; the base
+  // node's name is the source struct (C11 6.5p7).
+  const MDNode *T = I.getMetadata(LLVMContext::MD_tbaa);
+  if (!T || T->getNumOperands() < 3)
+    return {};
+  const MDNode *B = dyn_cast<MDNode>(T->getOperand(0));
+  auto *O = mdconst::dyn_extract<ConstantInt>(T->getOperand(2));
+  auto *N = B && B->getNumOperands() ? dyn_cast<MDString>(B->getOperand(0)) : nullptr;
+  if (!N || !O)
+    return {};
+  std::string n = N->getString().str();
+  if (n.empty() || n == "omnipotent char" || n == "any pointer" || n == "Simple C/C++ TBAA")
+    return {};
+  if (n.rfind("struct.", 0) != 0 && n.rfind("class.", 0) != 0)
+    n = "struct." + n;
+  return {{n, O->getSExtValue()}};
+}
+
+std::optional<std::tuple<std::string, int64_t, int64_t>> Client::zeroFill(const MemSetInst &MS) {
+  auto *b = dyn_cast<ConstantInt>(MS.getValue());
+  if (!b || !b->isZero())
+    return std::nullopt;
+  const DIType *D = source::pointee(MS.getRawDest());
+  if (!D)
+    return std::nullopt;
+  std::string n = source::name(D);
+  if (n.empty())
+    return std::nullopt;
+  if (n.rfind("struct.", 0) != 0 && n.rfind("class.", 0) != 0)
+    n = "struct." + n;
+  auto *L = dyn_cast<ConstantInt>(MS.getLength());
+  int64_t len = L && L->getBitWidth() <= 64 ? L->getSExtValue() : INT64_MAX;
+  return std::make_tuple(n, int64_t(0), len);
+}
+
 // Each constant-offset GEP a store writes through names the field at every
 // struct level its indices pass: (S, offset of the address inside S).
 void Client::buildStores() {
-  // TBAA on a store names the record and byte offset when the address is a
-  // byte GEP (optimised IR). Operand 0 is the base type node, operand 2 the
-  // offset; the base node's name is the source struct (C11 6.5p7).
-  auto tbaaField = [&](const Instruction &I) -> std::vector<Field> {
-    const MDNode *T = I.getMetadata(LLVMContext::MD_tbaa);
-    if (!T || T->getNumOperands() < 3)
-      return {};
-    const MDNode *B = dyn_cast<MDNode>(T->getOperand(0));
-    auto *O = mdconst::dyn_extract<ConstantInt>(T->getOperand(2));
-    auto *N = B && B->getNumOperands() ? dyn_cast<MDString>(B->getOperand(0)) : nullptr;
-    if (!N || !O)
-      return {};
-    std::string n = N->getString().str();
-    if (n.empty() || n == "omnipotent char" || n == "any pointer" || n == "Simple C/C++ TBAA")
-      return {};
-    if (n.rfind("struct.", 0) != 0 && n.rfind("class.", 0) != 0)
-      n = "struct." + n;
-    return {{n, O->getSExtValue()}};
-  };
   for (const auto &kv : bodies) {
     Function *F = kv.second;
     auto &out = stores[F];
@@ -942,9 +964,7 @@ void Client::buildStores() {
         v = abstractValue(S->getValueOperand());
         std::set<Field> src = copySources(S);
         copy = !src.empty();
-        fs = fieldsOf(P);
-        if (fs.empty())
-          fs = tbaaField(I);
+        fs = accessFields(I, P);
         for (const Field &d : fs)
           for (const Field &s : src)
             if (d != s)
@@ -963,7 +983,7 @@ void Client::buildStores() {
               while (auto *C = dyn_cast<CastInst>(Op))
                 Op = C->getOperand(0);
               if (auto *L = dyn_cast<LoadInst>(Op))
-                for (const Field &s : fieldsOf(L->getPointerOperand()))
+                for (const Field &s : accessFields(*L, L->getPointerOperand()))
                   for (const Field &d : fs)
                     if (s == d)
                       copy = true;
@@ -974,27 +994,15 @@ void Client::buildStores() {
         P = MS->getRawDest();
         auto *b = dyn_cast<ConstantInt>(MS->getValue());
         v = b && b->isZero() ? "0" : "*";
-        fs = fieldsOf(P);
-        if (fs.empty())
-          fs = tbaaField(I);
+        fs = accessFields(I, P);
         // A typed zero-fill with no field GEP still zeros every offset in the
         // object (GetImageInfo's memset of ImageInfo).
-        if (fs.empty() && b && b->isZero())
-          if (const DIType *D = source::pointee(MS->getRawDest())) {
-            std::string n = source::name(D);
-            if (!n.empty()) {
-              if (n.rfind("struct.", 0) != 0 && n.rfind("class.", 0) != 0)
-                n = "struct." + n;
-              auto *L = dyn_cast<ConstantInt>(MS->getLength());
-              int64_t len = L && L->getBitWidth() <= 64 ? L->getSExtValue() : INT64_MAX;
-              ranges[F].push_back({n, 0, len});
-            }
-          }
+        if (fs.empty())
+          if (auto z = zeroFill(*MS))
+            ranges[F].push_back(*z);
       } else if (auto *MI = dyn_cast<MemIntrinsic>(&I)) {
         P = MI->getRawDest();
-        fs = fieldsOf(P);
-        if (fs.empty())
-          fs = tbaaField(I);
+        fs = accessFields(I, P);
       }
       if (!P)
         continue;
@@ -1019,27 +1027,27 @@ void Client::buildModRef() {
   for (const auto &kv : bodies) {
     Function *F = kv.second;
     auto &m = mods[F], &r = refs[F];
-    auto add = [&](auto &set, Value *P) {
-      for (const auto &f : fieldsOf(P))
+    auto add = [&](auto &set, const Instruction &I, Value *P) {
+      for (const auto &f : accessFields(I, P))
         set.insert(f);
     };
     for (Instruction &I : instructions(*F)) {
       if (auto *S = dyn_cast<StoreInst>(&I))
-        add(m, S->getPointerOperand());
+        add(m, I, S->getPointerOperand());
       else if (auto *L = dyn_cast<LoadInst>(&I))
-        add(r, L->getPointerOperand());
+        add(r, I, L->getPointerOperand());
       else if (auto *MI = dyn_cast<MemTransferInst>(&I)) {
-        add(m, MI->getRawDest());
-        add(r, MI->getRawSource());
+        add(m, I, MI->getRawDest());
+        add(r, I, MI->getRawSource());
       } else if (auto *MS = dyn_cast<MemSetInst>(&I))
-        add(m, MS->getRawDest());
+        add(m, I, MS->getRawDest());
       else if (auto *CB = dyn_cast<CallBase>(&I)) {
         if (isa<IntrinsicInst>(CB))
           continue;
         for (Value *A : CB->args())
           if (A->getType()->isPointerTy()) {
-            add(m, A);
-            add(r, A);
+            add(m, I, A);
+            add(r, I, A);
           }
       }
     }
@@ -1075,7 +1083,7 @@ void Client::buildModRef() {
                 push(S->getValueOperand());
           continue;
         }
-        add(c, P);
+        add(c, *L, P);
         continue;
       }
       if (isa<CallBase>(V) || isa<Argument>(V) || isa<Constant>(V))
@@ -2280,6 +2288,8 @@ bool Client::held(const Param &p) const {
   return (p.kind == Kind::Handle || p.kind == Kind::Object || p.kind == Kind::Aggregate) && constructed.count(p.type);
 }
 
+static std::vector<std::pair<Value *, Instruction *>> returnDefs(Function &F);
+
 void Client::buildProducers() {
   // Producers: an interface function whose result or out-parameter is a
   // handle of type T.
@@ -2302,8 +2312,10 @@ void Client::buildProducers() {
   makes.erase("");
   for (const auto &kv : makes)
     constructed.insert(kv.first);
-  // A result read out of an object the client built field by field is a
-  // value the client put there: the function returns it, it makes none.
+  // A result read out of memory the client built (an object field by field,
+  // or bytes such as a list it passes) is a value the client put there: the
+  // function returns it, it makes none. Nor does a function whose every
+  // return value is the null constant.
   for (auto &kv : makes) {
     auto &ps = kv.second;
     ps.erase(std::remove_if(ps.begin(), ps.end(),
@@ -2313,10 +2325,14 @@ void Client::buildProducers() {
                               const auto &sig = signature(fp.first);
                               auto at = irParams(fp.first);
                               for (int k : loadedFrom(fp.first))
-                                if ((size_t)k < at.size() && at[k] >= 0 && sig[at[k]].kind == Kind::Object &&
+                                if ((size_t)k < at.size() && at[k] >= 0 &&
+                                    (sig[at[k]].kind == Kind::Object || sig[at[k]].kind == Kind::Bytes) &&
                                     !held(sig[at[k]]))
                                   return true;
-                              return false;
+                              auto defs = returnDefs(*fp.first);
+                              return !defs.empty() && std::all_of(defs.begin(), defs.end(), [](const auto &d) {
+                                return isa<ConstantPointerNull>(d.first);
+                              });
                             }),
              ps.end());
   }
@@ -2820,7 +2836,7 @@ std::set<Client::Field> Client::copySources(StoreInst *S) const {
   auto *L = dyn_cast<LoadInst>(V);
   if (!L)
     return {};
-  auto fs = fieldsOf(L->getPointerOperand());
+  auto fs = accessFields(*L, L->getPointerOperand());
   return {fs.begin(), fs.end()};
 }
 
@@ -2928,7 +2944,7 @@ const std::set<Client::Field> &Client::argStores(Function *W, int only) const {
       for (User *U : v->users()) {
         if (auto *S = dyn_cast<StoreInst>(U)) {
           if (S->getValueOperand() == v) {
-            for (const Field &f : fieldsOf(S->getPointerOperand()))
+            for (const Field &f : accessFields(*S, S->getPointerOperand()))
               out.insert(f);
             if (auto *A = dyn_cast<AllocaInst>(S->getPointerOperand()->stripPointerCasts()))
               taint(A);
@@ -3653,20 +3669,13 @@ std::vector<Function *> Client::harnessStarts(Function *E, Function *entry, cons
 
 // Φ_pre completion for establish sequences: a constant compare of a load of
 // a tag-settable field is a client obligation even when may dropped it.
-std::vector<Client::Keyed> Client::keyedGatesAlong(const std::vector<std::string> &seq, Function *E) const {
+void Client::ensureTagSetters() const {
+  if (tagSettersReady)
+    return;
+  tagSettersReady = true;
   // Tag-dispatch setters (정의 3.8.4): store may live in a non-export
   // (JPEGVSetField); climb callers to the interface vararg (TIFFSetField).
-  std::map<Field, std::vector<Keyed>> tagSetters;
   std::unordered_map<Function *, std::vector<Function *>> callersOf;
-  for (const auto &kv : bodies) {
-    Function *F = kv.second;
-    if (!F)
-      continue;
-    for (Function *C : calls.count(F) ? calls.at(F) : FnSet{})
-      callersOf[C].push_back(F);
-    // Also index by callee of each call site (calls map is callees-of-F).
-  }
-  callersOf.clear();
   for (const auto &kv : bodies) {
     Function *F = kv.second;
     if (!F)
@@ -3716,6 +3725,40 @@ std::vector<Client::Keyed> Client::keyedGatesAlong(const std::vector<std::string
     }
     return found;
   };
+  auto viaVa = [](Value *V) {
+    std::vector<Value *> st{V};
+    std::unordered_set<const Value *> seen;
+    while (!st.empty()) {
+      Value *X = st.back();
+      st.pop_back();
+      if (!X || !seen.insert(X).second)
+        continue;
+      if (isa<VAArgInst>(X))
+        return true;
+      if (auto *C = dyn_cast<CastInst>(X)) {
+        st.push_back(C->getOperand(0));
+        continue;
+      }
+      if (auto *P = dyn_cast<PHINode>(X)) {
+        for (Value *in : P->incoming_values())
+          st.push_back(in);
+        continue;
+      }
+      if (auto *L = dyn_cast<LoadInst>(X)) {
+        st.push_back(L->getPointerOperand());
+        continue;
+      }
+      if (auto *G = dyn_cast<GEPOperator>(X)) {
+        std::string ty;
+        raw_string_ostream os(ty);
+        G->getSourceElementType()->print(os);
+        if (ty.find("va_list") != std::string::npos)
+          return true;
+        st.push_back(G->getPointerOperand());
+      }
+    }
+    return false;
+  };
   for (const auto &kv : bodies) {
     Function *F = kv.second;
     if (!F || F->isDeclaration())
@@ -3740,40 +3783,6 @@ std::vector<Client::Keyed> Client::keyedGatesAlong(const std::vector<std::string
             if (reach.insert(S).second)
               st.push_back(S);
         }
-        auto viaVa = [](Value *V) {
-          std::vector<Value *> st{V};
-          std::unordered_set<const Value *> seen;
-          while (!st.empty()) {
-            Value *X = st.back();
-            st.pop_back();
-            if (!X || !seen.insert(X).second)
-              continue;
-            if (isa<VAArgInst>(X))
-              return true;
-            if (auto *C = dyn_cast<CastInst>(X)) {
-              st.push_back(C->getOperand(0));
-              continue;
-            }
-            if (auto *P = dyn_cast<PHINode>(X)) {
-              for (Value *in : P->incoming_values())
-                st.push_back(in);
-              continue;
-            }
-            if (auto *L = dyn_cast<LoadInst>(X)) {
-              st.push_back(L->getPointerOperand());
-              continue;
-            }
-            if (auto *G = dyn_cast<GEPOperator>(X)) {
-              std::string ty;
-              raw_string_ostream os(ty);
-              G->getSourceElementType()->print(os);
-              if (ty.find("va_list") != std::string::npos)
-                return true;
-              st.push_back(G->getPointerOperand());
-            }
-          }
-          return false;
-        };
         for (const BasicBlock *B : reach) {
           for (Instruction &I : *const_cast<BasicBlock *>(B)) {
             auto *S = dyn_cast<StoreInst>(&I);
@@ -3782,8 +3791,7 @@ std::vector<Client::Keyed> Client::keyedGatesAlong(const std::vector<std::string
             Argument *objArg = oneFormal(S->getPointerOperand());
             if (!objArg || objArg->getParent() != F)
               continue;
-            for (const auto &f : fieldsOf(const_cast<Value *>(S->getPointerOperand()))) {
-              // Climb to an interface vararg that carries obj and tag.
+            for (const auto &f : accessFields(*S, const_cast<Value *>(S->getPointerOperand()))) {
               struct Node {
                 Function *fn;
                 Argument *obj;
@@ -3807,14 +3815,13 @@ std::vector<Client::Keyed> Client::keyedGatesAlong(const std::vector<std::string
                   k.root = 0;
                   k.path = {f.first};
                   k.off = f.second;
-                  tagSetters[f].push_back(k);
+                  tagSettersOf[f].push_back(k);
                   break;
                 }
                 auto cit = callersOf.find(n.fn);
                 if (cit == callersOf.end())
                   continue;
                 for (Function *C : cit->second) {
-                  // Conservative: same arg positions when climbing thin wrappers.
                   if (n.obj->getArgNo() < C->arg_size() && n.tag->getArgNo() < C->arg_size())
                     q.push({C, C->getArg(n.obj->getArgNo()), C->getArg(n.tag->getArgNo())});
                 }
@@ -3825,6 +3832,172 @@ std::vector<Client::Keyed> Client::keyedGatesAlong(const std::vector<std::string
       }
     }
   }
+}
+
+// §3.8.5: at a bit-OR site `fields[i] |= 1 << (desc->bit & 31)`, read constant
+// arrays of desc's type so each tag constant maps to the (word field, mask) it
+// raises. No library-specific layout: the member index is taken from the GEP.
+void Client::ensureRegistryRaises() const {
+  if (registryReady)
+    return;
+  registryReady = true;
+  ensureTagSetters();
+  auto strip = [](Value *V) {
+    while (V) {
+      if (auto *C = dyn_cast<CastInst>(V)) {
+        V = C->getOperand(0);
+        continue;
+      }
+      break;
+    }
+    return V;
+  };
+  auto asConstInt = [&](Value *V) -> ConstantInt * {
+    V = strip(V);
+    return dyn_cast_or_null<ConstantInt>(V);
+  };
+  for (Module *M : {&down, &up}) {
+    for (Function &F : *M) {
+      if (F.isDeclaration())
+        continue;
+      for (Instruction &I : instructions(F)) {
+        auto *S = dyn_cast<StoreInst>(&I);
+        if (!S)
+          continue;
+        auto *Or = dyn_cast<BinaryOperator>(strip(S->getValueOperand()));
+        if (!Or || Or->getOpcode() != Instruction::Or)
+          continue;
+        Value *ShlV = nullptr, *OldV = nullptr;
+        for (unsigned o = 0; o < 2; ++o) {
+          auto *Sh = dyn_cast<BinaryOperator>(strip(Or->getOperand(o)));
+          if (Sh && Sh->getOpcode() == Instruction::Shl)
+            ShlV = Sh;
+          else
+            OldV = Or->getOperand(o);
+        }
+        if (!ShlV || !OldV)
+          continue;
+        auto *Shl = cast<BinaryOperator>(ShlV);
+        if (!asConstInt(Shl->getOperand(0)) || !asConstInt(Shl->getOperand(0))->isOne())
+          continue;
+        Value *Shift = strip(Shl->getOperand(1));
+        auto *And = dyn_cast<BinaryOperator>(Shift);
+        if (!And || And->getOpcode() != Instruction::And)
+          continue;
+        if (!S->getValueOperand()->getType()->isIntegerTy())
+          continue;
+        const uint64_t lowBits = S->getValueOperand()->getType()->getIntegerBitWidth() - 1;
+        Value *BitSrc = nullptr;
+        for (unsigned o = 0; o < 2; ++o)
+          if (auto *K = asConstInt(And->getOperand(o)); K && K->getZExtValue() == lowBits)
+            BitSrc = And->getOperand(1 - o);
+        if (!BitSrc)
+          continue;
+        BitSrc = strip(BitSrc);
+        auto *BitLoad = dyn_cast<LoadInst>(BitSrc);
+        if (!BitLoad)
+          continue;
+        auto *BitGep = dyn_cast<GEPOperator>(BitLoad->getPointerOperand()->stripPointerCasts());
+        if (!BitGep || BitGep->getNumIndices() < 2)
+          continue;
+        auto *BitIdx = dyn_cast<ConstantInt>(BitGep->idx_begin()[BitGep->getNumIndices() - 1]);
+        if (!BitIdx || BitIdx->getBitWidth() > 64)
+          continue;
+        unsigned bitMember = (unsigned)BitIdx->getZExtValue();
+        auto *StTy = dyn_cast<StructType>(BitGep->getSourceElementType());
+        if (!StTy || bitMember >= StTy->getNumElements())
+          continue;
+        auto *OldLoad = dyn_cast<LoadInst>(strip(OldV));
+        if (!OldLoad || OldLoad->getPointerOperand()->stripPointerCasts() !=
+                            S->getPointerOperand()->stripPointerCasts())
+          continue;
+        // The word index must be bit / wordBits of the same bit load.
+        auto *WordGep = dyn_cast<GEPOperator>(S->getPointerOperand()->stripPointerCasts());
+        if (!WordGep || WordGep->getNumIndices() < 1)
+          continue;
+        unsigned wordBits = S->getValueOperand()->getType()->getIntegerBitWidth();
+        if (!wordBits)
+          continue;
+        {
+          Value *Ix = strip(WordGep->idx_begin()[WordGep->getNumIndices() - 1]);
+          auto *Div = dyn_cast<BinaryOperator>(Ix);
+          if (!Div || (Div->getOpcode() != Instruction::SDiv && Div->getOpcode() != Instruction::UDiv &&
+                       Div->getOpcode() != Instruction::LShr))
+            continue;
+          auto *K = asConstInt(Div->getOperand(1));
+          uint64_t d = K ? K->getZExtValue() : 0;
+          if (!(Div->getOpcode() == Instruction::LShr ? (1ull << d) == wordBits : d == wordBits))
+            continue;
+          auto *L = dyn_cast<LoadInst>(strip(Div->getOperand(0)));
+          auto *G2 = L ? dyn_cast<GEPOperator>(L->getPointerOperand()->stripPointerCasts()) : nullptr;
+          if (!G2 || G2->getSourceElementType() != StTy || G2->getNumIndices() != BitGep->getNumIndices() ||
+              !std::equal(G2->idx_begin() + 1, G2->idx_end(), BitGep->idx_begin() + 1))
+            continue;
+        }
+        auto words = accessFields(*S, const_cast<Value *>(S->getPointerOperand()));
+        if (words.empty())
+          continue;
+        // Every level the word lies in, with the array's base offset there.
+        std::map<std::string, int64_t> baseOf;
+        for (const auto &w : words) {
+          auto [it, added] = baseOf.try_emplace(w.first, w.second);
+          if (!added)
+            it->second = std::min(it->second, w.second);
+        }
+        unsigned wordBytes = wordBits / 8;
+        for (GlobalVariable &G : M->globals()) {
+          if (!G.isConstant() || !G.hasInitializer())
+            continue;
+          auto *CA = dyn_cast<ConstantArray>(G.getInitializer());
+          auto *CAgg = dyn_cast<ConstantAggregate>(G.getInitializer());
+          unsigned n = 0;
+          auto elem = [&](unsigned i) -> Constant * {
+            if (CA)
+              return CA->getOperand(i);
+            return CAgg ? CAgg->getAggregateElement(i) : nullptr;
+          };
+          Type *elemTy = nullptr;
+          if (CA) {
+            n = CA->getNumOperands();
+            elemTy = CA->getType()->getElementType();
+          } else if (auto *CDS = dyn_cast<ConstantDataArray>(G.getInitializer())) {
+            continue;
+          } else if (CAgg && G.getValueType()->isArrayTy()) {
+            n = G.getValueType()->getArrayNumElements();
+            elemTy = G.getValueType()->getArrayElementType();
+          } else
+            continue;
+          if (elemTy != StTy)
+            continue;
+          for (unsigned i = 0; i < n; ++i) {
+            Constant *E = elem(i);
+            if (!E)
+              continue;
+            Constant *TagC = E->getAggregateElement(0u);
+            Constant *BitC = E->getAggregateElement(bitMember);
+            auto *TagI = dyn_cast_or_null<ConstantInt>(TagC);
+            auto *BitI = dyn_cast_or_null<ConstantInt>(BitC);
+            if (!TagI || !BitI || TagI->getBitWidth() > 64 || BitI->getBitWidth() > 64)
+              continue;
+            int64_t tag = TagI->getSExtValue();
+            uint64_t bit = BitI->getZExtValue();
+            uint64_t mask = 1ull << (bit % wordBits);
+            auto &vec = raisesOfTag[tag];
+            for (const auto &[ty, base] : baseOf) {
+              Field word{ty, base + (int64_t)((bit / wordBits) * wordBytes)};
+              if (std::find(vec.begin(), vec.end(), std::make_pair(word, mask)) == vec.end())
+                vec.push_back({word, mask});
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+std::vector<Client::Keyed> Client::keyedGatesAlong(const std::vector<std::string> &seq, Function *E) const {
+  ensureTagSetters();
+  const auto &tagSetters = tagSettersOf;
   std::vector<Keyed> out;
   auto add = [&](Keyed k, const std::string &op, int64_t v) {
     k.preds = {{op, v}};
@@ -3869,7 +4042,7 @@ std::vector<Client::Keyed> Client::keyedGatesAlong(const std::vector<std::string
         if (!L || !CI || CI->getBitWidth() > 64)
           continue;
         int64_t v = CI->getSExtValue();
-        for (const auto &f : fieldsOf(const_cast<Value *>(L->getPointerOperand()))) {
+        for (const auto &f : accessFields(*L, const_cast<Value *>(L->getPointerOperand()))) {
           auto it = tagSetters.find(f);
           if (it == tagSetters.end())
             continue;
@@ -3893,32 +4066,73 @@ const Client::WitnessPlan *Client::established(const std::string &file, unsigned
   auto key = std::make_tuple(file, line, names);
   if (auto it = estOf.find(key); it != estOf.end())
     return it->second.get();
-  if (!reach || !estBusy.insert(key).second)
+  if (!reach)
     return nullptr;
+  if (auto b = estBusy.find(key); b != estBusy.end()) {
+    estLow = std::min(estLow, b->second);
+    return nullptr;
+  }
+  const int depth = estBusy.size();
+  estBusy.emplace(key, depth);
+  const int outer = estLow;
+  estLow = INT_MAX;
+  // 정의 E is existential over sequences: a sequence whose plan is open
+  // does not refute the store, so the satisfiable sequences are taken in
+  // cost order until one plan passes or the path budget runs out.
   std::unique_ptr<WitnessPlan> plan;
-  std::string log = file + ":" + std::to_string(line);
-  if (auto w = reach(file, line, names); w && !w->seq.empty()) {
+  for (int from = 0; !plan;) {
+    std::string log = file + ":" + std::to_string(line);
+    auto w = reach(file, line, names, from);
+    if (!w || w->seq.empty()) {
+      estLog.push_back(log + (from ? " : exhausted" : " : none"));
+      break;
+    }
     for (const std::string &n : w->seq)
       log += " " + n;
     if (Function *S = body(w->seq.front())) {
-      plan = std::make_unique<WitnessPlan>(realize(S, w->phi, w->keyed));
+      plan = std::make_unique<WitnessPlan>(realize(S, w->phi, w->keyed, w->rets, true));
       std::string open;
-      for (const Realized &r : plan->cells)
-        if (r.how == Realize::Open)
-          open += " " + r.cell.type + "+" + std::to_string(r.cell.off) + " " + r.cell.op + " " +
-                  (r.cell.values.empty() ? "-" : r.cell.values[0]);
+      for (const auto *rs : {&plan->cells, &plan->returns})
+        for (const Realized &r : *rs)
+          if (r.how == Realize::Open)
+            open += " " + r.cell.type + "+" + std::to_string(r.cell.off) + " " + r.cell.op + " " +
+                    (r.cell.values.empty() ? "-" : r.cell.values[0]) + " [" + r.why + "]";
       log += plan->pass ? " : pass" : " : open" + open;
       if (!plan->pass)
         plan.reset();
       else
         plan->seq = w->seq;
     }
-  } else {
-    log += " : none";
+    estLog.push_back(log);
+    if (w->index < from)
+      break;
+    from = w->index + 1;
   }
-  estLog.push_back(log);
   estBusy.erase(key);
+  const int low = estLow;
+  estLow = std::min(outer, low);
+  // A pass is monotone in the answers it assumed; a failure is final only
+  // when every cycle it met closes at this query or deeper (its SCC root).
+  if (!plan && low < depth)
+    return nullptr;
   return (estOf[key] = std::move(plan)).get();
+}
+
+bool Client::mayStore(const std::vector<Function *> &fns, const Field &f) const {
+  for (Function *R : fns) {
+    if (!R)
+      continue;
+    for (Function *G : closureOf(R)) {
+      if (auto it = stores.find(G); it != stores.end())
+        if (auto s = it->second.lower_bound({f, ""}); s != it->second.end() && s->first == f)
+          return true;
+      if (auto it = ranges.find(G); it != ranges.end())
+        for (const auto &[ty, off, len] : it->second)
+          if (ty == f.first && off <= f.second && f.second - off < len)
+            return true;
+    }
+  }
+  return false;
 }
 
 // Construct: no function stores the field, or Definition E. Under Lemma E
@@ -3930,66 +4144,64 @@ bool Client::establishedBy(Function *E, Function *entry, const Cell &c, const Wi
                            std::string &at) const {
   via = nullptr;
   Field f = fieldOf(c);
+  const char *dbgEst = getenv("SP_DBG_EST");
+  bool dbg = dbgEst && (f.first + "+" + std::to_string(f.second)).find(dbgEst) != std::string::npos;
+  if (dbg)
+    errs() << "DBG_EST " << f.first << "+" << f.second << " op " << c.op << " everStored "
+           << everStored(f.first, f.second) << " upOnly " << upOnly(f) << " boundary " << c.boundary
+           << " prefix " << c.prefix << " reach " << (bool)reach << "\n";
   if (!everStored(f.first, f.second))
     return true;
-  // Λ3 by a producer of a held layer on c's path: that producer stores a
-  // constant that satisfies φ_c into the field. The harness already calls
-  // the producer to build the handle; no may-path query is required.
-  auto layerType = [](std::string T) {
-    if (T.rfind("struct.", 0) == 0)
-      T = T.substr(7);
-    return T;
-  };
-  auto sameField = [&](const Field &g) {
-    if (g.second != f.second)
-      return false;
-    if (g.first == f.first)
-      return true;
-    return layerType(g.first) == layerType(f.first);
-  };
-  std::vector<std::string> layers{heldType(E, c.root)};
-  for (const std::string &t : c.path)
-    layers.push_back(layerType(t));
-  for (const std::string &T : layers) {
-    if (T.empty())
-      continue;
-    auto pit = producers.find(T);
-    if (pit == producers.end())
-      continue;
-    for (const Producer &pr : pit->second) {
-      for (Function *G : closureOf(pr.fn)) {
-        auto sit = stores.find(G);
-        if (sit != stores.end())
-          for (const auto &[g, v] : sit->second)
-            if (sameField(g) && v != "*" && satisfies(v, c)) {
-              at = G->getName().str();
-              return true;
-            }
-        // A zero memset of the object covers every field in its byte range.
-        if (auto rit = ranges.find(G); rit != ranges.end())
-          for (const auto &[ty, off, len] : rit->second)
-            if (sameField({ty, off}) ||
-                (layerType(ty) == layerType(f.first) && off <= f.second && f.second - off < len))
-              if (satisfies("0", c)) {
-                at = G->getName().str();
-                return true;
-              }
-      }
-    }
-  }
+  // Λ3 (DESIGN §3.11): library-internal Construct is Definition E, not a
+  // path-insensitive may-store in a producer's closure. A producer the
+  // harness already calls may store φ_c only on some paths (e.g.
+  // jinit_upsampler writes h2v2_upsample iff !do_fancy); treating that as
+  // Construct skips the return constraints of the store and marks a
+  // witness realized when execution installs a different method
+  // (h2v2_fancy_upsample) that never reaches the sink. harnessStarts
+  // already puts those producers in the establish scope below.
   bool up = upOnly(f);
-  if (!entry || (!up && !(c.boundary || c.prefix)))
+  if (!entry)
+    return false;
+  // Entry state the library alone stores: φ_c must hold when the entry is
+  // called, so only a call the harness makes before it (a producer or its
+  // dependence, never the entry) can establish it, and only through a
+  // passing sequence to a satisfying store. satisfies is exact on value
+  // atoms only.
+  const bool pre = !up && !(c.boundary || c.prefix);
+  if (pre && c.op != "=" && c.op != "!=" && c.op != "has" && c.op != "lacks")
     return false;
   std::set<Field> fs{f};
   if (c.boundary)
     if (auto it = copies(entry).find(f); it != copies(entry).end())
       fs.insert(it->second.begin(), it->second.end());
   std::vector<Function *> starts = harnessStarts(E, entry, c);
+  if (pre)
+    starts.erase(std::remove(starts.begin(), starts.end(), entry), starts.end());
+  if (starts.empty())
+    return false;
   FnSet scope;
   for (Function *F : starts)
     scope.insert(closureOf(F).begin(), closureOf(F).end());
   bool nonConst = false, anySat = false;
-  std::vector<std::pair<std::string, unsigned>> plus;
+  // S+ in the cost order of the sequences reaching it: the call distance
+  // from the starts to the store's function, then position.
+  std::map<Function *, unsigned> dist;
+  {
+    std::deque<Function *> q;
+    for (Function *F : starts)
+      if (dist.emplace(F, 0).second)
+        q.push_back(F);
+    while (!q.empty()) {
+      Function *F = q.front();
+      q.pop_front();
+      if (auto it = calls.find(F); it != calls.end())
+        for (Function *G : it->second)
+          if (dist.emplace(G, dist.at(F) + 1).second)
+            q.push_back(G);
+    }
+  }
+  std::vector<std::tuple<unsigned, std::string, unsigned>> plus;
   auto touches = [&](Function *G) {
     if (auto it = stores.find(G); it != stores.end())
       for (const Field &d : fs)
@@ -4014,7 +4226,7 @@ bool Client::establishedBy(Function *E, Function *entry, const Cell &c, const Wi
         bool hit = false;
         std::string v = "*";
         if (auto *S = dyn_cast<StoreInst>(&I)) {
-          for (const Field &g : fieldsOf(S->getPointerOperand()))
+          for (const Field &g : accessFields(*S, S->getPointerOperand()))
             hit = hit || fs.count(g);
           if (!hit)
             continue;
@@ -4027,9 +4239,16 @@ bool Client::establishedBy(Function *E, Function *entry, const Cell &c, const Wi
         } else if (auto *MI = dyn_cast<MemIntrinsic>(&I)) {
           auto *L = dyn_cast<ConstantInt>(MI->getLength());
           int64_t len = L && L->getBitWidth() <= 64 ? L->getSExtValue() : INT64_MAX;
-          for (const Field &g : fieldsOf(MI->getRawDest()))
+          std::vector<std::tuple<std::string, int64_t, int64_t>> span;
+          for (const Field &g : accessFields(*MI, MI->getRawDest()))
+            span.push_back({g.first, g.second, len});
+          if (span.empty())
+            if (auto *MS = dyn_cast<MemSetInst>(MI))
+              if (auto z = zeroFill(*MS))
+                span.push_back(*z);
+          for (const auto &[ty, off, n] : span)
             for (const Field &d : fs)
-              hit = hit || (g.first == d.first && g.second <= d.second && d.second - g.second < len);
+              hit = hit || (ty == d.first && off <= d.second && d.second - off < n);
           if (!hit)
             continue;
           auto *MS = dyn_cast<MemSetInst>(MI);
@@ -4042,7 +4261,8 @@ bool Client::establishedBy(Function *E, Function *entry, const Cell &c, const Wi
           nonConst = true; // a satisfying store with no position cannot be queried
         else if (satisfies(v, c)) {
           anySat = true;
-          plus.push_back({dl->getFilename().str(), dl.getLine()});
+          auto d = dist.find(G);
+          plus.push_back({d == dist.end() ? ~0u : d->second, dl->getFilename().str(), dl.getLine()});
         }
       }
     }
@@ -4058,8 +4278,17 @@ bool Client::establishedBy(Function *E, Function *entry, const Cell &c, const Wi
   // jinit_merged when every path to its store is open).
   std::sort(plus.begin(), plus.end());
   plus.erase(std::unique(plus.begin(), plus.end()), plus.end());
+  if (dbg) {
+    errs() << "DBG_EST   fs " << fs.size() << " nonConst " << nonConst << " anySat " << anySat << " plus";
+    for (const auto &[d, file, line] : plus)
+      errs() << " " << file << ":" << line;
+    errs() << " starts";
+    for (Function *F : starts)
+      errs() << " " << F->getName();
+    errs() << "\n";
+  }
   if (reach) {
-    for (const auto &[file, line] : plus)
+    for (const auto &[d, file, line] : plus)
       if ((via = established(file, line, starts))) {
         at = file + ":" + std::to_string(line);
         return true;
@@ -4067,6 +4296,8 @@ bool Client::establishedBy(Function *E, Function *entry, const Cell &c, const Wi
     if (!plus.empty())
       return false;
   }
+  if (pre)
+    return false;
   if (nonConst || satisfies("0", c) || !reach)
     return up || anySat;
   return false;
@@ -4121,12 +4352,168 @@ Function *Client::inputFiller(Function *E, Function *entry, const Cell &c) const
   return nullptr;
 }
 
-Client::WitnessPlan Client::realize(Function *E, const std::vector<Cell> &phi, const std::vector<Keyed> &keyed) const {
+// 정의 R: the values F returns, each with the instruction that fixes it:
+// the stores to a return slot only loads and stores use (-O0), otherwise
+// the returned value, through phis and selects.
+static std::vector<std::pair<Value *, Instruction *>> returnDefs(Function &F) {
+  std::vector<std::pair<Value *, Instruction *>> out, work;
+  std::set<std::pair<Value *, Instruction *>> seen;
+  for (Instruction &I : instructions(F))
+    if (auto *R = dyn_cast<ReturnInst>(&I))
+      if (Value *v = R->getReturnValue())
+        work.push_back({v, R});
+  while (!work.empty()) {
+    auto [v, at] = work.back();
+    work.pop_back();
+    if (!seen.insert({v, at}).second)
+      continue;
+    if (auto *P = dyn_cast<PHINode>(v)) {
+      for (unsigned i = 0; i < P->getNumIncomingValues(); ++i)
+        work.push_back({P->getIncomingValue(i), P->getIncomingBlock(i)->getTerminator()});
+      continue;
+    }
+    if (auto *S = dyn_cast<SelectInst>(v)) {
+      work.push_back({S->getTrueValue(), S});
+      work.push_back({S->getFalseValue(), S});
+      continue;
+    }
+    if (auto *L = dyn_cast<LoadInst>(v))
+      if (auto *A = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts())) {
+        std::vector<StoreInst *> st;
+        bool local = true;
+        for (User *U : A->users()) {
+          if (auto *S = dyn_cast<StoreInst>(U); S && S->getPointerOperand() == A)
+            st.push_back(S);
+          else if (!isa<LoadInst>(U) && !isa<DbgInfoIntrinsic>(U))
+            local = false;
+        }
+        if (local) {
+          for (StoreInst *S : st)
+            work.push_back({S->getValueOperand(), S});
+          continue;
+        }
+      }
+    out.push_back({v, at});
+  }
+  return out;
+}
+
+// Whether the constant c meets `pred k` at c's width; none when k is not an
+// integer or pred is not a comparison.
+static std::optional<bool> retHolds(const APInt &c, const std::string &pred, const std::string &k) {
+  int64_t kv = 0;
+  if (std::from_chars(k.data(), k.data() + k.size(), kv).ec != std::errc())
+    return std::nullopt;
+  APInt K(c.getBitWidth(), (uint64_t)kv, true);
+  if (pred == "==")
+    return c.eq(K);
+  if (pred == "!=")
+    return c.ne(K);
+  if (pred == "ugt")
+    return c.ugt(K);
+  if (pred == "uge")
+    return c.uge(K);
+  if (pred == "ult")
+    return c.ult(K);
+  if (pred == "ule")
+    return c.ule(K);
+  if (pred == "sgt")
+    return c.sgt(K);
+  if (pred == "sge")
+    return c.sge(K);
+  if (pred == "slt")
+    return c.slt(K);
+  if (pred == "sle")
+    return c.sle(K);
+  return std::nullopt;
+}
+
+// 정의 R: may decides the witness with each call result free, so the
+// obligation `callee pred k` refines exactly that freedom: some execution
+// of the callee returns a value meeting it. A constant definition can meet
+// it exactly when it satisfies the predicate; a returned direct call's
+// result passes the obligation on to that callee; any other value is not
+// refuted by the definition alone. Each remaining definition is probed from
+// the callee: 1 a satisfiable sequence reaches it, 0 every sequence was
+// tried and none is satisfiable. The obligation is refuted (0) only when
+// every definition is; a callee with no body, an unpositioned definition,
+// or an exhausted budget leaves it unknown (-1), which does not refute.
+int Client::returnedBy(const Ret &r, std::string &why, std::set<std::string> &busy) const {
+  Function *C = body(r.callee);
+  if (!C || C->isDeclaration())
+    return -1;
+  const std::string key = r.callee + " " + r.pred + " " + r.k;
+  if (!busy.insert(key).second) {
+    why = "cycle " + r.callee;
+    return 0;
+  }
+  struct Def {
+    int rank;
+    std::string file;
+    unsigned line;
+    Function *next;
+    bool operator<(const Def &o) const {
+      return std::tie(rank, file, line, next) < std::tie(o.rank, o.file, o.line, o.next);
+    }
+  };
+  std::set<Def> defs;
+  bool unpositioned = false;
+  for (auto [v, at] : returnDefs(*C)) {
+    int rank = 2;
+    Function *next = nullptr;
+    if (auto *K = dyn_cast<ConstantInt>(v)) {
+      if (auto h = retHolds(K->getValue(), r.pred, r.k); h && !*h)
+        continue;
+      rank = 0;
+    } else if (isa<ConstantPointerNull>(v)) {
+      if (auto h = retHolds(APInt(64, 0), r.pred, r.k); h && !*h)
+        continue;
+      rank = 0;
+    } else if (auto *CB = dyn_cast<CallBase>(v)) {
+      if (Function *G = CB->getCalledFunction(); G && !G->isIntrinsic() && CB->getType() == C->getReturnType()) {
+        next = G;
+        rank = 1;
+      }
+    }
+    const DebugLoc &dl = at->getDebugLoc();
+    if (!dl) {
+      unpositioned = true;
+      continue;
+    }
+    defs.insert({rank, dl->getFilename().str(), dl.getLine(), next});
+  }
+  int best = unpositioned ? -1 : 0;
+  const std::set<std::string> from{C->getName().str()};
+  for (const Def &d : defs) {
+    int p = probeFrom ? probeFrom(d.file, d.line, from) : -1;
+    if (p != 0 && d.next) {
+      std::string w;
+      int q = returnedBy({d.next->getName().str(), r.pred, r.k, r.callee, d.line}, w, busy);
+      if (q == 0)
+        why = w;
+      p = q == 0 ? 0 : std::min(p, q);
+    }
+    // Disjunction over definitions in the order 0 < -1 < 1.
+    if (p == 1 || (p == -1 && best == 0))
+      best = p;
+    if (best == 1)
+      break;
+  }
+  if (best == 0 && why.empty())
+    why = (defs.empty() ? "return-unsat " : "return-unreached ") + r.callee;
+  busy.erase(key);
+  return best;
+}
+
+Client::WitnessPlan Client::realize(Function *E, const std::vector<Cell> &phi, const std::vector<Keyed> &keyed,
+                                    const std::vector<Ret> &rets, bool decide) const {
   WitnessPlan W;
   W.first = E;
   W.entries = entries(E);
   Function *entry = W.entries.empty() ? nullptr : W.entries[0];
   W.iface = entry && ifaceD.count(entry);
+  if (decide && !W.iface)
+    return W;
   W.direct = W.entries.size() == 1 && entry == E;
   std::vector<const Cell *> ob;
   for (const Cell &c : phi)
@@ -4162,6 +4549,70 @@ Client::WitnessPlan Client::realize(Function *E, const std::vector<Cell> &phi, c
   for (const Keyed &k : keyed)
     if (realizable(E, k) && admitted(body(k.fn)))
       kw.push_back(k);
+  // §3.8.5: a has/lacks cell on a bitfield word is discharged by the same
+  // tag-dispatch Key that the constant registry maps to that mask.
+  ensureRegistryRaises();
+  auto addBitKeys = [&](const Cell &c) {
+    // OR raises establish has, not lacks (they never clear bits).
+    if (c.op != "has")
+      return;
+    auto m = c.values.empty() ? std::nullopt : asU64(c.values[0]);
+    if (!m)
+      return;
+    Field f = fieldOf(c);
+    for (const auto &[tag, raises] : raisesOfTag) {
+      bool hit = false;
+      for (const auto &[word, mask] : raises) {
+        if (word != f)
+          continue;
+        // The tag raises `mask`; it discharges has m when mask covers m.
+        if ((*m & mask) != *m)
+          continue;
+        hit = true;
+        break;
+      }
+      if (!hit)
+        continue;
+      for (const auto &kv : tagSettersOf) {
+        for (const Keyed &base : kv.second) {
+          if (base.tagV != tag)
+            continue;
+          Keyed k = base;
+          k.root = c.root;
+          k.path = c.path;
+          k.off = c.off;
+          if (!realizable(E, k) || !admitted(body(k.fn)))
+            continue;
+          bool dup = false;
+          for (const Keyed &o : kw)
+            if (o.fn == k.fn && o.tag == k.tag && o.tagV == k.tagV && o.covers(c))
+              dup = true;
+          if (!dup)
+            kw.push_back(std::move(k));
+        }
+      }
+    }
+  };
+  for (const Cell &c : phi)
+    addBitKeys(c);
+  if (std::getenv("SP_DBG_BITS")) {
+    size_t nr = 0;
+    for (const auto &kv : raisesOfTag)
+      nr += kv.second.size();
+    errs() << "DBG_BITS raises " << raisesOfTag.size() << " tags " << nr << " words, keyed " << kw.size() << "\n";
+    for (const Cell &c : phi)
+      if (c.op == "has")
+        for (const auto &[tag, rs] : raisesOfTag)
+          for (const auto &[w, m] : rs)
+            if (w == fieldOf(c))
+              errs() << "DBG_BITS   " << c.type << "+" << c.off << " has " << (c.values.empty() ? "-" : c.values[0])
+                     << " <- tag " << tag << " mask " << m << " setters "
+                     << std::count_if(tagSettersOf.begin(), tagSettersOf.end(), [&](const auto &kv) {
+                          return std::any_of(kv.second.begin(), kv.second.end(),
+                                             [&](const Keyed &k) { return k.tagV == tag; });
+                        })
+                     << "\n";
+  }
   auto valueAtom = [](const Cell &c) { return c.op == "=" || c.op == "!=" || c.op == "has" || c.op == "lacks"; };
   std::map<size_t, std::vector<Function *>> cand;
   std::map<size_t, std::pair<const WitnessPlan *, std::string>> vias;
@@ -4229,7 +4680,41 @@ Client::WitnessPlan Client::realize(Function *E, const std::vector<Cell> &phi, c
       r.by = body(k->fn);
       addKeyed(r.by, *k);
     }
+    if (r.how == Realize::Open)
+      r.why = "no-route";
     W.cells.push_back(r);
+    if (decide && r.how == Realize::Open)
+      return W;
+  }
+  std::set<std::tuple<std::string, std::string, std::string, unsigned>> seenRet;
+  for (const Ret &rt : rets) {
+    if (!seenRet.insert({rt.callee, rt.pred, rt.k, rt.line}).second)
+      continue;
+    Cell c;
+    c.type = "return " + rt.callee;
+    c.off = rt.line;
+    c.op = rt.pred;
+    c.values = {rt.k};
+    c.text = rt.caller;
+    Realized r{c};
+    const std::string key = rt.callee + " " + rt.pred + " " + rt.k;
+    auto it = retOf.find(key);
+    if (it == retOf.end()) {
+      std::set<std::string> busy;
+      std::string why;
+      int g = returnedBy(rt, why, busy);
+      it = retOf.emplace(key, std::make_pair(g, why)).first;
+    }
+    int got = it->second.first;
+    r.why = it->second.second;
+    if (got != 0) {
+      r.how = Realize::Construct;
+      r.by = body(rt.callee);
+      r.why = got == 1 ? "" : "unknown";
+    }
+    W.returns.push_back(r);
+    if (decide && r.how == Realize::Open)
+      return W;
   }
   // Greedy set cover of the Write cells by at most writerSlots functions,
   // the writer calls the §4 grammar makes before the entry.
@@ -4262,14 +4747,20 @@ Client::WitnessPlan Client::realize(Function *E, const std::vector<Cell> &phi, c
         rest.push_back(i);
     left.swap(rest);
   }
-  for (size_t i : left)
+  for (size_t i : left) {
     W.cells[i].how = Realize::Open;
+    W.cells[i].why = "writer-slots";
+  }
   // 정의 E: a cell a store establishes brings the calls the reaching
   // sequence's plan realizes; the merged cover stays within the K slots.
   // A via plan that reaches S+ under a φ incompatible with this witness
   // (same field, conflicting atoms) does not establish — otherwise exclusive
   // library branches (e.g. fancy=0 only on raw, jinit_merged only on !raw)
   // would each pass in isolation and wrongly Compose as Construct.
+  // The via runs before the witness: its atoms hold before it, the
+  // witness's after it. Two atoms on one field must hold together only when
+  // the field keeps its value across the via (frame rule), so a conflict
+  // refutes the composition only when nothing the via runs may store it.
   auto cellClash = [&](const Cell &a, const Cell &b) {
     if (a.type != b.type || a.off != b.off)
       return false;
@@ -4293,26 +4784,33 @@ Client::WitnessPlan Client::realize(Function *E, const std::vector<Cell> &phi, c
     }
     return false;
   };
-  for (const auto &[i, v] : vias) {
-    const auto &[via, where] = v;
+  auto compose = [&](Realized &target, const WitnessPlan *via, const std::string &where) {
+    std::vector<Function *> runs = via->cover;
+    for (const std::string &n : via->seq)
+      runs.push_back(body(n));
+    for (const auto &kf : via->keyed)
+      runs.push_back(kf.first);
     bool clash = false;
+    std::string clashWith;
     for (const Realized &vr : via->cells)
       for (const Realized &wr : W.cells)
-        if (cellClash(vr.cell, wr.cell)) {
+        if (!clash && cellClash(vr.cell, wr.cell) && !mayStore(runs, fieldOf(vr.cell))) {
           clash = true;
-          break;
+          clashWith = vr.cell.type + "+" + std::to_string(vr.cell.off) + " " + vr.cell.op;
         }
     if (clash) {
-      W.cells[i].how = Realize::Open;
-      continue;
+      target.how = Realize::Open;
+      target.why = "clash " + where + " " + clashWith;
+      return false;
     }
     std::vector<Function *> cover = W.cover;
     for (Function *F : via->cover)
       if (std::find(cover.begin(), cover.end(), F) == cover.end())
         cover.push_back(F);
     if (cover.size() > writerSlots) {
-      W.cells[i].how = Realize::Open;
-      continue;
+      target.how = Realize::Open;
+      target.why = "via-slots " + where + " " + std::to_string(cover.size());
+      return false;
     }
     W.cover = cover;
     for (const auto &[F, k] : via->keyed)
@@ -4330,10 +4828,14 @@ Client::WitnessPlan Client::realize(Function *E, const std::vector<Cell> &phi, c
       line += " " + n;
     W.established.push_back(line);
     W.established.insert(W.established.end(), via->established.begin(), via->established.end());
-  }
+    return true;
+  };
+  for (const auto &[i, v] : vias)
+    compose(W.cells[i], v.first, v.second);
   W.pass = W.iface;
-  for (const Realized &r : W.cells)
-    W.pass = W.pass && r.how != Realize::Open;
+  for (const auto *rs : {&W.cells, &W.returns})
+    for (const Realized &r : *rs)
+      W.pass = W.pass && r.how != Realize::Open;
   return W;
 }
 
@@ -4348,7 +4850,8 @@ Client::Plan Client::plan(const Witnesses &ws) const {
     Function *E = seq.empty() ? nullptr : body(seq.front());
     if (!E)
       continue;
-    WitnessPlan W = realize(E, phi, wi < keyedIn.size() ? keyedIn[wi] : std::vector<Keyed>{});
+    WitnessPlan W = realize(E, phi, wi < keyedIn.size() ? keyedIn[wi] : std::vector<Keyed>{},
+                            wi < retsIn.size() ? retsIn[wi] : std::vector<Ret>{});
     if (std::find(P.firsts.begin(), P.firsts.end(), E) == P.firsts.end())
       P.firsts.push_back(E);
     for (Function *F : W.entries)
@@ -4528,15 +5031,70 @@ std::vector<std::pair<std::string, std::string>> Client::openDispatchEdges(const
     auto st = rest.find(" st ");
     if (arrow == std::string::npos || st == std::string::npos || arrow >= st)
       continue;
-    open.emplace_back(rest.substr(0, arrow), rest.substr(arrow + 4, st - arrow - 4));
+    bool refuted = line.find(" OPEN refuted") != std::string::npos;
+    open.emplace_back(refuted ? std::string() : rest.substr(0, arrow), rest.substr(arrow + 4, st - arrow - 4));
   }
   return open;
+}
+
+bool Client::installRefuted(Function *T, const std::set<std::string> &starts) const {
+  if (!probe || !T)
+    return false;
+  auto key = std::make_pair(T->getName().str(), starts);
+  if (auto it = refutedOf.find(key); it != refutedOf.end())
+    return it->second;
+  bool &out = refutedOf[key];
+  out = false;
+  // Every use of T's address other than a call of it must be a store with a
+  // position; any other use (a table, an argument) installs T by a route
+  // the store queries do not cover.
+  std::set<std::pair<std::string, unsigned>> at;
+  for (Module *M : {&down, &up}) {
+    Function *G = M->getFunction(T->getName());
+    if (!G)
+      continue;
+    std::vector<const User *> work(G->user_begin(), G->user_end());
+    std::set<const User *> seen;
+    while (!work.empty()) {
+      const User *U = work.back();
+      work.pop_back();
+      if (!seen.insert(U).second)
+        continue;
+      if (auto *CB = dyn_cast<CallBase>(U); CB && CB->getCalledOperand()->stripPointerCasts() == G)
+        continue;
+      if (auto *S = dyn_cast<StoreInst>(U); S && S->getValueOperand()->stripPointerCasts() == G) {
+        const DebugLoc &dl = S->getDebugLoc();
+        if (!dl)
+          return false;
+        at.insert({dl->getFilename().str(), dl.getLine()});
+        continue;
+      }
+      if (auto *CE = dyn_cast<ConstantExpr>(U); CE && CE->isCast()) {
+        work.insert(work.end(), CE->user_begin(), CE->user_end());
+        continue;
+      }
+      return false;
+    }
+  }
+  if (at.empty())
+    return false;
+  for (const auto &[file, line] : at)
+    if (int r = probe(file, line, starts); r != 0) {
+      estLog.push_back("install " + T->getName().str() + " at " + file + ":" + std::to_string(line) +
+                       (r > 0 ? " reachable" : " unknown") + " from " + std::to_string(starts.size()));
+      return false;
+    }
+  estLog.push_back("refuted " + T->getName().str() + " stores " + std::to_string(at.size()));
+  return out = true;
 }
 
 // §2.4 Key and §3.7: an edge a -> b of a witness is indirect when a has no
 // call of b. Definition D realizes its dispatch by a key (1), by a call of
 // the harness installing b while the harness reads the input (2), or by a
-// writer or key setter the harness calls installing it (3).
+// writer or key setter the harness calls installing it (3). Each of these
+// only installs b if one of b's installing stores can run: when every
+// sequence from the harness calls to each of them is unsatisfiable, the
+// edge is open whatever closure contains the installer.
 void Client::dispatch(const Witnesses &ws, Plan &P) const {
   FnSet made, setters(P.writers.begin(), P.writers.end());
   for (const auto &h : P.handles)
@@ -4623,10 +5181,21 @@ void Client::dispatch(const Witnesses &ws, Plan &P) const {
           break;
         }
       }
+      bool refuted = false;
+      if (!how.empty() && probe) {
+        std::set<std::string> sn;
+        for (Function *H : called)
+          sn.insert(H->getName().str());
+        for (Function *W : setters)
+          sn.insert(W->getName().str());
+        refuted = installRefuted(T, sn);
+        if (refuted)
+          how.clear();
+      }
       open += how.empty();
       notes.push_back("  D " + A->getName().str() + " -> " + T->getName().str() + " st " +
                       std::to_string(St.size()) + " tg " + std::to_string(choices.size()) +
-                      (how.empty() ? " OPEN" : how));
+                      (how.empty() ? (refuted ? " OPEN refuted" : " OPEN") : how));
     }
     std::set<std::string> gate;
     if (!inputGates.empty())
@@ -4737,7 +5306,12 @@ void Client::report(const Plan &P, raw_ostream &out) const {
     for (const Realized &r : W.cells)
       out << "  cell " << r.cell.type << "+" << r.cell.off << " " << r.cell.op << " "
           << (r.cell.values.empty() ? "-" : r.cell.values[0]) << " " << realizeName(r.how)
-          << (r.by ? " " + r.by->getName().str() : "") << "\n";
+          << (r.by ? " " + r.by->getName().str() : "") << (r.how == Realize::Open ? " [" + r.why + "]" : "")
+          << "\n";
+    for (const Realized &r : W.returns)
+      out << "  " << r.cell.type << " " << r.cell.op << " " << r.cell.values[0] << " at " << r.cell.text << " line "
+          << r.cell.off << " " << realizeName(r.how) << (r.by ? " " + r.by->getName().str() : "")
+          << (r.why.empty() ? "" : " [" + r.why + "]") << "\n";
     for (const std::string &e : W.established)
       out << "  established " << e << "\n";
     for (const std::string &e : W.excluded)

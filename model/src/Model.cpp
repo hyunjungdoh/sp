@@ -1,6 +1,7 @@
 #include "Model.h"
 #include "Client.h"
 #include "Close.h"
+#include <chrono>
 #include <sstream>
 
 #include "llvm/Analysis/TargetLibraryInfo.h"
@@ -495,6 +496,13 @@ struct Witness {
   std::vector<Ret> rets;
   std::vector<Client::Keyed> keyed;
 };
+
+std::vector<Client::Ret> clientRets(const Witness &w) {
+  std::vector<Client::Ret> out;
+  for (const Witness::Ret &r : w.rets)
+    out.push_back({r.callee, r.pred, r.k, r.caller, r.line});
+  return out;
+}
 
 // A run prints every sequence it tries and stops at the first satisfiable
 // one, so the witness is its last block. The atoms to discharge are the
@@ -1216,6 +1224,35 @@ void markStInstallers(Module &M, const std::vector<std::string> &names) {
   errs() << "markStInstallers hit " << hit << " of " << names.size() << "\n";
 }
 
+// The may query of Definition E, three-valued: 1 a satisfiable sequence from
+// starts reaches file:line, 0 every sequence was tried and none is, -1 when
+// the path budget ran out or the line is not a sink.
+int probeReach(Module &down, Module &up, const std::set<std::string> &iface, const std::string &f, unsigned l,
+               const std::set<std::string> &starts, bool exact = false) {
+  Model m(down, up, f, l);
+  m.interfaceNames = iface;
+  m.startNames = starts;
+  m.exactStarts = exact;
+  m.probeBudget = true;
+  m.emitInputs = false;
+  std::string buf;
+  raw_string_ostream o(buf);
+  m.run(0, o);
+  o.flush();
+  std::istringstream in(buf);
+  if (!parseWitness(in).seq.empty())
+    return 1;
+  if (buf.find("\npaths-budget ") != std::string::npos || buf.rfind("paths-budget ", 0) == 0)
+    return -1;
+  // An exact start holds the line, so having none means the line is not a
+  // target, not that every sequence was tried.
+  if (exact && (buf.find("\nstarts 0\n") != std::string::npos || buf.rfind("starts 0\n", 0) == 0))
+    return -1;
+  if (buf.find("\npaths ") != std::string::npos)
+    return 0;
+  return -1;
+}
+
 int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, const std::vector<Witness> &witnesses,
              const calls::Table &table, const std::string &file, unsigned line, int rc) {
   SMDiagnostic e2;
@@ -1236,6 +1273,7 @@ int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, cons
   for (const Witness &w : witnesses) {
     ws.push_back({w.seq, w.phi});
     client.keyedIn.push_back(w.keyed);
+    client.retsIn.push_back(clientRets(w));
   }
   auto bound = [](const char *name, unsigned dflt) {
     const char *v = std::getenv(name);
@@ -1244,27 +1282,71 @@ int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, cons
   client.bounds(bound("CLIENT_K", 2), bound("CLIENT_N", 64), bound("CLIENT_D", 2), bound("CLIENT_L", 2));
   // §3.9 정의 E: the same may analysis, with a store's line as the target and
   // the harness calls as the starts.
-  unsigned queries = 0, reached = 0;
+  unsigned queries = 0, reached = 0, probes = 0;
+  double queryMs = 0, probeMs = 0;
+  using Clock = std::chrono::steady_clock;
+  auto msSince = [](Clock::time_point t) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - t).count();
+  };
   const std::set<std::string> iface = Client::publicInterface(*down2, *up2, dir);
-  client.reach = [&](const std::string &f, unsigned l, const std::set<std::string> &starts)
-      -> std::optional<Client::Reached> {
+  client.reach = [&](const std::string &f, unsigned l, const std::set<std::string> &starts,
+                     int from) -> std::optional<Client::Reached> {
+    if (from >= Model::pathBudget(false))
+      return std::nullopt;
     ++queries;
+    const auto t0 = Clock::now();
+    struct Tally {
+      std::function<void()> f;
+      ~Tally() { f(); }
+    } tally{[&] {
+      double ms = msSince(t0);
+      queryMs += ms;
+      errs() << "query " << f << ":" << l << " starts " << starts.size() << " ms " << (long)ms << "\n";
+    }};
     Model m(*down2, *up2, f, l);
     m.interfaceNames = iface;
     m.startNames = starts;
+    m.exactStarts = true;
+    m.emitInputs = false;
     std::string buf;
     raw_string_ostream o(buf);
-    m.run(0, o);
+    m.run(from, o);
     o.flush();
+    if (const char *d = std::getenv("SP_DBG_REACH"); d && (f + ":" + std::to_string(l)).find(d) != std::string::npos)
+      errs() << "DBG_REACH " << f << ":" << l << " starts " << starts.size() << "\n" << buf << "DBG_REACH_END\n";
     std::istringstream in(buf);
     Witness w = parseWitness(in);
     if (w.seq.empty())
       return std::nullopt;
     ++reached;
-    return Client::Reached{w.seq, w.phi, w.keyed};
+    return Client::Reached{w.seq, w.phi, w.keyed, clientRets(w), w.index};
   };
+  client.probe = [&](const std::string &f, unsigned l, const std::set<std::string> &starts) {
+    ++probes;
+    const auto t0 = Clock::now();
+    int r = probeReach(*down2, *up2, iface, f, l, starts, true);
+    double ms = msSince(t0);
+    probeMs += ms;
+    errs() << "probe " << f << ":" << l << " starts " << starts.size() << " r " << r << " ms " << (long)ms << "\n";
+    return r;
+  };
+  std::map<std::tuple<std::string, unsigned, std::set<std::string>>, int> probedFrom;
+  client.probeFrom = [&](const std::string &f, unsigned l, const std::set<std::string> &starts) {
+    auto key = std::make_tuple(f, l, starts);
+    if (auto it = probedFrom.find(key); it != probedFrom.end())
+      return it->second;
+    ++probes;
+    const auto t0 = Clock::now();
+    int r = probeReach(*down2, *up2, iface, f, l, starts, true);
+    double ms = msSince(t0);
+    probeMs += ms;
+    errs() << "probe-from " << *starts.begin() << " " << f << ":" << l << " r " << r << " ms " << (long)ms << "\n";
+    return probedFrom[key] = r;
+  };
+  const auto planT0 = Clock::now();
   Client::Plan plan = client.plan(ws);
-  errs() << "establish queries " << queries << " reached " << reached << "\n";
+  errs() << "establish queries " << queries << " reached " << reached << " ms " << (long)queryMs << " probes "
+         << probes << " ms " << (long)probeMs << " plan ms " << (long)msSince(planT0) << "\n";
   std::error_code ec;
   {
     raw_fd_ostream cout((outDir / "client.txt").string(), ec);
@@ -1432,6 +1514,10 @@ int main(int argc, char **argv) {
   // I = header-declared exports (midpoint). I★ = entryCallable starts (P1).
   model.interfaceNames = Client::publicInterface(*down, *up, dir);
   model.startNames = Client::entryInterface(*down, *up, dir);
+  client.probe = [&, iface = model.interfaceNames](const std::string &f, unsigned l,
+                                                   const std::set<std::string> &starts) {
+    return probeReach(*down, *up, iface, f, l, starts);
+  };
   // P1 feasibility = φ SAT ∧ no open Definition-D dispatch edge.
   model.openDispatch = [&](const std::vector<Function *> &fn) {
     std::vector<std::string> seq;
@@ -1459,7 +1545,19 @@ int main(int argc, char **argv) {
     if (!w.seq.empty())
       witnesses.push_back(w);
     raw_fd_ostream all((outDir / "witnesses.txt").string(), ec);
-    for (int n = w.seq.empty() ? -1 : w.index + 1; n >= 0;) {
+    // Paths are enumerated in cost order and many satisfiable ones differ
+    // only inside; a witness is kept when its start or its edge into the
+    // sink is new. The scan ends at the path budget.
+    auto key = [](const Witness &x) {
+      size_t k = x.seq.size();
+      return std::make_tuple(x.seq.front(), k > 1 ? x.seq[k - 2] : std::string(), x.seq.back());
+    };
+    std::set<std::tuple<std::string, std::string, std::string>> kept;
+    if (!w.seq.empty())
+      kept.insert(key(w));
+    const char *wb = std::getenv("SP_WITNESS_PATHS");
+    const int scan = wb && *wb ? std::max(1, std::atoi(wb)) : 128;
+    for (int n = w.seq.empty() ? -1 : w.index + 1; n >= 0 && n < scan;) {
       Model next(*down, *up, file, line);
       next.interfaceNames = model.interfaceNames;
       next.startNames = model.startNames;
@@ -1472,9 +1570,11 @@ int main(int argc, char **argv) {
       Witness v = parseWitness(in);
       if (v.seq.empty())
         break;
+      n = v.index + 1;
+      if (!kept.insert(key(v)).second)
+        continue;
       all << buf;
       witnesses.push_back(v);
-      n = v.index + 1;
     }
   }
   calls::Table table = model.indirectTargets();

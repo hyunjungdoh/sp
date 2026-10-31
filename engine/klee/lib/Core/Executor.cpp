@@ -1945,7 +1945,9 @@ ExecutionState *Executor::selectConcolic() {
   runningSince = stats::instructions;
   std::tuple<unsigned, unsigned, uint64_t, std::uint32_t> best{
       ~0U, ~0U, ~0ULL, ~0U};
+  size_t pending = 0;
   for (ExecutionState *s : states) {
+    pending += s->pendingSeed;
     auto [gen, hunt, g] = orderKey(*s);
     std::tuple<unsigned, unsigned, uint64_t, std::uint32_t> k{
         gen, hunt, g, s->getID()};
@@ -1955,8 +1957,10 @@ ExecutionState *Executor::selectConcolic() {
     }
   }
   // A deferred input is a state of the same order kept outside memory: it
-  // runs when its key is the least and there is room for it.
-  if (!deferred.empty() && states.size() < ConcolicPending &&
+  // runs when its key is the least and there is room for it. Room is in the
+  // quantity prunePending bounds, the pending states; seeded states are not
+  // bounded by it, so counting them would leave no room ever.
+  if (!deferred.empty() && pending < ConcolicPending &&
       (!running || deferred.front().key < std::make_tuple(std::get<0>(best),
                                                           std::get<1>(best),
                                                           std::get<2>(best))))
