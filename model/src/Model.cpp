@@ -654,6 +654,11 @@ Witness parseWitness(std::istream &st) {
       w = Witness{};
       continue;
     }
+    if (head == "unsat") {
+      // φ UNSAT: the sequence is no witness.
+      rejected = true;
+      continue;
+    }
     if (w.index < 0)
       continue;
     if (head == "fn") {

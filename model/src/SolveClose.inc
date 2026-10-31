@@ -1894,8 +1894,32 @@
         cur[d] = make();
       }
     };
+    // The one constant the kept stores leave in a cell, for the entry state
+    // of the next step's path choice.
+    std::map<Cell, std::string> known;
+    auto forget = [&](const Cell &c) {
+      for (auto it = known.begin(); it != known.end();) {
+        const Cell &d = it->first;
+        bool below = d.first == c.first && d.second.size() > c.second.size() && d.second[c.second.size()].deref &&
+                     std::equal(c.second.begin(), c.second.end(), d.second.begin());
+        if (below || (d.first == c.first && sameBytes(d.second, c.second)))
+          it = known.erase(it);
+        else
+          ++it;
+      }
+    };
+    auto knownAt = [&](const Cell &c) -> const std::string * {
+      for (const auto &kv : known)
+        if (kv.first.first == c.first && sameBytes(kv.first.second, c.second))
+          return &kv.second;
+      return nullptr;
+    };
     for (size_t si = 0; si < mapped && si < seq.size(); ++si) {
       Function *SF = seq[si];
+      if (auto it = stepTested.find(si); it != stepTested.end())
+        for (const auto &[k, c] : it->second)
+          if (const std::string *v = knownAt(c))
+            entryKnownNext[si][k] = *v;
       std::vector<Instruction *> goals;
       if (si < stepGoal.size() && stepGoal[si])
         goals.push_back(stepGoal[si]);
@@ -2078,6 +2102,11 @@
           ensure(e->cell);
           cur[e->cell] = find(cur[e->src]);
           killBelow(e->cell);
+          const std::string *from = knownAt(e->src);
+          std::optional<std::string> v = from ? std::optional<std::string>(*from) : std::nullopt;
+          forget(e->cell);
+          if (v)
+            known[e->cell] = *v;
         } else if (e->kind == 's') {
           out << "store " << si;
           writeCell(e->cell);
@@ -2090,6 +2119,9 @@
           cur[e->cell] = id;
           allow(id, e->vals);
           killBelow(e->cell);
+          forget(e->cell);
+          if (e->vals.size() == 1)
+            known[e->cell] = *e->vals.begin();
         } else if (e->kind == 'd') {
           out << "define " << si;
           writeCell(e->cell);
@@ -2097,6 +2129,7 @@
           ensure(e->cell);
           cur[e->cell] = make();
           killBelow(e->cell);
+          forget(e->cell);
         } else if (e->kind == 'e') {
           out << "pre " << si;
           writeCell(e->cell);

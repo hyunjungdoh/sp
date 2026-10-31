@@ -470,7 +470,7 @@ private:
   /// (advanceCheckpoint); decisions before floor are not flipped again.
   /// Nothing is discarded for lack of memory.
   struct Deferred {
-    std::pair<unsigned, uint64_t> key; // orderKey of the deferred state
+    std::tuple<unsigned, unsigned, uint64_t> key; // orderKey of the deferred state
     unsigned floor;
     std::vector<KTest *> inputs; // the state's seeds, re-run together
     std::set<std::string> fixed;
@@ -528,11 +528,13 @@ private:
   /// falling back to T. Zero exactly when sinkDistance is.
   uint64_t sinkOrder(ExecutionState &state);
 
-  /// Concolic mode (DESIGN-D §6, order). The order key k = (gen, g) of a
-  /// state: its generation, then its sink order g (sinkOrder, or 1 without a
-  /// sink guide; an unreachable state sorts last). Selection takes the least
-  /// key, deferral the greatest.
-  std::pair<unsigned, uint64_t> orderKey(ExecutionState &state);
+  /// Concolic mode (DESIGN-D §6, order). The order key k = (gen, hunt, g) of a
+  /// state: its generation; then whether it still hunts a Π_I installer
+  /// (0 = already installed, 1 = still hunting) so a lineage that opened the
+  /// gate is not starved by siblings still approaching T_st; then its sink
+  /// order g (sinkOrder, or 1 without a sink guide; unreachable sorts last).
+  /// Selection takes the least key, deferral the greatest.
+  std::tuple<unsigned, unsigned, uint64_t> orderKey(ExecutionState &state);
 
   /// Concolic mode. The input-carrying state now running: it runs for a
   /// quantum of --batch-instructions, or until it ends, is deferred, or loses

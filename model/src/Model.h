@@ -76,6 +76,7 @@
 #include "Source.h"
 #include "../../engine/klee/include/klee/Support/CallTargets.h"
 
+#include "llvm/Analysis/PostDominators.h"
 #include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/Demangle/Demangle.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
@@ -141,6 +142,33 @@ struct Step {
 };
 
 using Suffix = std::vector<Step>;
+
+// Two suffixes name the same bytes. An offset of zero does not move the
+// address: a cast through an empty prefix, or the first field of an embedded
+// struct, is that step, and its dereference belongs to the next byte offset.
+inline bool sameBytes(const Suffix &a, const Suffix &b) {
+  auto norm = [](Suffix in) {
+    Suffix out;
+    for (size_t i = 0; i < in.size(); ++i) {
+      if (in[i].off == 0 && i + 1 < in.size()) {
+        in[i + 1].deref = in[i + 1].deref || in[i].deref;
+        continue;
+      }
+      out.push_back(in[i]);
+    }
+    return out;
+  };
+  Suffix x = norm(a), y = norm(b);
+  if (x.size() != y.size())
+    return false;
+  for (size_t i = 0; i < x.size(); ++i) {
+    if (x[i].off != y[i].off || x[i].deref != y[i].deref)
+      return false;
+    if (!x[i].deref && x[i].type != y[i].type)
+      return false;
+  }
+  return true;
+}
 
 // A constant GEP moves the address by a byte offset, and that offset is the
 // step whatever type the GEP indexes. A named struct source records the
@@ -1127,6 +1155,13 @@ class Model {
 
 
   bool solve(const std::vector<Function *> &seq, raw_ostream &out);
+  bool solveOnce(const std::vector<Function *> &seq, raw_ostream &out);
+  // §3.5 정의 P, entry state of a step: the cells its path tests (spelled as
+  // the path search spells them) and, of those, the ones φ's forward state
+  // holds at one constant when the step begins. solve repeats until the
+  // constants the path choice assumes are the ones φ computes.
+  std::map<size_t, std::map<std::string, std::pair<int, Suffix>>> stepTested;
+  std::map<size_t, std::map<std::string, std::string>> entryKnown, entryKnownNext;
 
 
   // Cells at the sequence entry whose bytes the sink's address, its length,

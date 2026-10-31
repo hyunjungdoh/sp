@@ -32,6 +32,7 @@
 
 #include <cstdio>
 #include <functional>
+#include <queue>
 #include <sstream>
 
 namespace {
@@ -1290,8 +1291,56 @@ const std::vector<std::string> &Client::compared(Function *F, unsigned i, const 
       rest[0] = x - p.off;
       return 1;
     };
+    // First byte of the text as a discriminator (e.g. _TIFFgetMode's
+    // switch(mode[0]) on 'r'/'w'/'a'): those constants are Cmp texts too.
+    // strcmp-style collection below misses them because they never reach a
+    // comparison call. Only small switches over the text itself: a large
+    // switch on file-magic bytes shares no strcmp site either, but is not a
+    // classification of this formal (auxiliary lemma T: same Cmp result).
+    auto addChar = [&](int64_t v) {
+      if (v <= 0 || v > 127 || out.size() >= 32)
+        return;
+      std::string s(1, (char)v);
+      if (seen.insert(s).second)
+        out.push_back(std::move(s));
+    };
+    auto loadOfText = [&](Value *V) -> bool {
+      V = V->stripPointerCasts();
+      while (auto *C = dyn_cast<CastInst>(V))
+        V = C->getOperand(0)->stripPointerCasts();
+      auto *L = dyn_cast<LoadInst>(V);
+      if (!L)
+        return false;
+      Value *P = L->getPointerOperand()->stripPointerCasts();
+      if (auto *GEP = dyn_cast<GEPOperator>(P)) {
+        for (auto It = GEP->idx_begin(), E = GEP->idx_end(); It != E; ++It) {
+          auto *CI = dyn_cast<ConstantInt>(It->get());
+          if (!CI || !CI->isZero())
+            return false;
+        }
+        P = GEP->getPointerOperand()->stripPointerCasts();
+      }
+      std::vector<int64_t> rest;
+      return relate(P, rest) == 0;
+    };
     for (Instruction &I : instructions(*G)) {
       std::vector<int64_t> rest;
+      if (auto *Sw = dyn_cast<SwitchInst>(&I)) {
+        if (loadOfText(Sw->getCondition())) {
+          unsigned n = 0;
+          for (auto &Case : Sw->cases()) {
+            int64_t v = Case.getCaseValue()->getSExtValue();
+            if (v <= 0 || v > 127 || ++n > 8) {
+              n = 100;
+              break;
+            }
+          }
+          if (n <= 8)
+            for (auto &Case : Sw->cases())
+              addChar(Case.getCaseValue()->getSExtValue());
+        }
+        continue;
+      }
       if (auto *S = dyn_cast<StoreInst>(&I)) {
         auto *Al = dyn_cast<AllocaInst>(S->getPointerOperand()->stripPointerCasts());
         bool spill = Al && Al->getAllocatedType()->isPointerTy();
@@ -3602,6 +3651,237 @@ std::vector<Function *> Client::harnessStarts(Function *E, Function *entry, cons
   return out;
 }
 
+// Φ_pre completion for establish sequences: a constant compare of a load of
+// a tag-settable field is a client obligation even when may dropped it.
+std::vector<Client::Keyed> Client::keyedGatesAlong(const std::vector<std::string> &seq, Function *E) const {
+  // Tag-dispatch setters (정의 3.8.4): store may live in a non-export
+  // (JPEGVSetField); climb callers to the interface vararg (TIFFSetField).
+  std::map<Field, std::vector<Keyed>> tagSetters;
+  std::unordered_map<Function *, std::vector<Function *>> callersOf;
+  for (const auto &kv : bodies) {
+    Function *F = kv.second;
+    if (!F)
+      continue;
+    for (Function *C : calls.count(F) ? calls.at(F) : FnSet{})
+      callersOf[C].push_back(F);
+    // Also index by callee of each call site (calls map is callees-of-F).
+  }
+  callersOf.clear();
+  for (const auto &kv : bodies) {
+    Function *F = kv.second;
+    if (!F)
+      continue;
+    auto it = calls.find(F);
+    if (it == calls.end())
+      continue;
+    for (Function *C : it->second)
+      callersOf[C].push_back(F);
+  }
+  auto oneFormal = [&](Value *V) -> Argument * {
+    std::unordered_set<const Value *> seen;
+    std::vector<Value *> st{V};
+    Argument *found = nullptr;
+    while (!st.empty()) {
+      Value *X = st.back();
+      st.pop_back();
+      if (!X || !seen.insert(X).second)
+        continue;
+      if (auto *A = dyn_cast<Argument>(X->stripPointerCasts())) {
+        if (found && found != A)
+          return nullptr;
+        found = A;
+        continue;
+      }
+      if (auto *C = dyn_cast<CastInst>(X)) {
+        st.push_back(C->getOperand(0));
+        continue;
+      }
+      if (auto *L = dyn_cast<LoadInst>(X)) {
+        auto *Al = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts());
+        if (Al) {
+          for (User *U : Al->users()) {
+            auto *St = dyn_cast<StoreInst>(U);
+            if (St && St->getPointerOperand()->stripPointerCasts() == Al)
+              st.push_back(St->getValueOperand());
+          }
+          continue;
+        }
+        st.push_back(L->getPointerOperand());
+        continue;
+      }
+      if (auto *G = dyn_cast<GEPOperator>(X)) {
+        st.push_back(G->getPointerOperand());
+        continue;
+      }
+    }
+    return found;
+  };
+  for (const auto &kv : bodies) {
+    Function *F = kv.second;
+    if (!F || F->isDeclaration())
+      continue;
+    for (BasicBlock &BB : *F) {
+      auto *Sw = dyn_cast<SwitchInst>(BB.getTerminator());
+      if (!Sw)
+        continue;
+      Argument *tagArg = oneFormal(Sw->getCondition());
+      if (!tagArg || tagArg->getParent() != F)
+        continue;
+      for (auto &Case : Sw->cases()) {
+        if (Case.getCaseValue()->getBitWidth() > 64)
+          continue;
+        int64_t tagV = Case.getCaseValue()->getSExtValue();
+        std::unordered_set<const BasicBlock *> reach{Case.getCaseSuccessor()};
+        std::vector<const BasicBlock *> st{Case.getCaseSuccessor()};
+        while (!st.empty()) {
+          const BasicBlock *B = st.back();
+          st.pop_back();
+          for (const BasicBlock *S : successors(B))
+            if (reach.insert(S).second)
+              st.push_back(S);
+        }
+        auto viaVa = [](Value *V) {
+          std::vector<Value *> st{V};
+          std::unordered_set<const Value *> seen;
+          while (!st.empty()) {
+            Value *X = st.back();
+            st.pop_back();
+            if (!X || !seen.insert(X).second)
+              continue;
+            if (isa<VAArgInst>(X))
+              return true;
+            if (auto *C = dyn_cast<CastInst>(X)) {
+              st.push_back(C->getOperand(0));
+              continue;
+            }
+            if (auto *P = dyn_cast<PHINode>(X)) {
+              for (Value *in : P->incoming_values())
+                st.push_back(in);
+              continue;
+            }
+            if (auto *L = dyn_cast<LoadInst>(X)) {
+              st.push_back(L->getPointerOperand());
+              continue;
+            }
+            if (auto *G = dyn_cast<GEPOperator>(X)) {
+              std::string ty;
+              raw_string_ostream os(ty);
+              G->getSourceElementType()->print(os);
+              if (ty.find("va_list") != std::string::npos)
+                return true;
+              st.push_back(G->getPointerOperand());
+            }
+          }
+          return false;
+        };
+        for (const BasicBlock *B : reach) {
+          for (Instruction &I : *const_cast<BasicBlock *>(B)) {
+            auto *S = dyn_cast<StoreInst>(&I);
+            if (!S || !viaVa(S->getValueOperand()))
+              continue;
+            Argument *objArg = oneFormal(S->getPointerOperand());
+            if (!objArg || objArg->getParent() != F)
+              continue;
+            for (const auto &f : fieldsOf(const_cast<Value *>(S->getPointerOperand()))) {
+              // Climb to an interface vararg that carries obj and tag.
+              struct Node {
+                Function *fn;
+                Argument *obj;
+                Argument *tag;
+              };
+              std::queue<Node> q;
+              std::unordered_set<Function *> seenFn;
+              q.push({F, objArg, tagArg});
+              while (!q.empty()) {
+                Node n = q.front();
+                q.pop();
+                if (!seenFn.insert(n.fn).second)
+                  continue;
+                if (ifaceD.count(n.fn) && n.fn->isVarArg() && n.obj && n.tag) {
+                  Keyed k;
+                  k.fn = n.fn->getName().str();
+                  k.obj = n.obj->getArgNo();
+                  k.tag = (int)n.tag->getArgNo();
+                  k.tagV = tagV;
+                  k.va = true;
+                  k.root = 0;
+                  k.path = {f.first};
+                  k.off = f.second;
+                  tagSetters[f].push_back(k);
+                  break;
+                }
+                auto cit = callersOf.find(n.fn);
+                if (cit == callersOf.end())
+                  continue;
+                for (Function *C : cit->second) {
+                  // Conservative: same arg positions when climbing thin wrappers.
+                  if (n.obj->getArgNo() < C->arg_size() && n.tag->getArgNo() < C->arg_size())
+                    q.push({C, C->getArg(n.obj->getArgNo()), C->getArg(n.tag->getArgNo())});
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  std::vector<Keyed> out;
+  auto add = [&](Keyed k, const std::string &op, int64_t v) {
+    k.preds = {{op, v}};
+    Function *Setter = body(k.fn);
+    if (!Setter)
+      return;
+    auto sw = signature(Setter);
+    auto aw = irParams(Setter);
+    std::string T = heldType(E, 0);
+    if (k.obj < aw.size() && aw[k.obj] >= 0 && !T.empty() && sw[aw[k.obj]].type == T)
+      k.root = 0;
+    else {
+      auto sig = signature(E);
+      for (size_t i = 0; i < sig.size(); ++i)
+        if (held(sig[i]) && k.obj < aw.size() && aw[k.obj] >= 0 && sig[i].type == sw[aw[k.obj]].type) {
+          k.root = (int)i;
+          break;
+        }
+    }
+    for (const Keyed &o : out)
+      if (o.fn == k.fn && o.tag == k.tag && o.tagV == k.tagV && o.preds == k.preds)
+        return;
+    out.push_back(std::move(k));
+  };
+  for (const std::string &n : seq) {
+    Function *F = body(n);
+    if (!F)
+      continue;
+    for (Instruction &I : instructions(*F)) {
+      auto *Cmp = dyn_cast<ICmpInst>(&I);
+      // Only EQ: NE on the same field is the complementary branch and would
+      // install an excluding key (e.g. JPEGCOLORMODE != RGB) that fights the
+      // enabling one. The harness oneOf already allows skipping the setter.
+      if (!Cmp || Cmp->getPredicate() != ICmpInst::ICMP_EQ)
+        continue;
+      for (int side = 0; side < 2; ++side) {
+        Value *A = const_cast<Value *>(Cmp->getOperand((unsigned)side)->stripPointerCasts());
+        while (auto *C = dyn_cast<CastInst>(A))
+          A = const_cast<Value *>(C->getOperand(0)->stripPointerCasts());
+        auto *L = dyn_cast<LoadInst>(A);
+        auto *CI = dyn_cast<ConstantInt>(Cmp->getOperand(1u - (unsigned)side));
+        if (!L || !CI || CI->getBitWidth() > 64)
+          continue;
+        int64_t v = CI->getSExtValue();
+        for (const auto &f : fieldsOf(const_cast<Value *>(L->getPointerOperand()))) {
+          auto it = tagSetters.find(f);
+          if (it == tagSetters.end())
+            continue;
+          for (const Keyed &base : it->second)
+            add(base, "=", v);
+        }
+      }
+    }
+  }
+  return out;
+}
+
 // §3.9 정의 E. The plan of the may sequence from starts to the line, if one
 // is satisfiable and its plan passes. A query met again while it is being
 // computed is a cycle and does not establish (least fixed point).
@@ -3767,15 +4047,28 @@ bool Client::establishedBy(Function *E, Function *entry, const Cell &c, const Wi
       }
     }
   }
-  if (nonConst || satisfies("0", c) || !reach)
-    return up || anySat;
+  // Definition E before the nonConst short-circuit. A field that also has
+  // non-constant stores used to return here with Construct and no via plan,
+  // dropping the path conditions of the constant store (including client
+  // keyed setters that dominate it). Prefer a passing establish of S+ when
+  // one exists; only then fall back to up/anySat.
+  // Lemma E: when S+ is non-empty, Construct requires a passing establish
+  // sequence to one of those stores. Falling back to anySat after every
+  // sequence failed would mark unrealizable installers Construct (e.g.
+  // jinit_merged when every path to its store is open).
   std::sort(plus.begin(), plus.end());
   plus.erase(std::unique(plus.begin(), plus.end()), plus.end());
-  for (const auto &[file, line] : plus)
-    if ((via = established(file, line, starts))) {
-      at = file + ":" + std::to_string(line);
-      return true;
-    }
+  if (reach) {
+    for (const auto &[file, line] : plus)
+      if ((via = established(file, line, starts))) {
+        at = file + ":" + std::to_string(line);
+        return true;
+      }
+    if (!plus.empty())
+      return false;
+  }
+  if (nonConst || satisfies("0", c) || !reach)
+    return up || anySat;
   return false;
 }
 
@@ -3973,8 +4266,46 @@ Client::WitnessPlan Client::realize(Function *E, const std::vector<Cell> &phi, c
     W.cells[i].how = Realize::Open;
   // 정의 E: a cell a store establishes brings the calls the reaching
   // sequence's plan realizes; the merged cover stays within the K slots.
+  // A via plan that reaches S+ under a φ incompatible with this witness
+  // (same field, conflicting atoms) does not establish — otherwise exclusive
+  // library branches (e.g. fancy=0 only on raw, jinit_merged only on !raw)
+  // would each pass in isolation and wrongly Compose as Construct.
+  auto cellClash = [&](const Cell &a, const Cell &b) {
+    if (a.type != b.type || a.off != b.off)
+      return false;
+    if (a.op == "=" && b.op == "=") {
+      for (const std::string &v : a.values)
+        if (satisfies(v, b))
+          return false;
+      return !a.values.empty() && !b.values.empty();
+    }
+    if (a.op == "=" && b.op == "!=") {
+      for (const std::string &v : a.values)
+        if (satisfies(v, b))
+          return false;
+      return !a.values.empty();
+    }
+    if (a.op == "!=" && b.op == "=") {
+      for (const std::string &v : b.values)
+        if (satisfies(v, a))
+          return false;
+      return !b.values.empty();
+    }
+    return false;
+  };
   for (const auto &[i, v] : vias) {
     const auto &[via, where] = v;
+    bool clash = false;
+    for (const Realized &vr : via->cells)
+      for (const Realized &wr : W.cells)
+        if (cellClash(vr.cell, wr.cell)) {
+          clash = true;
+          break;
+        }
+    if (clash) {
+      W.cells[i].how = Realize::Open;
+      continue;
+    }
     std::vector<Function *> cover = W.cover;
     for (Function *F : via->cover)
       if (std::find(cover.begin(), cover.end(), F) == cover.end())
@@ -3986,6 +4317,13 @@ Client::WitnessPlan Client::realize(Function *E, const std::vector<Cell> &phi, c
     W.cover = cover;
     for (const auto &[F, k] : via->keyed)
       addKeyed(F, k);
+    // Φ_pre / 정의 3.8.4: may can leave a keyed-only field out of residual φ
+    // when both sides of a branch still reach the goal (so the branch is not
+    // a sequence condition). The establish sequence still loads and tests
+    // that field; expose the matching key setter so the harness can set it.
+    for (const Keyed &k : keyedGatesAlong(via->seq, E))
+      if (realizable(E, k) && admitted(body(k.fn)))
+        addKeyed(body(k.fn), k);
     W.levers.insert(W.levers.end(), via->levers.begin(), via->levers.end());
     std::string line = where + " via";
     for (const std::string &n : via->seq)
@@ -4512,20 +4850,30 @@ struct Builder {
   }
 
   // A text the client chooses among representatives of the classes the
-  // library can tell apart: a fresh short string and each of the given
-  // texts. Each is a writable copy.
+  // library can tell apart. Single-character Cmp constants (e.g. open mode
+  // "r" from switch(mode[0])) come first so the seed path opens; then a
+  // fresh short string; then longer Cmp/Open constants (paths, keys). Fresh
+  // before long names preserves seed paths that already reached without a
+  // mode discriminator (Magick/HEIF).
   Value *text(IRBuilder<> &B, const std::vector<std::string> &named) {
     if (named.empty())
       return text(B);
     AllocaInst *slot = entryAlloca(B, PointerType::get(ctx, 0));
     std::vector<std::function<void(IRBuilder<> &)>> alts;
-    alts.push_back([&, slot](IRBuilder<> &C) { C.CreateStore(text(C), slot); });
-    for (const std::string &s : named)
+    auto addNamed = [&](const std::string &s) {
       alts.push_back([&, slot, s](IRBuilder<> &C) {
         Value *p = C.CreateCall(mallocF, {C.getInt64(s.size() + 1)});
         C.CreateCall(memcpyF, {p, C.CreateGlobalStringPtr(s), C.getInt64(s.size() + 1)});
         C.CreateStore(p, slot);
       });
+    };
+    for (const std::string &s : named)
+      if (s.size() == 1)
+        addNamed(s);
+    alts.push_back([&, slot](IRBuilder<> &C) { C.CreateStore(text(C), slot); });
+    for (const std::string &s : named)
+      if (s.size() != 1)
+        addNamed(s);
     oneOf(B, alts, "text");
     return B.CreateLoad(PointerType::get(ctx, 0), slot);
   }
@@ -4551,7 +4899,9 @@ struct Builder {
 
   // A harness function of type FT: the most general callback the client
   // passes. Its shape decides its effect. A read, (buffer, length) returning
-  // a count, fills a non-null buffer with the next input bytes. A function
+  // a count, fills a non-null buffer with the next input bytes. A seek,
+  // (handle, offset, whence), moves the input cursor. A size (handle)→i64
+  // returns the input bound; a close (handle)→i32 returns 0. A function
   // whose declared result is a pointer of source type returns a client
   // value of that type, which 'result' builds (key names the declared
   // type). Another function returning a pointer returns fresh memory as
@@ -4603,22 +4953,51 @@ struct Builder {
       Argument *buf = F->getArg(i), *len = F->getArg(i + 1);
       if (!buf->getType()->isPointerTy() || !len->getType()->isIntegerTy())
         continue;
+      // Seek is (handle, offset, whence): ptr then two ints. That is not a
+      // read — the middle integer is a file position, not a byte count.
+      if (i == 0 && i + 2 < F->arg_size() && F->getArg(i + 2)->getType()->isIntegerTy())
+        continue;
       Value *at = B.CreateLoad(B.getInt64Ty(), cursor);
       Value *left = B.CreateSub(B.getInt64(n), at);
       Value *want = B.CreateSExtOrTrunc(len, B.getInt64Ty());
       Value *neg = B.CreateICmpSLT(want, B.getInt64(0));
       want = B.CreateSelect(neg, B.getInt64(0), want);
-      Value *n = B.CreateSelect(B.CreateICmpULT(want, left), want, left);
-      n = B.CreateSelect(B.CreateIsNull(buf), B.getInt64(0), n);
+      Value *got = B.CreateSelect(B.CreateICmpULT(want, left), want, left);
+      got = B.CreateSelect(B.CreateIsNull(buf), B.getInt64(0), got);
       auto *copy = BasicBlock::Create(ctx, "copy", F), *done = BasicBlock::Create(ctx, "done", F);
       B.CreateCondBr(B.CreateIsNull(buf), done, copy);
       B.SetInsertPoint(copy);
-      B.CreateCall(memcpyF, {buf, B.CreateGEP(B.getInt8Ty(), data, at), n});
+      B.CreateCall(memcpyF, {buf, B.CreateGEP(B.getInt8Ty(), data, at), got});
       B.CreateBr(done);
       B.SetInsertPoint(done);
-      B.CreateStore(B.CreateAdd(at, n), cursor);
-      count = n;
+      B.CreateStore(B.CreateAdd(at, got), cursor);
+      count = got;
       break;
+    }
+    // Seek (handle, off, whence) → new cursor in the input, like POSIX lseek.
+    if (!count && F->arg_size() == 3 && F->getArg(0)->getType()->isPointerTy() &&
+        F->getArg(1)->getType()->isIntegerTy() && F->getArg(2)->getType()->isIntegerTy() &&
+        R->isIntegerTy()) {
+      Value *off = B.CreateSExtOrTrunc(F->getArg(1), B.getInt64Ty());
+      Value *w = B.CreateSExtOrTrunc(F->getArg(2), B.getInt64Ty());
+      Value *cur = B.CreateLoad(B.getInt64Ty(), cursor);
+      Value *base = B.CreateSelect(B.CreateICmpEQ(w, B.getInt64(1)), cur,
+                                   B.CreateSelect(B.CreateICmpEQ(w, B.getInt64(2)), B.getInt64(n), B.getInt64(0)));
+      Value *to = B.CreateAdd(base, off);
+      to = B.CreateSelect(B.CreateICmpSLT(to, B.getInt64(0)), B.getInt64(0), to);
+      to = B.CreateSelect(B.CreateICmpUGT(to, B.getInt64(n)), B.getInt64(n), to);
+      B.CreateStore(to, cursor);
+      B.CreateRet(B.CreateSExtOrTrunc(to, R));
+      return F;
+    }
+    // Size (handle) → input bound. Close (handle) → 0. Distinguish by width:
+    // TIFFSizeProc is toff_t (i64); TIFFCloseProc is int (i32).
+    if (!count && F->arg_size() == 1 && F->getArg(0)->getType()->isPointerTy() && R->isIntegerTy()) {
+      if (R->getIntegerBitWidth() >= 64)
+        B.CreateRet(B.CreateZExtOrTrunc(B.getInt64(n), R));
+      else
+        B.CreateRet(ConstantInt::get(R, 0));
+      return F;
     }
     if (R->isVoidTy())
       B.CreateRetVoid();
@@ -5810,8 +6189,6 @@ void Client::emit(const Plan &P, Module &H) const {
           break;
         }
       } else if (auto bs = boundBy(F, i); T->isIntegerTy() && !bs.empty()) {
-        v = K.symbolic(C, T, "length");
-        lengths.push_back({cast<CallInst>(cast<Instruction>(v)->getPrevNode()), bs});
         // The length counts elements or bytes; either way it stays within
         // a buffer when it is at most the element count: a buffer of N
         // bytes, a text of L characters, or the one object V-Obj builds. It
@@ -5827,7 +6204,23 @@ void Client::emit(const Plan &P, Module &H) const {
           }
           n = std::min(n, nb);
         }
-        K.require(C, C.CreateICmpULE(v, ConstantInt::get(T, n)));
+        // Choice 0 = full buffer: a zero length satisfies ule n but libraries
+        // treat it as empty I/O (e.g. TIFFReadEncodedStrip size→0 skips
+        // decode). Seed must exercise the bounded call; symbolic covers the
+        // rest of {0..n}.
+        AllocaInst *lenSlot = K.entryAlloca(C, T);
+        std::vector<std::function<void(IRBuilder<> &)>> lenAlts;
+        lenAlts.push_back([&, lenSlot, T, n](IRBuilder<> &A) {
+          A.CreateStore(ConstantInt::get(T, n), lenSlot);
+        });
+        lenAlts.push_back([&, lenSlot, T, n, bs](IRBuilder<> &A) {
+          Value *s = K.symbolic(A, T, "length");
+          lengths.push_back({cast<CallInst>(cast<Instruction>(s)->getPrevNode()), bs});
+          K.require(A, A.CreateICmpULE(s, ConstantInt::get(T, n)));
+          A.CreateStore(s, lenSlot);
+        });
+        K.oneOf(C, lenAlts, "length");
+        v = C.CreateLoad(T, lenSlot);
       } else {
         v = K.symbolic(C, T, "arg");
         plainArg = true;

@@ -567,6 +567,9 @@ private:
   bool establishedBy(Function *E, Function *entry, const Cell &c, const WitnessPlan *&via, std::string &at) const;
   std::vector<Function *> harnessStarts(Function *E, Function *entry, const Cell &c) const;
   const WitnessPlan *established(const std::string &file, unsigned line, const std::vector<Function *> &starts) const;
+  // Key setters for fields that an establish sequence compares against a
+  // constant (Φ_pre held cells may omitted when both branch sides reach).
+  std::vector<Keyed> keyedGatesAlong(const std::vector<std::string> &seq, Function *E) const;
   // Per query (file, line, starts): absent while computing (a cycle), then
   // the plan of the reaching sequence when it passes, else null.
   mutable std::map<std::tuple<std::string, unsigned, std::set<std::string>>, std::unique_ptr<WitnessPlan>> estOf;

@@ -1924,11 +1924,17 @@ uint64_t Executor::sinkOrder(ExecutionState &state) {
                               sinkDistance(state));
 }
 
-std::pair<unsigned, uint64_t> Executor::orderKey(ExecutionState &state) {
+std::tuple<unsigned, unsigned, uint64_t>
+Executor::orderKey(ExecutionState &state) {
+  // hunt=0 once an sp.st installer has run: that lineage must advance to the
+  // sink ahead of siblings still minimizing T_st (otherwise D_st + g_sink
+  // puts every installed state behind every hunter, and the gate that just
+  // opened never reaches the decoder).
+  unsigned hunt = state.stInstalled ? 0u : 1u;
   if (!statsTracker || !userSearcherRequiresSink() || state.stack.empty())
-    return {state.gen, 1};
+    return {state.gen, hunt, 1};
   uint64_t g = sinkOrder(state);
-  return {state.gen, g ? g : ~0ULL};
+  return {state.gen, hunt, g ? g : ~0ULL};
 }
 
 ExecutionState *Executor::selectConcolic() {
@@ -1937,10 +1943,12 @@ ExecutionState *Executor::selectConcolic() {
     return running;
   running = nullptr;
   runningSince = stats::instructions;
-  std::tuple<unsigned, uint64_t, std::uint32_t> best{~0U, ~0ULL, ~0U};
+  std::tuple<unsigned, unsigned, uint64_t, std::uint32_t> best{
+      ~0U, ~0U, ~0ULL, ~0U};
   for (ExecutionState *s : states) {
-    auto [gen, g] = orderKey(*s);
-    std::tuple<unsigned, uint64_t, std::uint32_t> k{gen, g, s->getID()};
+    auto [gen, hunt, g] = orderKey(*s);
+    std::tuple<unsigned, unsigned, uint64_t, std::uint32_t> k{
+        gen, hunt, g, s->getID()};
     if (!running || k < best) {
       best = k;
       running = s;
@@ -1949,8 +1957,9 @@ ExecutionState *Executor::selectConcolic() {
   // A deferred input is a state of the same order kept outside memory: it
   // runs when its key is the least and there is room for it.
   if (!deferred.empty() && states.size() < ConcolicPending &&
-      (!running ||
-       deferred.front().key < std::make_pair(std::get<0>(best), std::get<1>(best))))
+      (!running || deferred.front().key < std::make_tuple(std::get<0>(best),
+                                                          std::get<1>(best),
+                                                          std::get<2>(best))))
     running = nullptr;
   return running;
 }
@@ -2026,6 +2035,11 @@ void Executor::spawnGateFlips(ExecutionState &state, const ref<Expr> &cond,
                           BranchType::Conditional);
     ++stats::forks;
     makePending(*gs, parent);
+    // A gate state is the path the static analysis proved selects the
+    // installer, not a further generation of the search: it keeps the
+    // generation of the path it splits from, so it is ordered by its (short)
+    // distance among that path's peers instead of behind all of them.
+    gs->gen = state.gen;
     addConstraint(*gs, gate);
     ++ledger.flips;
     ++ledger.gates;
@@ -2034,7 +2048,8 @@ void Executor::spawnGateFlips(ExecutionState &state, const ref<Expr> &cond,
 }
 
 void Executor::prunePending() {
-  std::vector<std::pair<std::pair<unsigned, uint64_t>, ExecutionState *>>
+  std::vector<
+      std::pair<std::tuple<unsigned, unsigned, uint64_t>, ExecutionState *>>
       pending;
   for (ExecutionState *s : states)
     if (s->pendingSeed)
@@ -2144,7 +2159,7 @@ void Executor::respawn() {
   ExecutionState *s = pristine->branch();
   executionTree->attach(pristine->executionTreeNode, s, pristine,
                         BranchType::NONE);
-  s->gen = d.key.first;
+  s->gen = std::get<0>(d.key);
   s->floor = d.floor;
   s->fixed = d.fixed; // the inputs already hold these objects' values
   addedStates.push_back(s);
@@ -4503,7 +4518,8 @@ bool Executor::checkMemoryUsage() {
     // Nothing is discarded: states are replaced by their inputs, greatest
     // order key first. The running state is not deferred, so the search
     // makes progress.
-    std::vector<std::pair<std::pair<unsigned, uint64_t>, ExecutionState *>>
+    std::vector<
+        std::pair<std::tuple<unsigned, unsigned, uint64_t>, ExecutionState *>>
         order;
     for (ExecutionState *s : arr)
       if (s != running)
