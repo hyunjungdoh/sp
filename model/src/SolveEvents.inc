@@ -1063,6 +1063,10 @@
         char kind = 'e';
         std::string v;
         std::set<std::string> ne;
+        // For a produced value: the call whose result the step stored, and
+        // the constants the path held at that store.
+        const CallBase *from = nullptr;
+        std::shared_ptr<const std::map<std::string, Val>> at;
       };
       using State = std::map<std::string, Val>;
       std::map<size_t, std::pair<Function *, std::unordered_set<const BasicBlock *>>> stepChoice;
@@ -1125,10 +1129,26 @@
       // entry of the next step). On a path that meets it, need becomes the
       // requirement at this step's entry.
       std::map<std::string, std::pair<int, Suffix>> testedAt;
-      auto feasiblePath = [&](Function *F, const std::unordered_set<Instruction *> &goals, Mem &m,
-                              const std::unordered_set<const BasicBlock *> &shortest, State *need, size_t si,
-                              Instruction **hit)
-          -> std::unordered_set<const BasicBlock *> {
+      // A callee searched for the requirement a returned value puts on its
+      // entry is not a step: it has no step index.
+      constexpr size_t calleeStep = std::numeric_limits<size_t>::max();
+      // The callees under search; a callee already among them is not entered
+      // again, which bounds the search by the call graph's acyclic paths.
+      std::vector<Function *> searching;
+      bool fpTrivial = false;
+      // The constants the caller's path holds at the call, for the callee
+      // search to start from.
+      const State *calleeSeed = nullptr;
+      std::function<std::unordered_set<const BasicBlock *>(Function *, const std::unordered_set<Instruction *> &, Mem &,
+                                                           const std::unordered_set<const BasicBlock *> &, State *,
+                                                           size_t, Instruction **)>
+          feasiblePath;
+      feasiblePath = [&](Function *F, const std::unordered_set<Instruction *> &goals, Mem &m,
+                         const std::unordered_set<const BasicBlock *> &shortest, State *need, size_t si,
+                         Instruction **hit) -> std::unordered_set<const BasicBlock *> {
+        fpTrivial = false;
+        const State *callerKnown = si == calleeStep ? calleeSeed : nullptr;
+        calleeSeed = nullptr;
         Instruction *reached = nullptr;
         struct HitOut {
           Instruction **out;
@@ -1152,10 +1172,14 @@
           testedAt.emplace(k, std::make_pair(c.arg, c.suf));
           return true;
         };
+        // An atom is an equation or disequation of a cell, or a relational
+        // test of a cell against a constant.
         struct Atom {
           std::string key;
-          bool eq;
+          bool eq = true;
           std::string v;
+          int rel = -1; // ICmpInst::Predicate when >= 0; else EQ/NE via eq
+          bool never = false; // the edge's condition is a constant it disagrees with
         };
         auto loadKey = [&](Value *V, std::string &k) {
           while (auto *C = dyn_cast<CastInst>(V))
@@ -1163,54 +1187,216 @@
           auto *L = dyn_cast<LoadInst>(V);
           return L && keyOf(L->getPointerOperand(), k) && k.find('|') != std::string::npos;
         };
-        std::function<void(Value *, bool, std::vector<Atom> &)> atoms = [&](Value *V, bool need, std::vector<Atom> &out) {
-          while (auto *C = dyn_cast<CastInst>(V))
-            V = C->getOperand(0);
+        // A branch operand is the value the path sees. With onPath a φ is
+        // the arm the path took; without it every arm is taken, so the
+        // tested cells contain those of each path.
+        using OnPath = std::function<bool(const BasicBlock *)>;
+        std::function<void(Value *, bool, std::vector<Atom> &, const OnPath *, Instruction *)> atoms;
+        atoms = [&](Value *V, bool need, std::vector<Atom> &out, const OnPath *onPath, Instruction *at) {
+          std::unordered_set<Value *> seen;
+          std::function<Value *(Value *)> peel = [&](Value *X) -> Value * {
+            if (!X || !seen.insert(X).second)
+              return X;
+            while (auto *C = dyn_cast<CastInst>(X))
+              X = C->getOperand(0);
+            if (auto *P = dyn_cast<PHINode>(X)) {
+              if (onPath) {
+                Value *pick = nullptr;
+                unsigned best = 0;
+                bool any = false;
+                std::unordered_map<const BasicBlock *, unsigned> dist;
+                {
+                  std::queue<const BasicBlock *> q;
+                  const BasicBlock *entry = &F->getEntryBlock();
+                  if ((*onPath)(entry)) {
+                    dist[entry] = 0;
+                    q.push(entry);
+                  }
+                  while (!q.empty()) {
+                    const BasicBlock *B = q.front();
+                    q.pop();
+                    for (const BasicBlock *S : successors(B)) {
+                      if (!(*onPath)(S) || dist.count(S))
+                        continue;
+                      dist[S] = dist[B] + 1;
+                      q.push(S);
+                    }
+                  }
+                }
+                for (unsigned i = 0; i < P->getNumIncomingValues(); ++i) {
+                  auto it = dist.find(P->getIncomingBlock(i));
+                  if (it == dist.end())
+                    continue;
+                  if (!any || it->second >= best) {
+                    any = true;
+                    best = it->second;
+                    pick = P->getIncomingValue(i);
+                  }
+                }
+                if (pick)
+                  return peel(pick);
+              }
+              return P;
+            }
+            if (auto *Sel = dyn_cast<SelectInst>(X)) {
+              if (Value *C = peel(Sel->getCondition())) {
+                if (auto *CI = dyn_cast<ConstantInt>(C))
+                  return peel(CI->isZero() ? Sel->getFalseValue() : Sel->getTrueValue());
+                if (isa<ConstantPointerNull>(C))
+                  return peel(Sel->getFalseValue());
+              }
+              return Sel;
+            }
+            if (auto *L = dyn_cast<LoadInst>(X)) {
+              auto *A = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts());
+              if (!A)
+                return L;
+              // A frame slot is a cell of the path state. On a path its value
+              // is the last store the path executed, which need not dominate
+              // the use: `downsampled_output = 1` sits in one arm, `= 0` in the
+              // block that dominates the test.
+              std::vector<StoreInst *> st;
+              for (User *U : A->users())
+                if (auto *S = dyn_cast<StoreInst>(U); S && S->getPointerOperand()->stripPointerCasts() == A)
+                  st.push_back(S);
+              if (onPath && at) {
+                const BasicBlock *AB = at->getParent();
+                auto before = [&](StoreInst *S) {
+                  if (dominatesBefore(S, at))
+                    return true;
+                  const BasicBlock *SB = S->getParent();
+                  if (SB == AB || !(*onPath)(SB))
+                    return false;
+                  for (const BasicBlock *T : successors(AB))
+                    if (T == SB)
+                      return false;
+                  return true;
+                };
+                StoreInst *last = nullptr;
+                bool clear = true;
+                for (StoreInst *S : st) {
+                  if (!before(S))
+                    continue;
+                  if (!last || dominatesBefore(last, S))
+                    last = S;
+                  else if (!dominatesBefore(S, last))
+                    clear = false;
+                }
+                if (last && clear)
+                  for (StoreInst *S : st)
+                    if (S != last && before(S) && !dominatesBefore(S, last))
+                      clear = false;
+                if (last)
+                  return clear ? peel(last->getValueOperand()) : L;
+                return L;
+              }
+              StoreInst *best = nullptr;
+              for (StoreInst *S : st) {
+                if (at && !dominatesBefore(S, at))
+                  continue;
+                if (!best || dominatesBefore(best, S))
+                  best = S;
+              }
+              return best ? peel(best->getValueOperand()) : L;
+            }
+            return X;
+          };
+          V = peel(V);
+          if (!V)
+            return;
+          if (auto *P = dyn_cast<PHINode>(V)) {
+            if (!onPath) {
+              for (unsigned i = 0; i < P->getNumIncomingValues(); ++i)
+                atoms(P->getIncomingValue(i), need, out, onPath, at);
+            }
+            return;
+          }
           std::string k;
           if (boolLoad(V)) {
             if (loadKey(V, k))
-              out.push_back({k, true, need ? "1" : "0"});
+              out.push_back({k, true, need ? "1" : "0", -1});
             return;
           }
           if (auto *BO = dyn_cast<BinaryOperator>(V)) {
             auto *One = dyn_cast<ConstantInt>(BO->getOperand(1));
             if (BO->getOpcode() == Instruction::Xor && One && One->isOne())
-              atoms(BO->getOperand(0), !need, out);
-            else if ((need && BO->getOpcode() == Instruction::And) || (!need && BO->getOpcode() == Instruction::Or)) {
-              atoms(BO->getOperand(0), need, out);
-              atoms(BO->getOperand(1), need, out);
+              atoms(BO->getOperand(0), !need, out, onPath, at);
+            else if ((need && BO->getOpcode() == Instruction::And) ||
+                     (!need && BO->getOpcode() == Instruction::Or)) {
+              atoms(BO->getOperand(0), need, out, onPath, at);
+              atoms(BO->getOperand(1), need, out, onPath, at);
             }
+            return;
+          }
+          // A path-resolved constant constrains no cell, but the edge it
+          // disagrees with is not on any execution of this path.
+          if (auto *CK = dyn_cast<ConstantInt>(V)) {
+            if (onPath && CK->isZero() == need)
+              out.push_back(Atom{"", true, "", -1, true});
             return;
           }
           auto *Cmp = dyn_cast<ICmpInst>(V);
           if (!Cmp)
             return;
           auto pred = need ? Cmp->getPredicate() : Cmp->getInversePredicate();
-          if (pred != ICmpInst::ICMP_EQ && pred != ICmpInst::ICMP_NE)
+          // icmp-of-icmp against 0/1: the inner predicate (or its inverse).
+          auto sideVal = [&](Value *X) {
+            while (auto *C = dyn_cast<CastInst>(X))
+              X = C->getOperand(0);
+            return peel(X);
+          };
+          Value *a = sideVal(Cmp->getOperand(0));
+          Value *b = sideVal(Cmp->getOperand(1));
+          auto *KA = dyn_cast<ConstantInt>(a), *KB = dyn_cast<ConstantInt>(b);
+          if (KA && KB && KA->getType() == KB->getType()) {
+            if (onPath && !ICmpInst::compare(KA->getValue(), KB->getValue(), pred))
+              out.push_back(Atom{"", true, "", -1, true});
+            return;
+          }
+          auto reduceInner = [&](Value *AtomV, Value *Other, ICmpInst::Predicate use) -> bool {
+            auto *Inner = dyn_cast<ICmpInst>(AtomV);
+            auto *CK = dyn_cast<ConstantInt>(Other);
+            if (!Inner || !CK)
+              return false;
+            if (CK->isZero()) {
+              atoms(Inner, use == ICmpInst::ICMP_NE, out, onPath, at);
+              return true;
+            }
+            if (CK->isOne()) {
+              atoms(Inner, use == ICmpInst::ICMP_EQ, out, onPath, at);
+              return true;
+            }
+            return false;
+          };
+          if (reduceInner(a, b, pred) || reduceInner(b, a, ICmpInst::getSwappedPredicate(pred)))
             return;
           for (int side = 0; side < 2; ++side) {
-            Value *C = Cmp->getOperand(1 - side);
-            while (auto *X = dyn_cast<CastInst>(C))
-              C = X->getOperand(0);
+            Value *Op = side == 0 ? a : b;
+            Value *C = side == 0 ? b : a;
+            ICmpInst::Predicate use = side == 0 ? pred : ICmpInst::getSwappedPredicate(pred);
             std::string v;
             if (isa<ConstantPointerNull>(C))
               v = "0";
-            else if (auto *CI = dyn_cast<ConstantInt>(C))
-              v = dec(CI);
+            else if (auto *CK = dyn_cast<ConstantInt>(C))
+              v = dec(CK);
             else
               continue;
-            if (loadKey(Cmp->getOperand(side), k)) {
-              out.push_back({k, pred == ICmpInst::ICMP_EQ, v});
-              return;
-            }
+            if (!loadKey(Op, k))
+              continue;
+            if (use == ICmpInst::ICMP_EQ || use == ICmpInst::ICMP_NE)
+              out.push_back({k, use == ICmpInst::ICMP_EQ, v, -1});
+            else
+              out.push_back({k, true, v, (int)use});
+            return;
           }
         };
         // The atoms that hold when the terminator of B passes to S.
-        auto edge = [&](const BasicBlock *B, const BasicBlock *S, std::vector<Atom> &out) {
-          const Instruction *T = B->getTerminator();
+        auto edge = [&](const BasicBlock *B, const BasicBlock *S, std::vector<Atom> &out,
+                        const OnPath *onPath = nullptr) {
+          Instruction *T = const_cast<Instruction *>(B->getTerminator());
           if (auto *BR = dyn_cast<BranchInst>(T)) {
             if (BR->isConditional() && BR->getSuccessor(0) != BR->getSuccessor(1))
-              atoms(BR->getCondition(), S == BR->getSuccessor(0), out);
+              atoms(BR->getCondition(), S == BR->getSuccessor(0), out, onPath, BR);
             return;
           }
           auto *SW = dyn_cast<SwitchInst>(T);
@@ -1225,9 +1411,9 @@
             if (!to.empty())
               return;
             for (auto &C : SW->cases())
-              out.push_back({k, false, dec(C.getCaseValue())});
+              out.push_back({k, false, dec(C.getCaseValue()), -1});
           } else if (to.size() == 1)
-            out.push_back({k, true, to[0]});
+            out.push_back({k, true, to[0], -1});
         };
         std::unordered_set<const BasicBlock *> goalB, back;
         std::vector<const BasicBlock *> work;
@@ -1301,11 +1487,14 @@
         if (need)
           for (const auto &kv : *need)
             tested.insert(kv.first);
-        for (const std::string &k : tested)
-          if (auto it = testedAt.find(k); it != testedAt.end())
-            stepTested[si].emplace(k, it->second);
-        if (tested.empty() && !memoOnShortest)
+        if (si != calleeStep)
+          for (const std::string &k : tested)
+            if (auto it = testedAt.find(k); it != testedAt.end())
+              stepTested[si].emplace(k, it->second);
+        if (tested.empty() && !memoOnShortest) {
+          fpTrivial = true;
           return shortest;
+        }
         auto under = [](const std::string &k, const std::string &p) {
           return k == p || (k.size() > p.size() && k.compare(0, p.size(), p) == 0 && k[p.size()] == '|');
         };
@@ -1344,6 +1533,10 @@
             for (const auto &[k, v] : it->second)
               if (tested.count(k))
                 seed[k] = Val{'k', v, {}};
+          if (callerKnown)
+            for (const auto &[k, v] : *callerKnown)
+              if (tested.count(k))
+                seed[k] = v;
         }
         auto effects = [&](const BasicBlock *B, State &st, bool toGoal) {
           for (Instruction &I : *const_cast<BasicBlock *>(B)) {
@@ -1360,6 +1553,16 @@
                 auto *CI = dyn_cast<ConstantInt>(S->getValueOperand());
                 auto *CN = dyn_cast<ConstantPointerNull>(S->getValueOperand());
                 st[k] = CI ? Val{'k', dec(CI), {}} : CN ? Val{'k', "0", {}} : Val{'a', "", {}};
+                if (st[k].kind == 'a') {
+                  st[k].from = dyn_cast<CallBase>(S->getValueOperand()->stripPointerCasts());
+                  if (st[k].from) {
+                    auto known = std::make_shared<State>();
+                    for (const auto &[ok, ov] : st)
+                      if (ov.kind == 'k')
+                        (*known)[ok] = Val{'k', ov.v, {}};
+                    st[k].at = std::move(known);
+                  }
+                }
               }
               continue;
             }
@@ -1386,7 +1589,39 @@
         // branches after it like the entry value: the same equations and
         // disequations on one path.
         auto apply = [](State &st, const Atom &a) {
+          if (a.never)
+            return false;
           Val &x = st[a.key];
+          if (a.rel >= 0) {
+            // A relational atom decides a path only against a known value.
+            const std::string &have = x.v;
+            if (have.empty())
+              return true;
+            auto parse = [](const std::string &s, int64_t &n) {
+              auto r = asI64(s);
+              if (!r)
+                return false;
+              n = *r;
+              return true;
+            };
+            int64_t lhs = 0, rhs = 0;
+            if (!parse(have, lhs) || !parse(a.v, rhs))
+              return true;
+            auto pred = (ICmpInst::Predicate)a.rel;
+            switch (pred) {
+            case ICmpInst::ICMP_EQ: return lhs == rhs;
+            case ICmpInst::ICMP_NE: return lhs != rhs;
+            case ICmpInst::ICMP_UGT: return (uint64_t)lhs > (uint64_t)rhs;
+            case ICmpInst::ICMP_UGE: return (uint64_t)lhs >= (uint64_t)rhs;
+            case ICmpInst::ICMP_ULT: return (uint64_t)lhs < (uint64_t)rhs;
+            case ICmpInst::ICMP_ULE: return (uint64_t)lhs <= (uint64_t)rhs;
+            case ICmpInst::ICMP_SGT: return lhs > rhs;
+            case ICmpInst::ICMP_SGE: return lhs >= rhs;
+            case ICmpInst::ICMP_SLT: return lhs < rhs;
+            case ICmpInst::ICMP_SLE: return lhs <= rhs;
+            default: return true;
+            }
+          }
           if (x.kind == 'k')
             return (x.v == a.v) == a.eq;
           if (a.eq) {
@@ -1410,6 +1645,93 @@
           }
           return s;
         };
+        // A path that constrains the value a call returned constrains the
+        // callee's entry: the callee must reach a return of an admitted value
+        // on a path of its own, and what that path requires of the cells at
+        // its entry the caller requires of them at the call. None when no
+        // return can produce an admitted value.
+        std::map<std::pair<const CallBase *, std::string>, std::optional<State>> calleeNeeds;
+        auto calleeNeed = [&](const CallBase *CB, const Val &want) -> std::optional<State> {
+          Function *Cal = CB->getCalledFunction();
+          Function *D = Cal ? define(Cal->getName()) : nullptr;
+          if (!D || D->isDeclaration() || D == F || std::find(searching.begin(), searching.end(), D) != searching.end())
+            return State{};
+          const State known = want.at ? *want.at : State{};
+          std::string wk = want.v;
+          for (const std::string &n : want.ne)
+            wk += "!" + n;
+          wk += "@" + spell(known);
+          if (auto it = calleeNeeds.find({CB, wk}); it != calleeNeeds.end())
+            return it->second;
+          std::optional<State> &out = calleeNeeds[{CB, wk}];
+          out = State{};
+          auto admits = [&](Value *V) {
+            while (V && isa<CastInst>(V))
+              V = cast<CastInst>(V)->getOperand(0);
+            std::string s;
+            if (V && isa<ConstantPointerNull>(V))
+              s = "0";
+            else if (auto *CI = dyn_cast_or_null<ConstantInt>(V))
+              s = dec(CI);
+            else
+              return true;
+            return (want.v.empty() || s == want.v) && !want.ne.count(s);
+          };
+          std::unordered_set<Instruction *> rets;
+          for (BasicBlock &RBB : *D) {
+            auto *R = dyn_cast<ReturnInst>(RBB.getTerminator());
+            if (!R)
+              continue;
+            Value *RV = R->getReturnValue();
+            while (RV && isa<CastInst>(RV))
+              RV = cast<CastInst>(RV)->getOperand(0);
+            if (auto *Phi = dyn_cast_or_null<PHINode>(RV)) {
+              for (unsigned i = 0; i < Phi->getNumIncomingValues(); ++i)
+                if (admits(Phi->getIncomingValue(i)))
+                  rets.insert(Phi->getIncomingBlock(i)->getTerminator());
+              continue;
+            }
+            if (auto *Ld = dyn_cast_or_null<LoadInst>(RV))
+              if (auto *Slot = dyn_cast<AllocaInst>(Ld->getPointerOperand()->stripPointerCasts())) {
+                bool any = false;
+                for (User *U : Slot->users())
+                  if (auto *St = dyn_cast<StoreInst>(U); St && St->getPointerOperand()->stripPointerCasts() == Slot) {
+                    any = true;
+                    if (admits(St->getValueOperand()))
+                      rets.insert(St);
+                  }
+                if (any)
+                  continue;
+              }
+            if (admits(RV))
+              rets.insert(R);
+          }
+          if (rets.empty())
+            return out = std::nullopt;
+          std::vector<std::optional<Loc>> down;
+          for (Value *Op : CB->args()) {
+            Loc L;
+            if (objectLoc(m, Op, L))
+              down.push_back(L);
+            else
+              down.push_back(std::nullopt);
+          }
+          Mem md;
+          bindFormals(md, D, down);
+          propagateObject(md, D);
+          State got;
+          Instruction *reachedRet = nullptr;
+          bool saved = fpTrivial;
+          searching.push_back(D);
+          calleeSeed = &known;
+          feasiblePath(D, rets, md, chosenPath(D, rets), &got, calleeStep, &reachedRet);
+          bool trivial = fpTrivial;
+          searching.pop_back();
+          fpTrivial = saved;
+          if (!reachedRet && !trivial)
+            return out = std::nullopt;
+          return out = got;
+        };
         // The state at the goal meets the requirement there; what remains
         // on entry values is the requirement at the step's entry.
         auto meets = [&](State st, const State *req, State &at) {
@@ -1427,6 +1749,31 @@
           for (const auto &[k, x] : st)
             if (x.kind == 'e' && (!x.v.empty() || !x.ne.empty()))
               at[k] = x;
+          for (const auto &[k, x] : st) {
+            if (x.kind != 'a' || !x.from || (x.v.empty() && x.ne.empty()))
+              continue;
+            auto got = calleeNeed(x.from, x);
+            if (!got)
+              return false;
+            for (const auto &[ck, r] : *got) {
+              auto sit = st.find(ck);
+              if (sit != st.end() && sit->second.kind == 'a')
+                continue;
+              State t;
+              t[ck] = sit != st.end() && sit->second.kind == 'k' ? sit->second
+                      : at.count(ck)                              ? at[ck]
+                                                                  : Val{};
+              bool ok = true;
+              if (!r.v.empty())
+                ok = apply(t, Atom{ck, true, r.v});
+              for (const std::string &n : r.ne)
+                ok = ok && apply(t, Atom{ck, false, n});
+              if (!ok)
+                return false;
+              if (t[ck].kind == 'e')
+                at[ck] = t[ck];
+            }
+          }
           // A path chosen under an entry constant needs the earlier steps
           // to leave that constant.
           if (auto it = entryKnown.find(si); it != entryKnown.end())
@@ -1477,8 +1824,13 @@
             for (const BasicBlock *S : succs) {
               if (memo.count({nodes[n].bb, S}))
                 continue;
+              std::unordered_set<const BasicBlock *> pathTo;
+              for (int i = n; i >= 0; i = nodes[i].prev)
+                pathTo.insert(nodes[i].bb);
+              pathTo.insert(S);
+              OnPath onPath = [&](const BasicBlock *BB) { return pathTo.count(BB); };
               std::vector<Atom> as;
-              edge(nodes[n].bb, S, as);
+              edge(nodes[n].bb, S, as, &onPath);
               State next = st;
               bool ok = true;
               for (const Atom &a : as)
@@ -1521,12 +1873,13 @@
         // The branch condition of one path, not the intersection of every
         // path that can still reach the goal.
         auto reach = chosenPath(F, goals);
-        // Inside a callee the goal is any return. A branch there constrains
-        // the entry only when one successor alone can still return; where
-        // both can, the shortest path's choice is not a condition of the
-        // sequence, and taking it would exclude the other outcome.
-        std::unordered_set<const BasicBlock *> canReturn;
-        if (F != seq[curStep]) {
+        // 정의 P: blocks from which the goal is reachable. A branch or a
+        // switch is a condition only when one successor lies in this cone.
+        // The chosen path is a subset, so scoring arms by it pins the
+        // shortest arm (grayscale case 1, the constant-1 phi incoming) even
+        // when another arm still reaches the goal.
+        std::unordered_set<const BasicBlock *> goalCone;
+        {
           std::vector<const BasicBlock *> work;
           for (Instruction *G : goals)
             if (G && G->getFunction() == F)
@@ -1534,13 +1887,16 @@
           while (!work.empty()) {
             const BasicBlock *B = work.back();
             work.pop_back();
-            if (!canReturn.insert(B).second)
+            if (!goalCone.insert(B).second)
               continue;
             for (const BasicBlock *P : predecessors(B))
               work.push_back(P);
           }
         }
-        const auto &decides = F == seq[curStep] ? reach : canReturn;
+        // Inside a callee the goal is any return, so the cone is every block
+        // that can still return. The step keeps its chosen path for which
+        // block is visited; the cone decides whether that visit is a guard.
+        const auto &decides = F == seq[curStep] ? reach : goalCone;
         Mem m;
         bindFormals(m, F, args);
         propagateObject(m, F);
@@ -1749,6 +2105,47 @@
               return V;
             while (auto *C = dyn_cast<CastInst>(V))
               V = C->getOperand(0);
+            // 정의 P (값의 합의): a φ folds to a constant only when every
+            // incoming that reaches the goal peels to that same constant.
+            // The shortest incoming alone is not the condition (e.g. the
+            // constant 1 of `planar != CONTIG` when the CONTIG incoming,
+            // samples-per-pixel, also reaches the decompress call).
+            if (auto *P = dyn_cast<PHINode>(V)) {
+              auto agree = [](Value *A, Value *B) {
+                if (A == B)
+                  return true;
+                auto *CA = dyn_cast<ConstantInt>(A);
+                auto *CB = dyn_cast<ConstantInt>(B);
+                if (CA && CB)
+                  return CA->getValue() == CB->getValue();
+                return isa<ConstantPointerNull>(A) && isa<ConstantPointerNull>(B);
+              };
+              std::vector<Value *> ins;
+              for (unsigned i = 0; i < P->getNumIncomingValues(); ++i) {
+                if (!goalCone.count(P->getIncomingBlock(i)))
+                  continue;
+                if (Value *X = go(P->getIncomingValue(i)))
+                  ins.push_back(X);
+              }
+              if (ins.empty()) {
+                if (P->getNumIncomingValues() == 1)
+                  return go(P->getIncomingValue(0));
+                return P;
+              }
+              for (size_t i = 1; i < ins.size(); ++i)
+                if (!agree(ins[0], ins[i]))
+                  return P;
+              return ins[0];
+            }
+            if (auto *Sel = dyn_cast<SelectInst>(V)) {
+              if (Value *C = go(Sel->getCondition())) {
+                if (auto *CI = dyn_cast<ConstantInt>(C))
+                  return go(CI->isZero() ? Sel->getFalseValue() : Sel->getTrueValue());
+                if (isa<ConstantPointerNull>(C))
+                  return go(Sel->getFalseValue());
+              }
+              return Sel;
+            }
             if (auto *L = dyn_cast<LoadInst>(V)) {
               Loc cell;
               if (locate(L, cell)) {
@@ -2010,15 +2407,6 @@
                 return;
               }
           }
-          Loc L, R;
-          bool lc = locate(lhs, L);
-          bool rc = locate(rhs, R);
-          Constant *CL = nullptr;
-          Constant *CR = nullptr;
-          if (isa<ConstantInt>(lhs) || isa<ConstantPointerNull>(lhs))
-            CL = cast<Constant>(lhs);
-          if (isa<ConstantInt>(rhs) || isa<ConstantPointerNull>(rhs))
-            CR = cast<Constant>(rhs);
           unsigned bits = 64;
           if (auto *IT = dyn_cast<IntegerType>(Cmp->getOperand(0)->getType()))
             bits = IT->getBitWidth();
@@ -2050,6 +2438,90 @@
             stepNe[curStep][{cell.arg, cell.suf}].insert(k);
             neq[{cell.arg, cell.suf}].insert(k);
           };
+          // A comparison of an icmp result with 0 or 1 is that icmp or its
+          // negation.
+          auto reduceICmpAtom = [&](Value *Atom, Value *Other, ICmpInst::Predicate use,
+                                    auto &recurse) -> bool {
+            auto *Inner = dyn_cast<ICmpInst>(Atom);
+            auto *CI = dyn_cast<ConstantInt>(Other);
+            if (!Inner || !CI)
+              return false;
+            if (CI->isZero()) {
+              if (use == ICmpInst::ICMP_EQ)
+                recurse(Inner, ICmpInst::getInversePredicate(Inner->getPredicate()));
+              else if (use == ICmpInst::ICMP_NE)
+                recurse(Inner, Inner->getPredicate());
+              else
+                return false;
+              return true;
+            }
+            if (CI->isOne()) {
+              if (use == ICmpInst::ICMP_EQ)
+                recurse(Inner, Inner->getPredicate());
+              else if (use == ICmpInst::ICMP_NE)
+                recurse(Inner, ICmpInst::getInversePredicate(Inner->getPredicate()));
+              else
+                return false;
+              return true;
+            }
+            return false;
+          };
+          std::function<void(ICmpInst *, ICmpInst::Predicate)> onCmpRec;
+          onCmpRec = [&](ICmpInst *C, ICmpInst::Predicate p) {
+            Value *a = mustVal(C->getOperand(0));
+            Value *b = mustVal(C->getOperand(1));
+            if (reduceICmpAtom(a, b, p, onCmpRec) ||
+                reduceICmpAtom(b, a, ICmpInst::getSwappedPredicate(p), onCmpRec))
+              return;
+            Loc l, r;
+            bool la = locate(a, l);
+            bool ra = locate(b, r);
+            Constant *Ca = nullptr, *Cb = nullptr;
+            if (isa<ConstantInt>(a) || isa<ConstantPointerNull>(a))
+              Ca = cast<Constant>(a);
+            if (isa<ConstantInt>(b) || isa<ConstantPointerNull>(b))
+              Cb = cast<Constant>(b);
+            if (Ca && Cb)
+              return;
+            auto emit = [&](const Loc &cell, ICmpInst::Predicate use, Constant *K) {
+              std::string k =
+                  isa<ConstantPointerNull>(K) ? "0" : dec(cast<ConstantInt>(K));
+              if (use == ICmpInst::ICMP_EQ)
+                equation(cell, k);
+              else if (use == ICmpInst::ICMP_NE)
+                unequal(cell, k);
+              else
+                push(cell, 'r', use, k, nullptr);
+            };
+            if (la && Cb) {
+              emit(l, p, Cb);
+              return;
+            }
+            if (ra && Ca) {
+              emit(r, ICmpInst::getSwappedPredicate(p), Ca);
+              return;
+            }
+            if (la && ra) {
+              push(l, 'p', p, "", &r);
+              return;
+            }
+          };
+          if (reduceICmpAtom(lhs, rhs, pred, onCmpRec) ||
+              reduceICmpAtom(rhs, lhs, ICmpInst::getSwappedPredicate(pred), onCmpRec))
+            return;
+          if (isa<ConstantInt>(lhs) && isa<ConstantInt>(rhs))
+            return;
+          if (isa<ConstantPointerNull>(lhs) && isa<ConstantPointerNull>(rhs))
+            return;
+          Loc L, R;
+          bool lc = locate(lhs, L);
+          bool rc = locate(rhs, R);
+          Constant *CL = nullptr;
+          Constant *CR = nullptr;
+          if (isa<ConstantInt>(lhs) || isa<ConstantPointerNull>(lhs))
+            CL = cast<Constant>(lhs);
+          if (isa<ConstantInt>(rhs) || isa<ConstantPointerNull>(rhs))
+            CR = cast<Constant>(rhs);
           if (lc && rc && !CL && !CR) {
             push(L, 'p', pred, "", &R);
             return;
@@ -2099,6 +2571,25 @@
           else
             push(cell, 'r', use, k, nullptr);
         };
+        // §3.5 정의 P: a branch is a condition of the sequence only where
+        // every path from the entry to the goal takes the same successor. For
+        // the step function the goal is a fixed instruction, and the shortest
+        // `reach` path reports its own arm as a guard even when the sibling
+        // arm also reaches the goal under a later guard of its own (e.g.
+        // do_fancy: either value still installs the box, one directly and the
+        // other once downsampled_width ≤ 2). Such a branch is not a sequence
+        // condition — forcing its arm would wrongly exclude the other outcome
+        // and pin an unrealizable value — so drop its guard. Callees already
+        // score arms by `goalCone`; this is the same test with the step's
+        // fixed goal as the target.
+        auto siblingReachesGoal = [&](BranchInst *BR, BasicBlock *taken) {
+          if (F != seq[curStep])
+            return false;
+          for (BasicBlock *S : successors(BR))
+            if (S != taken && goalCone.count(S))
+              return true;
+          return false;
+        };
         for (const BasicBlock *CBB : reachOrd) {
           BasicBlock *BB = const_cast<BasicBlock *>(CBB);
           Instruction *Term = BB->getTerminator();
@@ -2111,7 +2602,7 @@
                 ++n;
                 only = S;
               }
-            if (n == 1 && reach.count(only)) {
+            if (n == 1 && reach.count(only) && !siblingReachesGoal(BR, only)) {
               factAt = BR;
               bool takenTrue = only == BR->getSuccessor(0);
               std::function<void(Value *, bool)> req = [&](Value *V, bool need) {
@@ -2140,6 +2631,45 @@
                     req(BO->getOperand(1), false);
                     return;
                   }
+                  // ¬(A∧B) and A∨B force neither operand alone; when one is
+                  // already decided on this path, the other is the atom.
+                  auto constBool = [&](Value *X) -> std::optional<bool> {
+                    if (Value *Y = mustVal(X)) {
+                      if (auto *CI = dyn_cast<ConstantInt>(Y))
+                        return !CI->isZero();
+                      if (isa<ConstantPointerNull>(Y))
+                        return false;
+                    }
+                    return std::nullopt;
+                  };
+                  if (!need && BO->getOpcode() == Instruction::And) {
+                    auto a = constBool(BO->getOperand(0));
+                    auto b = constBool(BO->getOperand(1));
+                    if (a && *a) {
+                      req(BO->getOperand(1), false);
+                      return;
+                    }
+                    if (b && *b) {
+                      req(BO->getOperand(0), false);
+                      return;
+                    }
+                    if ((a && !*a) || (b && !*b))
+                      return;
+                  }
+                  if (need && BO->getOpcode() == Instruction::Or) {
+                    auto a = constBool(BO->getOperand(0));
+                    auto b = constBool(BO->getOperand(1));
+                    if (a && !*a) {
+                      req(BO->getOperand(1), true);
+                      return;
+                    }
+                    if (b && !*b) {
+                      req(BO->getOperand(0), true);
+                      return;
+                    }
+                    if ((a && *a) || (b && *b))
+                      return;
+                  }
                 }
                 if (auto *Cmp = dyn_cast<ICmpInst>(V)) {
                   auto pred = Cmp->getPredicate();
@@ -2152,13 +2682,18 @@
             }
           }
           if (auto *SW = dyn_cast<SwitchInst>(Term)) {
+            // 정의 P: the case value is an atom only when it is the unique
+            // successor in the goal cone. `decides` on a step is the chosen
+            // path, which would pin the shortest case (num_components = 1)
+            // while cases 3 and 4 still return.
+            const auto &arms = goalCone.empty() ? decides : goalCone;
             ConstantInt *onlyV = nullptr;
             int n = 0;
-            bool def = decides.count(SW->getDefaultDest());
+            bool def = arms.count(SW->getDefaultDest());
             if (def)
               ++n;
             for (auto &Case : SW->cases())
-              if (decides.count(Case.getCaseSuccessor())) {
+              if (arms.count(Case.getCaseSuccessor())) {
                 ++n;
                 onlyV = Case.getCaseValue();
               }

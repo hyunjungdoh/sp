@@ -309,6 +309,23 @@ store와, 정의 R의 수정 집합이 \(c\)에 닿는 호출이다. 지역 변�
   `JPEGPreDecode`가 최단인 raw 분기(`raw_data_out = 1`)를 골랐고, `master_selection`은
   `jinit_upsampler`로 가려고 `raw_data_out = 0`을 요구했다.
 
+**정의 P (값의 합의).** 최단 경로가 고른 상수가 시퀀스 조건이 되려면, 목표에 닿는 경로가
+모두 그 상수에 동의해야 한다. 두 경우다.
+
+- φ·select. 분기 피연산자의 φ는 목표 원뿔에 들어오는 incoming을 모두 벗긴 값이 같은
+  상수일 때만 그 상수로 접힌다. incoming이 둘 이상이고 값이 다르면 접지 않는다. 최단
+  incoming만 \(k\)인 등식은 다른 incoming을 배제하므로 조건이 아니다.
+- switch. 케이스 값 \(k\)는 목표 원뿔에 들어가는 후계자가 그 케이스 하나뿐일 때만 원자다.
+  default나 다른 케이스가 목표에 닿으면 등식을 싣지 않는다. 단계 함수도 피호출자도 같다.
+  고른 경로의 블록만 세면 최단 케이스가 조건이 된다.
+
+- *측정(35538).* `JPEGPreDecode`는
+  `num_components != (td_planarconfig == CONTIG ? td_samplesperpixel : 1)`이다.
+  최단 경로는 φ의 상수 1 쪽이다. CONTIG 쪽도 `TIFFjpeg_start_decompress`에 닿으므로
+  `num_components = 1`은 조건이 아니다. 그 등식은 같은 증인의 `h2v2_upsample` 설치
+  (그 성분의 샘플링 팩터 1)와 동시에 참이 될 수 없다. `default_decompress_parms`의
+  `switch (num_components)`도 케이스 1·3·4·default가 모두 반환에 닿는다.
+
 **정의 R (반환 경로의 수정).** 호출 \(g(\bar a)\)가 돌아온 뒤의 상태에 대해, \(g\)의 수정
 집합 \(\mathrm{MOD}_{\mathrm{ret}}(g)\)는 \(g\)의 진입에서 반환에 이르는 경로 위의 명령이 쓰는
 셀이다. 호출이 **돌아온다**는 것은 `flowReach`와 같은 최소 고정점이다. 피호출자가 정의이면

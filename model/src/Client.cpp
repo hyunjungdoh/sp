@@ -1838,6 +1838,31 @@ bool Client::satisfies(const std::string &v, const Cell &c) {
       return false;
     return c.op == "has" ? (*k & *m) == *m : (*k & *m) == 0;
   }
+  // A bound: the integer comparison of the value with the constant.
+  static const std::set<std::string> rel = {"ult", "ule", "ugt", "uge", "slt", "sle",
+                                            "sgt", "sge", "<",  ">",   "<=",  ">="};
+  if (rel.count(c.op) && !c.values.empty()) {
+    auto x = asI64(v), y = asI64(c.values[0]);
+    if (!x || !y)
+      return false;
+    if (c.op == "ult" || c.op == "<")
+      return (uint64_t)*x < (uint64_t)*y;
+    if (c.op == "ule" || c.op == "<=")
+      return (uint64_t)*x <= (uint64_t)*y;
+    if (c.op == "ugt" || c.op == ">")
+      return (uint64_t)*x > (uint64_t)*y;
+    if (c.op == "uge")
+      return (uint64_t)*x >= (uint64_t)*y;
+    if (c.op == "slt")
+      return *x < *y;
+    if (c.op == "sle")
+      return *x <= *y;
+    if (c.op == "sgt")
+      return *x > *y;
+    if (c.op == "sge")
+      return *x >= *y;
+    return false;
+  }
   auto same = [&](const std::string &a, const std::string &b) {
     if (bareName(a) == bareName(b))
       return true;
@@ -4782,6 +4807,17 @@ Client::WitnessPlan Client::realize(Function *E, const std::vector<Cell> &phi, c
           return false;
       return !b.values.empty();
     }
+    // An equation clashes with any atom none of its values satisfies.
+    auto eqVs = [&](const Cell &eq, const Cell &other) {
+      if (eq.op != "=" || eq.values.empty())
+        return false;
+      for (const std::string &v : eq.values)
+        if (satisfies(v, other))
+          return false;
+      return true;
+    };
+    if (eqVs(a, b) || eqVs(b, a))
+      return true;
     return false;
   };
   std::vector<Realized> carried;
@@ -4834,8 +4870,12 @@ Client::WitnessPlan Client::realize(Function *E, const std::vector<Cell> &phi, c
     // and merged after every compose (below), not spliced into W.cells here:
     // the clash check above iterates W.cells, so a cell added by one via would
     // otherwise be tested against a sibling via and spuriously refute it.
+    // Input-content cells are not carried: they hold on the arm the via plan
+    // happened to take, not on every execution that installs the value, and
+    // the input of the composed run is solved for that run itself.
     for (const Realized &vr : via->cells)
-      carried.push_back(vr);
+      if (vr.how != Realize::File && !vr.cell.file)
+        carried.push_back(vr);
     std::string line = where + " via";
     for (const std::string &n : via->seq)
       line += " " + n;
@@ -7162,12 +7202,16 @@ void Client::emit(const Plan &P, Module &H) const {
     C.CreateCall(declare(n.setter), args);
   };
   {
-    // Primary witness entry only. The plan still records every witness entry
-    // for obligations/report, but main must not oneOf across them: equal
-    // weight on Write when the primary π₀ is Read burns the concolic budget
-    // off the guided path (nurs:sink / sp.wit k=0).
-    std::vector<Function *> entries = P.entries;
-    if (!P.firsts.empty())
+    // Every realized witness reaches the sink; none is more the client's
+    // than another, so main offers each one's entry. An unrealized witness
+    // is not offered.
+    std::vector<Function *> entries;
+    for (const WitnessPlan &W : P.witnesses)
+      if (W.realized)
+        for (Function *E : W.entries)
+          if (std::find(entries.begin(), entries.end(), E) == entries.end())
+            entries.push_back(E);
+    if (entries.empty() && !P.firsts.empty())
       entries = {P.firsts.front()};
     std::vector<std::function<void(IRBuilder<> &)>> alts;
     for (Function *E : entries)
