@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-# First-generation seeds for --concolic (DESIGN-D §6 시드): every regular file
-# of the US and DS source trees named in pins.yaml (VCS metadata excluded,
-# the case's poc/ is outside them), at most N bytes so a seed is the file
-# itself within the H2 input bound, deduplicated by content. The file goes to
-# the harness data object `input`; every other symbolic object is absent and
-# the engine binds it to zero.
+# First-generation seeds for --concolic. From the US and DS trees named in
+# pins.yaml, keep a regular file only when it sits under test/images or
+# fuzzing (poc/ and VCS metadata stay out), at most N bytes so a seed is the
+# file itself within the input bound, deduplicated by content. The file goes
+# to the harness data object `input`.
 # Usage: corpus.py <dataset-case-dir> <N>
 # Writes dataset/<CVE>/concolic_seed/ (replaces any previous contents).
 import hashlib, os, re, shutil, struct, sys
@@ -20,6 +19,14 @@ for line in open(os.path.join(case, "pins.yaml")):
     if m and role in ("US", "DS"):
         dirs.append(m.group(1))
 
+def sample(rel):
+    parts = rel.split(os.sep)
+    if "poc" in parts or ".git" in parts:
+        return False
+    if "fuzzing" in parts:
+        return True
+    return any(parts[i] == "images" and i > 0 and parts[i - 1] == "test" for i in range(len(parts)))
+
 files = {}
 for d in dirs:
     for root, sub, names in os.walk(os.path.join(case, d)):
@@ -28,9 +35,11 @@ for d in dirs:
             p = os.path.join(root, f)
             if os.path.islink(p) or not os.path.isfile(p):
                 continue
-            if 0 < os.path.getsize(p) <= N:
-                body = open(p, "rb").read()
-                files.setdefault(hashlib.sha1(body).digest(), (p, body))
+            rel = os.path.relpath(p, case)
+            if not sample(rel) or not (0 < os.path.getsize(p) <= N):
+                continue
+            body = open(p, "rb").read()
+            files.setdefault(hashlib.sha1(body).digest(), (p, body))
 
 if os.path.isdir(out):
     shutil.rmtree(out)
