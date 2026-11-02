@@ -74,24 +74,7 @@ bool isCopy(const CallBase &CB) {
   return true;
 }
 
-// A fresh object: the declaration returns a pointer and every pointer
-// argument is a constant. A runtime pointer is the object the caller already
-// had, or a buffer the call fills.
-bool isAlloc(const CallBase &CB) {
-  Function *D = CB.getCalledFunction();
-  if (!D || !D->isDeclaration() || D->isIntrinsic() || D->getName().starts_with("llvm."))
-    return false;
-  if (!CB.getType()->isPointerTy())
-    return false;
-  bool anyInt = false;
-  for (Value *A : CB.args()) {
-    if (A->getType()->isIntegerTy())
-      anyInt = true;
-    if (A->getType()->isPointerTy() && !isa<Constant>(A))
-      return false;
-  }
-  return anyInt;
-}
+// isAlloc: Model.h (shared with Sink.cpp).
 
 // Consecutive field offsets are one cell. A variable index and a pointer
 // load are boundaries. The struct type name is not part of the cell.

@@ -69,6 +69,46 @@ int pthread_once(int *once, void (*fn)(void)) {
   return 0;
 }
 
+// libstdc++ std::call_once stores the callable here and asks pthread_once to
+// run __once_proxy. Both live in libstdc++, which is not bitcode, so the
+// native callback cannot see this process. One thread: run the trampoline.
+__thread void *_ZSt15__once_callable;
+__thread void (*_ZSt11__once_call)(void);
+void __once_proxy(void) {
+  void (*fn)(void) = _ZSt11__once_call;
+  if (fn)
+    fn();
+}
+
+// std::thread::hardware_concurrency(). The host's core count is not part of
+// this environment; the process is single-threaded, so the answer is 1.
+unsigned _ZNSt6thread20hardware_concurrencyEv(void) { return 1; }
+
+// std::thread::_M_start_thread(unique_ptr<_State>, void(*)()). Creating a
+// thread is refused (pthread_create returns EAGAIN). Running the native
+// libstdc++ definition instead starts a real thread on a KLEE pointer and
+// kills the process. The unique_ptr is the callee's; it is not destroyed.
+void _ZNSt6thread15_M_start_threadESt10unique_ptrINS_6_StateESt14default_deleteIS1_EEPFvvE(
+    void *self, void *state, void (*boot)(void)) {
+  (void)self;
+  (void)state;
+  (void)boot;
+}
+
+// glibc x86_64 confnames. Only the answers this environment actually has.
+long sysconf(int name) {
+  if (name == 2) // _SC_CLK_TCK
+    return 100;
+  if (name == 4) // _SC_OPEN_MAX
+    return 1024;
+  if (name == 30) // _SC_PAGESIZE
+    return 4096;
+  if (name == 83 || name == 84) // _SC_NPROCESSORS_CONF, _SC_NPROCESSORS_ONLN
+    return 1;
+  errno = EINVAL;
+  return -1;
+}
+
 // C++ ABI guards of function-local statics, single-threaded: the first byte
 // of the guard records that the initialization completed.
 int __cxa_guard_acquire(long long *g) { return *(char *)g == 0; }
@@ -538,8 +578,28 @@ int system(const char *cmd) { return cmd ? -1 : 0; }
 // standard stream: input is empty and output is discarded.
 
 #define ENV_STREAMS 16
+// Same _IO_FILE prefix as the standard streams, so a print into an opened
+// file reads _IO_write_ptr inside this object.
 struct stream {
+  int flags;
+  char *read_ptr, *read_end, *read_base;
+  char *write_base, *write_ptr, *write_end;
+  char *buf_base, *buf_end;
+  char *save_base, *backup_base, *save_end;
+  void *markers, *chain;
+  int fileno, flags2;
+  long old_offset;
+  unsigned short cur_column;
+  signed char vtable_offset;
+  char shortbuf[1];
+  void *lock;
+  long offset;
+  void *codecvt, *wide_data, *freeres_list, *freeres_buf;
+  size_t pad5;
+  int mode;
+  char unused2[20];
   int used, fd, eof, err, back;
+  char wbuf[4096];
 };
 static struct stream streams[ENV_STREAMS];
 static struct stream *ours(FILE *fp) {
@@ -561,7 +621,16 @@ static int modeFlags(const char *m) {
 static FILE *wrap(int fd) {
   for (int i = 0; i < ENV_STREAMS; ++i)
     if (!streams[i].used) {
-      streams[i] = (struct stream){1, fd, 0, 0, EOF};
+      streams[i].used = 1;
+      streams[i].fd = fd;
+      streams[i].eof = 0;
+      streams[i].err = 0;
+      streams[i].back = EOF;
+      streams[i].fileno = fd;
+      streams[i].write_base = streams[i].buf_base = streams[i].wbuf;
+      streams[i].write_ptr = streams[i].wbuf;
+      streams[i].write_end = streams[i].buf_end =
+          streams[i].wbuf + sizeof streams[i].wbuf;
       return (FILE *)&streams[i];
     }
   close(fd);
@@ -665,6 +734,7 @@ int fputc(int c, FILE *fp) {
   return fwrite(&b, 1, 1, fp) == 1 ? b : EOF;
 }
 int putc(int c, FILE *fp) { return fputc(c, fp); }
+int putc_unlocked(int c, FILE *fp) { return fputc(c, fp); }
 int fputs(const char *str, FILE *fp) {
   size_t len = 0;
   while (str[len])
@@ -741,6 +811,15 @@ int fileno(FILE *fp) {
   return s ? s->fd : 2;
 }
 int fflush(FILE *fp) {
+  (void)fp;
+  return 0;
+}
+int fflush_unlocked(FILE *fp) { return fflush(fp); }
+// One thread, so the stdio lock is always free. Native flockfile on a
+// modeled FILE waits forever on a lock word that is not a pthread lock.
+void flockfile(FILE *fp) { (void)fp; }
+void funlockfile(FILE *fp) { (void)fp; }
+int ftrylockfile(FILE *fp) {
   (void)fp;
   return 0;
 }

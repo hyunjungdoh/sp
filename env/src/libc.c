@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/resource.h>
 #include <sys/time.h>
 #include <sys/times.h>
@@ -28,10 +29,54 @@ long long klee_get_value_i64(long long expr);
 // Standard streams: objects the stream functions do not own, so input is
 // empty and output is discarded.
 
-static char standard[3][16];
-FILE *stdin = (FILE *)standard[0];
-FILE *stdout = (FILE *)standard[1];
-FILE *stderr = (FILE *)standard[2];
+// glibc's _IO_FILE. fmt prints by reading _IO_write_ptr/_IO_write_end
+// (offsets 40 and 48) and writing into that span, so a 16-byte placeholder
+// is an out-of-bounds read. Output is discarded: the span is a local buffer.
+struct stdio_file {
+  int flags;
+  char *read_ptr, *read_end, *read_base;
+  char *write_base, *write_ptr, *write_end;
+  char *buf_base, *buf_end;
+  char *save_base, *backup_base, *save_end;
+  void *markers, *chain;
+  int fileno, flags2;
+  long old_offset;
+  unsigned short cur_column;
+  signed char vtable_offset;
+  char shortbuf[1];
+  void *lock;
+  long offset;
+  void *codecvt, *wide_data, *freeres_list, *freeres_buf;
+  size_t pad5;
+  int mode;
+  char unused2[20];
+};
+static char stdbuf[3][65536];
+static struct stdio_file standard[3] = {
+    {.write_base = stdbuf[0],
+     .write_ptr = stdbuf[0],
+     .write_end = stdbuf[0] + sizeof stdbuf[0],
+     .buf_base = stdbuf[0],
+     .buf_end = stdbuf[0] + sizeof stdbuf[0],
+     .fileno = 0},
+    {.write_base = stdbuf[1],
+     .write_ptr = stdbuf[1],
+     .write_end = stdbuf[1] + sizeof stdbuf[1],
+     .buf_base = stdbuf[1],
+     .buf_end = stdbuf[1] + sizeof stdbuf[1],
+     .fileno = 1},
+    {.write_base = stdbuf[2],
+     .write_ptr = stdbuf[2],
+     .write_end = stdbuf[2] + sizeof stdbuf[2],
+     .buf_base = stdbuf[2],
+     .buf_end = stdbuf[2] + sizeof stdbuf[2],
+     .fileno = 2},
+};
+_Static_assert(offsetof(struct stdio_file, write_ptr) == 40, "FILE write ptr");
+_Static_assert(offsetof(struct stdio_file, write_end) == 48, "FILE write end");
+FILE *stdin = (FILE *)&standard[0];
+FILE *stdout = (FILE *)&standard[1];
+FILE *stderr = (FILE *)&standard[2];
 char *empty_environ[] = {NULL};
 char **environ = empty_environ;
 char __libc_single_threaded = 1;
@@ -152,6 +197,17 @@ static int casecmp(const char *a, const char *b, size_t n) {
 }
 int strcasecmp(const char *a, const char *b) { return casecmp(a, b, (size_t)-1); }
 int strncasecmp(const char *a, const char *b, size_t n) { return casecmp(a, b, n); }
+// The only locale is "C", so the locale-taking comparisons are the plain ones.
+// These are glibc symbols (attribute lookup goes through strncasecmp_l); leaving
+// them undefined makes KLEE run the native function on a symbolic pointer.
+int strcasecmp_l(const char *a, const char *b, locale_t loc) {
+  (void)loc;
+  return strcasecmp(a, b);
+}
+int strncasecmp_l(const char *a, const char *b, size_t n, locale_t loc) {
+  (void)loc;
+  return strncasecmp(a, b, n);
+}
 char *strstr(const char *h, const char *n) {
   size_t m = strlen(n);
   for (; *h; ++h)

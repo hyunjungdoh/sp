@@ -3234,6 +3234,9 @@ std::vector<Client::Named> Client::named(const std::vector<std::string> &seq) co
         nm.obj = *obj;
         nm.name = j;
         nm.value = *fb;
+        if (auto *D = dyn_cast<ConstantInt>(CB->getArgOperand(*fb)))
+          nm.fallback = D->getSExtValue();
+        nm.sinkDep = sinkNamed.count(nm.key) > 0;
         out.push_back(std::move(nm));
         break;
       }
@@ -5352,8 +5355,15 @@ void Client::report(const Plan &P, raw_ostream &out) const {
     }
   for (const auto &[E, ns] : P.named)
     for (const Named &n : ns)
+    {
       out << "named " << E->getName() << " " << n.setter->getName() << " obj " << n.obj << " \"" << n.key
-          << "\" value arg" << n.value << "\n";
+          << "\" value arg" << n.value;
+      if (n.fallback)
+        out << " fallback " << *n.fallback;
+      if (n.sinkDep)
+        out << " sinkdep";
+      out << "\n";
+    }
   for (const WitnessPlan &W : P.witnesses) {
     std::map<Realize, unsigned> n;
     for (const Realized &r : W.cells)
@@ -7194,11 +7204,25 @@ void Client::emit(const Plan &P, Module &H) const {
     }
     FunctionType *FT = n.setter->getFunctionType();
     std::vector<Value *> args;
-    for (unsigned i = 0; i < FT->getNumParams(); ++i)
-      args.push_back(i == n.obj     ? obtain(C, n.type)
-                     : i == n.name  ? key
-                     : i == n.value ? K.symbolic(C, FT->getParamType(i), "named")
-                                    : (Value *)n.rest[i]);
+    for (unsigned i = 0; i < FT->getNumParams(); ++i) {
+      if (i == n.value) {
+        // skip already yields the fallback d, so the set alternative draws v
+        // from V \ {d}: select(s == d, d + 1, s). Its seed value (s = 0) then
+        // differs from skip, and the union of the two alternatives is V.
+        Type *T = FT->getParamType(i);
+        Value *s = K.symbolic(C, T, "named");
+        if (n.fallback && T->isIntegerTy()) {
+          Value *d = ConstantInt::get(T, (uint64_t)*n.fallback, true);
+          Value *d1 = ConstantInt::get(T, (uint64_t)(*n.fallback + 1), true);
+          s = C.CreateSelect(C.CreateICmpEQ(s, d), d1, s);
+        }
+        args.push_back(s);
+        continue;
+      }
+      args.push_back(i == n.obj    ? obtain(C, n.type)
+                     : i == n.name ? key
+                                   : (Value *)n.rest[i]);
+    }
     C.CreateCall(declare(n.setter), args);
   };
   {
@@ -7221,8 +7245,16 @@ void Client::emit(const Plan &P, Module &H) const {
           for (const auto &[W, k] : kit->second)
             K.oneOf(C, {[&, W = W, &k = k](IRBuilder<> &A) { keySet(A, W, k); }, [](IRBuilder<> &) {}}, "key");
         if (auto nit = P.named.find(E); nit != P.named.end())
-          for (const Named &n : nit->second)
-            K.oneOf(C, {[&](IRBuilder<> &A) { nameSet(A, n); }, [](IRBuilder<> &) {}}, "named");
+          for (const Named &n : nit->second) {
+            // §3.12: choice 0 is the seed path. A name the sink depends on is
+            // set there; the others are skipped there (§4 순서는 시드 경로만 정한다).
+            std::function<void(IRBuilder<> &)> set = [&](IRBuilder<> &A) { nameSet(A, n); };
+            std::function<void(IRBuilder<> &)> skip = [](IRBuilder<> &) {};
+            if (n.sinkDep)
+              K.oneOf(C, {set, skip}, "named");
+            else
+              K.oneOf(C, {skip, set}, "named");
+          }
         auto g = P.guards.find(E);
         auto f = P.files.find(E);
         call(C, E, "", -1, g == P.guards.end() ? nullptr : &g->second, f == P.files.end() ? nullptr : &f->second);

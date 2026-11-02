@@ -543,6 +543,16 @@ bool IntrinsicCleanerPass::runOnBasicBlock(BasicBlock &b, Module &M) {
       default: {
         const Function *Callee = ii->getCalledFunction();
         llvm::StringRef name = Callee->getName();
+        // One thread, so a thread-local variable's address is the address of
+        // the variable itself. libstdc++ std::call_once addresses its
+        // trampoline this way; leaving the intrinsic in place makes that
+        // call fail as an external function.
+        if (name.starts_with("llvm.threadlocal.address")) {
+          ii->replaceAllUsesWith(ii->getArgOperand(0));
+          ii->eraseFromParent();
+          dirty = true;
+          break;
+        }
         klee_warning_once((void *)Callee, "unsupported intrinsic %.*s",
                           (int)name.size(), name.data());
         break;

@@ -1186,6 +1186,16 @@ class Model {
 
   bool solve(const std::vector<Function *> &seq, raw_ostream &out);
   bool solveOnce(const std::vector<Function *> &seq, raw_ostream &out);
+  // §3.12 싱크 가드와 싱크 의존. 싱크 함수의 CFG 위 제어 의존 공식(논리합 포함)과,
+  // 그 공식의 피연산자·싱크 명령의 피연산자에서 ICFG를 거슬러 간 값 흐름의 출처
+  // (이름 조회, 파일 읽기, f_0 인자, 전역, 몸체 없는 호출)를 사실로 낸다. f_0의
+  // 인자에서 도달하지 않는 객체(loc=⊥)의 셀도 단계 함수의 형식인자 기준으로 적는다.
+ public:
+  void sinkFacts(const std::vector<Function *> &seq, raw_ostream &out);
+  Function *defined(StringRef name) const { return define(name); }
+
+ private:
+  std::shared_ptr<void> sinkIdx;
   // §3.5 정의 P, entry state of a step: the cells its path tests (spelled as
   // the path search spells them) and, of those, the ones φ's forward state
   // holds at one constant when the step begins. solve repeats until the
@@ -1225,6 +1235,25 @@ class Model {
   // enter the residual. Bytes no equation names stay symbolic.
   void emit(Module &H) const;
 };
+
+// A fresh object: the declaration returns a pointer and every pointer
+// argument is a constant. A runtime pointer is the object the caller already
+// had, or a buffer the call fills. (Origin.cpp, Sink.cpp)
+inline bool isAlloc(const CallBase &CB) {
+  Function *D = CB.getCalledFunction();
+  if (!D || !D->isDeclaration() || D->isIntrinsic() || D->getName().starts_with("llvm."))
+    return false;
+  if (!CB.getType()->isPointerTy())
+    return false;
+  bool anyInt = false;
+  for (Value *A : CB.args()) {
+    if (A->getType()->isIntegerTy())
+      anyInt = true;
+    if (A->getType()->isPointerTy() && !isa<Constant>(A))
+      return false;
+  }
+  return anyInt;
+}
 
 // An argument a function can return unchanged. The miss path of a lookup
 // returns this argument; the call's constant for it is the fallback value.

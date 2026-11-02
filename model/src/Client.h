@@ -133,6 +133,12 @@ public:
     // (at slotAt) and for κ (at textAt).
     std::vector<Constant *> initArgs;
     unsigned slotAt = 0, textAt = 0;
+    // The constant d the lookup passes as its fallback. skip yields d, so the
+    // set alternative draws v from V \ {d} (§3.8.6 완전성의 분할).
+    std::optional<int64_t> fallback;
+    // §3.12: a sink guard or sink operand depends on this name's value, so the
+    // seed path sets it (choice 0 = set); otherwise choice 0 = skip.
+    bool sinkDep = false;
   };
   // A constraint on an integer field embedded in an entry argument: the
   // field at byte offset off of argument root, width bits wide.
@@ -245,6 +251,9 @@ public:
   std::vector<std::vector<Keyed>> keyedIn;
   // 정의 R: the return obligations of each witness, aligned likewise.
   std::vector<std::vector<Ret>> retsIn;
+  // §3.12: the names (κ of `sinkdep … named "κ"`) a sink guard or sink operand
+  // of any witness depends on through the ICFG value flow.
+  std::set<std::string> sinkNamed;
   // §3.9 정의 E: the may layer's first satisfiable sequence, at path index
   // `from` or later in cost order, from one of the start functions to a
   // source line, or none within the path budget.

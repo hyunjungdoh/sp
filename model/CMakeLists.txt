@@ -12,6 +12,7 @@ add_executable(model
   src/Index.cpp
   src/Locate.cpp
   src/Solve.cpp
+  src/Sink.cpp
   src/Emit.cpp
   src/Origin.cpp
   src/Flow.cpp

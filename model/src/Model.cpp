@@ -492,9 +492,14 @@ struct Witness {
     std::string callee, pred, k, caller;
     unsigned line = 0, col = 0;
     bool live = false;
+    // The may line says this call is a lookup. The harness returns the
+    // satisfying constant. A parser result has no such mark and stays a call.
+    bool lookup = false;
   };
   std::vector<Ret> rets;
   std::vector<Client::Keyed> keyed;
+  // §3.12: names (κ) a sink guard or sink operand depends on (`sinkdep … named "κ"`).
+  std::set<std::string> sinkNamed;
 };
 
 std::vector<Client::Ret> clientRets(const Witness &w) {
@@ -761,6 +766,15 @@ Witness parseWitness(std::istream &st) {
       pendingKeyed.reset();
     } else if (head == "cell") {
       take(s, may);
+    } else if (head == "sinkdep") {
+      // §3.12: `sinkdep <seed> named "κ" lookup G at F line N` — the name κ
+      // whose value a sink guard or sink operand depends on.
+      auto q = s.find("named \"");
+      if (q != std::string::npos) {
+        auto e = s.find('"', q + 7);
+        if (e != std::string::npos)
+          w.sinkNamed.insert(s.substr(q + 7, e - (q + 7)));
+      }
     } else if (head == "model") {
       std::string second;
       in >> second;
@@ -773,9 +787,12 @@ Witness parseWitness(std::istream &st) {
         if (colk == "col")
           r.col = (unsigned)std::atoi(cols.c_str());
         std::string extra;
-        while (in >> extra)
+        while (in >> extra) {
           if (extra == "live")
             r.live = true;
+          else if (extra == "lookup")
+            r.lookup = true;
+        }
         if (!r.callee.empty() && !r.caller.empty() && !r.pred.empty())
           w.rets.push_back(std::move(r));
       } else {
@@ -790,19 +807,193 @@ Witness parseWitness(std::istream &st) {
 }
 
 // The client the witnesses direct, linked with D and U into client.bc.
-// A required branch compared a call's result with a constant. An integer
-// lookup returns the witness. A pointer lookup that may be null returns
-// null. Every other integer result is assumed. Pointer results are applied
-// after the link, when a declaration is distinct from a body.
-void plantReturns(Module &M, const std::vector<Witness::Ret> &rets) {
+// A required branch compared a call's result with a constant. A named lookup
+// is a read: the same class's setter is called on that object, with a value
+// that meets the comparison, immediately before the read. The read stays.
+// A result the parser computes from the file is left as the call. Neither
+// comparison is assumed: an assume after the call does not choose the bytes.
+// Pointer results are applied after the link, when a declaration is distinct
+// from a body.
+static Function *calledFn(CallBase *CB) {
+  if (Function *F = CB->getCalledFunction())
+    return F;
+  return dyn_cast<Function>(CB->getCalledOperand()->stripPointerCasts());
+}
+
+static std::string classOf(StringRef name) {
+  std::string d = pretty(name);
+  auto paren = d.find('(');
+  if (paren != std::string::npos)
+    d.resize(paren);
+  while (!d.empty() && d.back() == ' ')
+    d.pop_back();
+  auto p = d.rfind("::");
+  return p == std::string::npos ? std::string() : d.substr(0, p);
+}
+
+static Function *definedAs(Module &M, Module *also, StringRef name) {
+  if (Function *F = M.getFunction(name); F && !F->isDeclaration())
+    return F;
+  if (also)
+    if (Function *F = also->getFunction(name); F && !F->isDeclaration())
+      return F;
+  return nullptr;
+}
+
+static bool isLookup(Function *F, std::map<const Function *, bool> &look) {
+  auto it = look.find(F);
+  if (it != look.end())
+    return it->second;
+  return look[F] = lookupOnly(F);
+}
+
+// How a setter argument is made: one of G's arguments at the call, the
+// witness (by value, or through a pointer to it), or a fresh symbolic value.
+struct Bind {
+  enum Kind { Arg, Witness, Sym } kind = Sym;
+  unsigned from = 0;
+};
+struct Setter {
+  Function *fn = nullptr;
+  std::vector<Bind> binds;
+};
+
+// The setter candidates of lookup G (§3.8.6): a function that is not a
+// lookup, takes G's object as its first argument, and has a parameter that
+// can carry the value G returns. Each such parameter is tried as the value
+// slot and takes the witness; the receiver is G's object; each other
+// parameter takes an unused G argument of the same type (never G's fallback,
+// which is the default, not a stored value), else a fresh symbolic value.
+// Signatures are not compared and no field flow is traced: the planted
+// read-back decides at run time which candidate actually sets the name G
+// reads, so a false candidate only costs a path. The sink of the search is
+// correctness; soundness is in nominating every writer of the object.
+static std::vector<Setter> valueSetters(Module &M, Module *also, Function *G, unsigned fb,
+                                        std::map<const Function *, bool> &look) {
+  std::string cls = classOf(G->getName());
+  if (cls.empty() || !G->getReturnType()->isIntegerTy() || fb >= G->arg_size() || G->arg_size() == 0)
+    return {};
+  std::map<std::string, Function *> cands;
+  auto scan = [&](Module &Mod) {
+    for (Function &S : Mod)
+      if (&S != G && !S.isDeclaration() && S.arg_size() > 1 && classOf(S.getName()) == cls &&
+          S.getArg(0)->getType() == G->getArg(0)->getType() && !isLookup(&S, look))
+        cands.emplace(S.getName().str(), &S);
+  };
+  scan(M);
+  if (also)
+    scan(*also);
+  std::vector<Setter> out;
+  for (auto &[name, S] : cands)
+    for (unsigned j = 1; j < S->arg_size(); ++j) {
+      Type *V = S->getArg(j)->getType();
+      bool value = (V->isIntegerTy() && V == G->getReturnType()) || V->isPointerTy();
+      if (!value)
+        continue;
+      Setter st{S, std::vector<Bind>(S->arg_size())};
+      std::set<unsigned> used{0, fb};
+      st.binds[0] = {Bind::Arg, 0};
+      st.binds[j].kind = Bind::Witness;
+      for (unsigned i = 1; i < S->arg_size(); ++i) {
+        if (i == j)
+          continue;
+        for (unsigned k = 1; k < G->arg_size(); ++k)
+          if (!used.count(k) && G->getArg(k)->getType() == S->getArg(i)->getType()) {
+            st.binds[i] = {Bind::Arg, k};
+            used.insert(k);
+            break;
+          }
+      }
+      out.push_back(std::move(st));
+    }
+  return out;
+}
+
+// Before the read CB, one path per setter candidate: a symbolic choice picks
+// the candidate, which is called with the witness, and G is read again with
+// a fallback other than the witness. A path whose read-back is not the
+// witness ends silently, so each path left has set the name G reads; G is a
+// lookup, so the extra read changes nothing. The read itself stays.
+static void plantReadBack(Module &M, CallBase *CB, unsigned fb, int64_t witness, const std::vector<Setter> &setters) {
+  LLVMContext &ctx = M.getContext();
+  Type *i32 = Type::getInt32Ty(ctx), *i64 = Type::getInt64Ty(ctx);
+  PointerType *p0 = PointerType::get(ctx, 0);
+  FunctionCallee mkSym =
+      M.getOrInsertFunction("klee_make_symbolic", FunctionType::get(Type::getVoidTy(ctx), {p0, i64, p0}, false));
+  FunctionCallee silent = M.getOrInsertFunction("klee_silent_exit", FunctionType::get(Type::getVoidTy(ctx), {i32}, false));
+  Function *F = CB->getFunction();
+  DebugLoc at = CB->getDebugLoc();
+  BasicBlock *head = CB->getParent();
+  BasicBlock *read = head->splitBasicBlock(CB, "setter.read");
+  head->getTerminator()->eraseFromParent();
+  auto *dead = BasicBlock::Create(ctx, "setter.dead", F, read);
+  IRBuilder<> X(dead);
+  X.SetCurrentDebugLocation(at);
+  X.CreateCall(silent, {X.getInt32(0)});
+  X.CreateUnreachable();
+  auto *check = BasicBlock::Create(ctx, "setter.check", F, read);
+  // Slots go at the end of the entry block, which dominates every use here
+  // whether or not the read is in it.
+  auto slot = [&](Type *T, const char *name) {
+    BasicBlock &En = F->getEntryBlock();
+    IRBuilder<> E(&En);
+    if (Instruction *t = En.getTerminator())
+      E.SetInsertPoint(t);
+    return E.CreateAlloca(T, nullptr, name);
+  };
+  const DataLayout &dl = M.getDataLayout();
+  auto call = [&](IRBuilder<> &B, const Setter &s) {
+    std::vector<Value *> args;
+    for (unsigned i = 0; i < s.binds.size(); ++i) {
+      Type *T = s.fn->getArg(i)->getType();
+      const Bind &b = s.binds[i];
+      if (b.kind == Bind::Arg) {
+        args.push_back(CB->getArgOperand(b.from));
+      } else if (b.kind == Bind::Witness && T->isIntegerTy()) {
+        args.push_back(ConstantInt::get(T, (uint64_t)witness, true));
+      } else if (b.kind == Bind::Witness) {
+        AllocaInst *A = slot(CB->getType(), "setter.value");
+        B.CreateStore(ConstantInt::get(CB->getType(), (uint64_t)witness, true), A);
+        args.push_back(A);
+      } else {
+        Type *S = T->isPointerTy() ? (Type *)ArrayType::get(B.getInt8Ty(), 64) : T;
+        AllocaInst *A = slot(S, "setter.free");
+        B.CreateCall(mkSym, {A, B.getInt64(dl.getTypeAllocSize(S)), B.CreateGlobalStringPtr("setter.free")});
+        args.push_back(T->isPointerTy() ? (Value *)A : B.CreateLoad(T, A));
+      }
+    }
+    B.CreateCall(s.fn, args);
+  };
+  IRBuilder<> H(head);
+  H.SetCurrentDebugLocation(at);
+  if (setters.size() == 1) {
+    call(H, setters[0]);
+    H.CreateBr(check);
+  } else {
+    AllocaInst *sel = slot(i32, "setter.choice");
+    H.CreateCall(mkSym, {sel, H.getInt64(4), H.CreateGlobalStringPtr("setter.choice")});
+    SwitchInst *sw = H.CreateSwitch(H.CreateLoad(i32, sel), dead, setters.size());
+    for (unsigned i = 0; i < setters.size(); ++i) {
+      auto *B = BasicBlock::Create(ctx, "setter." + std::to_string(i), F, check);
+      IRBuilder<> C(B);
+      C.SetCurrentDebugLocation(at);
+      call(C, setters[i]);
+      C.CreateBr(check);
+      sw->addCase(C.getInt32(i), B);
+    }
+  }
+  IRBuilder<> K(check);
+  K.SetCurrentDebugLocation(at);
+  std::vector<Value *> probe(CB->arg_begin(), CB->arg_end());
+  auto *T = cast<IntegerType>(probe[fb]->getType());
+  probe[fb] = ConstantInt::get(T, APInt(T->getBitWidth(), (uint64_t)witness, true) + 1);
+  Value *got = K.CreateCall(CB->getFunctionType(), CB->getCalledOperand(), probe);
+  K.CreateCondBr(K.CreateICmpEQ(got, ConstantInt::get(got->getType(), (uint64_t)witness, true)), read, dead);
+}
+
+void plantReturns(Module &M, Module *also, const std::vector<Witness::Ret> &rets) {
   if (rets.empty())
     return;
-  LLVMContext &ctx = M.getContext();
-  auto *i64 = Type::getInt64Ty(ctx);
-  FunctionType *assumeTy = FunctionType::get(Type::getVoidTy(ctx), {i64}, false);
-  Function *assume = M.getFunction("klee_assume");
-  if (!assume)
-    assume = Function::Create(assumeTy, Function::ExternalLinkage, "klee_assume", &M);
   auto predOf = [](const std::string &p) -> std::optional<ICmpInst::Predicate> {
     if (p == "==")
       return ICmpInst::ICMP_EQ;
@@ -842,6 +1033,7 @@ void plantReturns(Module &M, const std::vector<Witness::Ret> &rets) {
   struct SiteFact {
     std::vector<std::pair<unsigned, int64_t>> cs;
     bool live = false;
+    bool lookup = false;
   };
   std::map<SiteKey, SiteFact> grouped;
   for (const Witness::Ret &r : rets) {
@@ -855,21 +1047,10 @@ void plantReturns(Module &M, const std::vector<Witness::Ret> &rets) {
     SiteFact &fact = grouped[{r.callee, r.caller, r.line, r.col}];
     fact.cs.push_back({(unsigned)*pred, k});
     fact.live = fact.live || r.live;
+    fact.lookup = fact.lookup || r.lookup;
   }
-  auto supply = [](CallBase *CB, Value *W) {
-    if (auto *II = dyn_cast<InvokeInst>(CB)) {
-      BasicBlock *From = II->getParent();
-      BasicBlock *Unw = II->getUnwindDest();
-      II->replaceAllUsesWith(W);
-      for (PHINode &Phi : Unw->phis())
-        Phi.removeIncomingValue(From, false);
-      BranchInst::Create(II->getNormalDest(), II);
-      II->eraseFromParent();
-      return;
-    }
-    CB->replaceAllUsesWith(W);
-    CB->eraseFromParent();
-  };
+  std::map<const Function *, bool> look;
+  unsigned setters = 0, left = 0, choices = 0, widened = 0;
   for (const auto &gv : grouped) {
     Function *caller = M.getFunction(gv.first.caller);
     if (!caller || caller->isDeclaration())
@@ -879,7 +1060,7 @@ void plantReturns(Module &M, const std::vector<Witness::Ret> &rets) {
       auto *CB = dyn_cast<CallBase>(&I);
       if (!CB)
         continue;
-      Function *Cal = CB->getCalledFunction();
+      Function *Cal = calledFn(CB);
       if (!Cal || Cal->getName() != gv.first.callee)
         continue;
       const DebugLoc &DL = CB->getDebugLoc();
@@ -888,39 +1069,50 @@ void plantReturns(Module &M, const std::vector<Witness::Ret> &rets) {
       sites.push_back(CB);
     }
     for (CallBase *CB : sites) {
-      Function *D = CB->getCalledFunction();
+      Function *Decl = calledFn(CB);
+      Function *D = definedAs(M, also, Decl->getName());
+      if (!D)
+        D = Decl;
       std::optional<int64_t> fallback;
-      if (auto arg = fallbackArg(D))
-        if (*arg < CB->arg_size())
-          if (auto *C = dyn_cast<ConstantInt>(CB->getArgOperand(*arg)))
-            fallback = C->getSExtValue();
+      std::optional<unsigned> fb = fallbackArg(D);
+      if (fb && *fb < CB->arg_size())
+        if (auto *C = dyn_cast<ConstantInt>(CB->getArgOperand(*fb)))
+          fallback = C->getSExtValue();
       std::optional<int64_t> witness = satisfyingValue(gv.second.cs, fallback);
-      bool asLookup = lookupOnly(D) && witness && !gv.second.live;
-      Value *W = nullptr;
-      if (asLookup && CB->getType()->isIntegerTy())
-        W = ConstantInt::get(CB->getType(), (uint64_t)*witness, true);
-      else if (asLookup && CB->getType()->isPointerTy() && *witness == 0)
-        W = ConstantPointerNull::get(cast<PointerType>(CB->getType()));
-      if (W) {
-        supply(CB, W);
+      bool asLookup = (gv.second.lookup || lookupOnly(D)) && witness && !gv.second.live && CB->getType()->isIntegerTy();
+      if (!asLookup || !fb || *fb >= CB->arg_size() || !CB->getArgOperand(*fb)->getType()->isIntegerTy()) {
+        ++left;
         continue;
       }
-      if (!CB->getType()->isIntegerTy())
-        continue;
-      Instruction *ip = nullptr;
-      if (auto *II = dyn_cast<InvokeInst>(CB))
-        ip = II->getNormalDest()->getFirstNonPHI();
-      else
-        ip = CB->getNextNode();
-      if (!ip)
-        continue;
-      IRBuilder<> B(ip);
-      for (const auto &c : gv.second.cs) {
-        Value *cmp = B.CreateICmp((ICmpInst::Predicate)c.first, CB, ConstantInt::get(CB->getType(), c.second, true));
-        B.CreateCall(assume, {B.CreateZExt(cmp, i64)});
+      std::vector<Setter> chosen;
+      for (Setter s : valueSetters(M, also, D, *fb, look)) {
+        Function *local = M.getFunction(s.fn->getName());
+        if (!local)
+          local = Function::Create(s.fn->getFunctionType(), GlobalValue::ExternalLinkage, s.fn->getName(), &M);
+        if (local->getFunctionType() != s.fn->getFunctionType())
+          continue;
+        bool ok = true;
+        for (unsigned i = 0; i < s.binds.size() && ok; ++i)
+          ok = s.binds[i].kind != Bind::Arg || CB->getArgOperand(s.binds[i].from)->getType() == local->getArg(i)->getType();
+        if (!ok)
+          continue;
+        s.fn = local;
+        bool sig = local->arg_size() == CB->arg_size();
+        for (unsigned i = 0; i < s.binds.size() && sig; ++i)
+          sig = i == *fb ? s.binds[i].kind == Bind::Witness : s.binds[i].kind == Bind::Arg && s.binds[i].from == i;
+        widened += !sig;
+        chosen.push_back(std::move(s));
       }
+      if (chosen.empty()) {
+        ++left;
+        continue;
+      }
+      plantReadBack(M, CB, *fb, *witness, chosen);
+      ++setters;
+      choices += chosen.size();
     }
   }
+  errs() << "return-lower setters " << setters << " calls-left " << left << " choices " << choices << " widened " << widened << "\n";
 }
 
 // Bytes read or written through a pointer at constant offsets. base is the
@@ -1035,21 +1227,17 @@ static PtrExtent resultExtent(const CallBase *Root) {
   return out;
 }
 
-// A pointer result still present after linking. A body stays and, when
-// assumed is set, the comparison is assumed. A declaration with no integer
-// argument cannot allocate, so a non-null result is the object the
-// continuation accesses.
-static void plantExternal(Module &M, const std::vector<Witness::Ret> &rets, bool assumed = true) {
+// A pointer result still present after linking. The call stays: assuming it
+// non-null does not make the callee return that pointer. A declaration with
+// no integer argument cannot allocate, so a non-null result is the object
+// the continuation accesses.
+static void plantExternal(Module &M, const std::vector<Witness::Ret> &rets) {
   if (rets.empty())
     return;
   LLVMContext &ctx = M.getContext();
   auto *i64 = Type::getInt64Ty(ctx);
   auto *i8 = Type::getInt8Ty(ctx);
   auto *ptrTy = PointerType::getUnqual(ctx);
-  FunctionType *assumeTy = FunctionType::get(Type::getVoidTy(ctx), {i64}, false);
-  Function *assume = M.getFunction("klee_assume");
-  if (!assume)
-    assume = Function::Create(assumeTy, Function::ExternalLinkage, "klee_assume", &M);
   FunctionType *symTy = FunctionType::get(Type::getVoidTy(ctx), {ptrTy, i64, ptrTy}, false);
   Function *sym = M.getFunction("klee_make_symbolic");
   if (!sym)
@@ -1096,6 +1284,7 @@ static void plantExternal(Module &M, const std::vector<Witness::Ret> &rets, bool
   struct SiteFact {
     std::vector<std::pair<unsigned, int64_t>> cs;
     bool live = false;
+    bool lookup = false;
   };
   std::map<SiteKey, SiteFact> grouped;
   for (const Witness::Ret &r : rets) {
@@ -1109,6 +1298,7 @@ static void plantExternal(Module &M, const std::vector<Witness::Ret> &rets, bool
     SiteFact &fact = grouped[{r.callee, r.caller, r.line, r.col}];
     fact.cs.push_back({(unsigned)*pred, k});
     fact.live = fact.live || r.live;
+    fact.lookup = fact.lookup || r.lookup;
   }
   auto supply = [](CallBase *CB, Value *W) {
     if (auto *II = dyn_cast<InvokeInst>(CB)) {
@@ -1166,24 +1356,6 @@ static void plantExternal(Module &M, const std::vector<Witness::Ret> &rets, bool
         if (ext.base)
           ptr = B.CreateGEP(i8, block, {ConstantInt::get(i64, ext.base)});
         supply(CB, ptr);
-        continue;
-      }
-      if (!assumed)
-        continue;
-      Instruction *ip = nullptr;
-      if (auto *II = dyn_cast<InvokeInst>(CB))
-        ip = II->getNormalDest()->getFirstNonPHI();
-      else
-        ip = CB->getNextNode();
-      if (!ip)
-        continue;
-      IRBuilder<> B(ip);
-      for (const auto &c : gv.second.cs) {
-        auto pred = (ICmpInst::Predicate)c.first;
-        if (c.second != 0 || (pred != ICmpInst::ICMP_EQ && pred != ICmpInst::ICMP_NE))
-          continue;
-        Value *cmp = B.CreateICmp(pred, CB, ConstantPointerNull::get(cast<PointerType>(CB->getType())));
-        B.CreateCall(assume, {B.CreateZExt(cmp, i64)});
       }
     }
   }
@@ -1274,6 +1446,7 @@ int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, cons
     ws.push_back({w.seq, w.phi});
     client.keyedIn.push_back(w.keyed);
     client.retsIn.push_back(clientRets(w));
+    client.sinkNamed.insert(w.sinkNamed.begin(), w.sinkNamed.end());
   }
   auto bound = [](const char *name, unsigned dflt) {
     const char *v = std::getenv(name);
@@ -1401,6 +1574,12 @@ int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, cons
   // The client fixes no result of the library: every byte the library reads
   // is the client's (arguments, callbacks, the file), so the path's
   // comparisons are decided by those bytes, for every witness at once.
+  // A named lookup is set on its object before the read. A parser result
+  // stays the call. Neither comparison is assumed.
+  if (!witnesses.empty()) {
+    plantReturns(*down2, up2.get(), witnesses[0].rets);
+    plantReturns(*up2, down2.get(), witnesses[0].rets);
+  }
   Module ch("client", ctx);
   client.emit(plan, ch);
   if (verifyModule(ch, &errs()))
@@ -1419,7 +1598,7 @@ int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, cons
   closeLibrary(ch, dir);
   markStInstallers(ch, plan.stInstallers);
   if (!witnesses.empty())
-    plantExternal(ch, witnesses[0].rets, false);
+    plantExternal(ch, witnesses[0].rets);
   if (verifyModule(ch, &errs()))
     return 1;
   int r2 = finish(ch, ctx, outDir, "client", file, line);
@@ -1479,6 +1658,35 @@ int main(int argc, char **argv) {
       m.startNames = Client::entryInterface(*down, *up, dir);
       m.index();
       m.resolvePrecisely();
+      // 진단(SP_SINK_ONLY=<witness index>): 그 증인의 순서열에 §3.12만 다시 돌려
+      // stdout에 쓰고 끝낸다. 하네스 전체를 다시 만들지 않고 사실을 검사한다.
+      if (const char *so = std::getenv("SP_SINK_ONLY")) {
+        int want = std::atoi(so);
+        std::ifstream all((outDir / "witnesses.txt").string());
+        std::string block;
+        for (std::string s; std::getline(all, s);) {
+          block += s + "\n";
+          if (s != "sat" && s != "unsat")
+            continue;
+          std::istringstream in(block);
+          Witness w = parseWitness(in);
+          block.clear();
+          if (w.seq.empty() || w.index != want)
+            continue;
+          std::vector<Function *> seq;
+          for (const std::string &n : w.seq)
+            if (Function *F = m.defined(n))
+              seq.push_back(F);
+          if (seq.size() != w.seq.size()) {
+            errs() << "sink-only: unresolved function in witness " << want << "\n";
+            return 1;
+          }
+          m.sinkFacts(seq, outs());
+          return 0;
+        }
+        errs() << "sink-only: witness " << want << " not found\n";
+        return 1;
+      }
       table = m.indirectTargets();
       calls::write(table, outDir / "calls.txt");
     }
@@ -1609,8 +1817,8 @@ int main(int argc, char **argv) {
   int rc = 0;
   if (model.exportFn()) {
   if (!witnesses.empty()) {
-    plantReturns(*down, witnesses[0].rets);
-    plantReturns(*up, witnesses[0].rets);
+    plantReturns(*down, up.get(), witnesses[0].rets);
+    plantReturns(*up, down.get(), witnesses[0].rets);
   }
   Module harness("harness", ctx);
   model.emit(harness);
