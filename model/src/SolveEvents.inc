@@ -2557,9 +2557,14 @@
           if (isa<ConstantPointerNull>(C)) {
             if (use == ICmpInst::ICMP_EQ)
               equation(cell, "0");
-            else if (use == ICmpInst::ICMP_NE)
+            else if (use == ICmpInst::ICMP_NE) {
+              // p ≠ null is the disequation p ≠ 0, the same atom p = null
+              // yields as an equation; the cell is also a pointee the path
+              // dereferences. Without the atom the client saw no obligation
+              // and built the object with a producer that leaves p null.
+              unequal(cell, "0");
               pointee(cell);
-            else
+            } else
               push(cell, 'r', use, "0", nullptr);
             return;
           }

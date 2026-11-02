@@ -28,6 +28,7 @@
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/Analysis/MemoryBuiltins.h"
 #include "llvm/IR/DebugInfoMetadata.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/TargetParser/Triple.h"
 
 #include <charconv>
@@ -2571,11 +2572,27 @@ std::vector<Function *> Client::entries(Function *E) const {
 // interface function. A call that reaches the store through interface
 // function g is g called with particular arguments, so the client calling
 // g with symbolic ones subsumes it.
-std::vector<Function *> Client::writers(const Cell &c) const {
+std::vector<Function *> Client::writers(const Cell &c, const std::string &rootType) const {
   std::pair<std::string, int64_t> key{c.type, c.off};
   // F's inner closure holds a satisfying store iff F reaches one in the call
   // graph without edges into callable interface functions: search back from
   // the stores, not entering the callers of those functions.
+  // The stop at a callable interface G is a subsumption: the client can
+  // realize c by calling G directly, so G's callers are redundant. That holds
+  // only when calling G on the client's held object sets this cell — i.e. G
+  // takes the cell's held root type. A callable interface that receives only
+  // the leaf field's own type (ustring::ustring building a fresh ustring, not
+  // the one embedded in the handle) does not set the embedded cell; the search
+  // must climb to the interface that writes it (ImageBuf::reset). When no root
+  // type is given the cut is unconstrained (the legacy boundary-copy path).
+  auto onRoot = [&](Function *G) {
+    if (rootType.empty())
+      return true;
+    for (const Param &p : signature(G))
+      if (held(p) && p.type == rootType)
+        return true;
+    return false;
+  };
   if (callersOf.empty())
     for (const auto &kv : calls)
       for (Function *C : kv.second)
@@ -2592,7 +2609,7 @@ std::vector<Function *> Client::writers(const Cell &c) const {
   while (!work.empty()) {
     Function *G = work.back();
     work.pop_back();
-    if ((ifaceD.count(G) || ifaceU.count(G)) && callable(G))
+    if ((ifaceD.count(G) || ifaceU.count(G)) && callable(G) && onRoot(G))
       continue;
     if (auto it = callersOf.find(G); it != callersOf.end())
       for (Function *P : it->second)
@@ -3001,6 +3018,310 @@ const std::set<Client::Field> &Client::argStores(Function *W, int only) const {
     }
   }
   return out;
+}
+
+// §3.5 input-name slot: W writes c's field from one of its own name (text)
+// parameters. Unlike `carries`, which follows the value, this follows the
+// name through the string interning that breaks value taint: it stops at the
+// call that writes c's field and only asks whether a name parameter reached
+// that call's arguments (ustring::assign takes the name and returns the
+// interned pointer it stores). A reader that merely constructs a ustring from
+// a literal (an error message) never passes a name parameter to the writing
+// call, so it is not admitted.
+bool Client::namesCell(Function *W, const Cell &c) const {
+  Field f = fieldOf(c);
+  // The cell names its leaf by the source type (`ustring`); a store to the
+  // same byte names the IR struct lowered there (`basic_string<char>::
+  // _Alloc_hider`, which `ustring` lowers to) or an enclosing one
+  // (`basic_string`) whose member at offset 0 it is. Both names resolve to
+  // IR structs; the field is the same when they are the same struct, or one
+  // is the other's offset-0 member transitively.
+  auto chain = [](StructType *S) {
+    std::vector<StructType *> out;
+    for (; S && out.size() < 8; S = S->getNumElements() ? dyn_cast<StructType>(S->getElementType(0)) : nullptr)
+      out.push_back(S);
+    return out;
+  };
+  std::vector<StructType *> fc = chain(source::irType(f.first));
+  auto hits = [&](const Field &g) {
+    if (g.second != f.second)
+      return false;
+    if (g.first == f.first)
+      return true;
+    if (f.second != 0)
+      return false;
+    for (StructType *A : fc)
+      for (StructType *B : chain(source::irType(g.first)))
+        if (A == B || A->isLayoutIdentical(B))
+          return true;
+    return false;
+  };
+  // One level inside Bd: formal j (a local copy/convert like basic_string_view's
+  // copy constructor) is stored into the object at another pointer formal p.
+  auto outParams = [&](Function *Bd, unsigned j) {
+    std::set<unsigned> ps;
+    if (!Bd || Bd->isDeclaration() || j >= Bd->arg_size())
+      return ps;
+    std::set<Value *> tv;
+    std::vector<Value *> wk;
+    auto tt = [&](Value *v) {
+      if (tv.insert(v).second)
+        wk.push_back(v);
+    };
+    tt(Bd->getArg(j));
+    while (!wk.empty()) {
+      Value *v = wk.back();
+      wk.pop_back();
+      for (User *U : v->users()) {
+        if (auto *S = dyn_cast<StoreInst>(U)) {
+          if (S->getValueOperand() != v)
+            continue;
+          Value *base = S->getPointerOperand()->stripPointerCasts();
+          while (auto *G = dyn_cast<GEPOperator>(base))
+            base = G->getPointerOperand()->stripPointerCasts();
+          // Unoptimized code spills a formal to a local and reloads it: the
+          // load of a local the formal alone is stored to is the formal.
+          if (auto *L = dyn_cast<LoadInst>(base))
+            if (auto *Al = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts())) {
+              Value *only = nullptr;
+              bool one = true;
+              for (User *AU : Al->users())
+                if (auto *AS = dyn_cast<StoreInst>(AU); AS && AS->getPointerOperand() == Al) {
+                  one = one && !only;
+                  only = AS->getValueOperand();
+                }
+              if (one && only)
+                base = only;
+            }
+          if (auto *A = dyn_cast<Argument>(base); A && A->getParent() == Bd)
+            ps.insert(A->getArgNo());
+          else if (auto *Al = dyn_cast<AllocaInst>(base))
+            tt(Al);
+        } else if (auto *L = dyn_cast<LoadInst>(U)) {
+          if (L->getPointerOperand() == v)
+            tt(L);
+        } else if (auto *CB = dyn_cast<CallBase>(U)) {
+          // A getter's result (string_view::data(other)) derives from it.
+          if (!CB->getType()->isVoidTy())
+            for (unsigned k = 0; k < CB->arg_size(); ++k)
+              if (CB->getArgOperand(k) == v) {
+                tt(CB);
+                break;
+              }
+        } else if (isa<Instruction>(U)) {
+          tt(U);
+        }
+      }
+    }
+    return ps;
+  };
+  // The field the cell's leaf lies in (ImageBufImpl+8 for m_name): the
+  // step before the leaf in the cell's path. The leaf names a type many
+  // objects have (a ustring); the enclosing field says which one.
+  std::optional<Field> parent;
+  {
+    std::istringstream in(c.text);
+    std::string tok;
+    in >> tok >> tok;
+    std::vector<Field> steps;
+    while (in >> tok && tok != "=" && tok != "!=" && tok[0] != '<' && tok[0] != '>') {
+      auto p = tok.rfind('+');
+      if (p == std::string::npos || p == 0)
+        continue;
+      if (auto o = asI64(tok.substr(p + 1)); o && *o >= 0)
+        steps.push_back({tok.substr(0, p), *o});
+    }
+    if (steps.size() >= 2)
+      parent = steps[steps.size() - 2];
+  }
+  // Interprocedural forward taint in two colours from F. Name: the seed
+  // formals, flowing into a callee's formals, out through a callee's output
+  // parameters (copy constructors), and through the return of a call that
+  // derives its result from the name (the string interning: make_unique
+  // takes the name and returns the interned pointer the caller stores).
+  // Object: the address of the cell's enclosing field, taken by a GEP in any
+  // function reached, flowing through spills and into a callee's `this`.
+  // A store of a name-coloured value to c's leaf field of an object-coloured
+  // address returns true. A reader that builds a ustring from a literal never
+  // passes a name to the writing call; a writer of another ustring (an
+  // attribute's name) never addresses the enclosing field.
+  std::set<std::tuple<Function *, unsigned, bool>> seen;
+  std::function<bool(Function *, const std::set<unsigned> &, const std::set<unsigned> &, int)> run =
+      [&](Function *F, const std::set<unsigned> &names, const std::set<unsigned> &objs, int depth) -> bool {
+    if (!F || F->isDeclaration() || depth > 16)
+      return false;
+    std::set<Value *> tv, ov;
+    SetVector<CallBase *> calls;
+    std::vector<Value *> work;
+    auto taint = [&](Value *v) {
+      if (tv.insert(v).second)
+        work.push_back(v);
+    };
+    auto otaint = [&](Value *v) {
+      if (ov.insert(v).second)
+        work.push_back(v);
+    };
+    for (unsigned i : names)
+      if (i < F->arg_size() && seen.insert({F, i, false}).second)
+        taint(F->getArg(i));
+    for (unsigned i : objs)
+      if (i < F->arg_size() && seen.insert({F, i, true}).second)
+        otaint(F->getArg(i));
+    if (parent)
+      for (Instruction &I : instructions(*F))
+        if (isa<GetElementPtrInst>(I))
+          for (const Field &g : fieldsOf(&I))
+            if (g == *parent) {
+              otaint(&I);
+              break;
+            }
+    if (work.empty())
+      return false;
+    // The object colour reaches a pointer when it is that address or a
+    // reload/GEP/cast of it; a value loaded from the address is not it.
+    auto objAddr = [&](Value *P) {
+      for (Value *b = P;;) {
+        if (ov.count(b))
+          return true;
+        if (auto *G = dyn_cast<GEPOperator>(b))
+          b = G->getPointerOperand();
+        else if (auto *L = dyn_cast<LoadInst>(b); L && isa<AllocaInst>(L->getPointerOperand()->stripPointerCasts()))
+          b = L->getPointerOperand()->stripPointerCasts();
+        else if (auto *Op = dyn_cast<Operator>(b); Op && (Op->getOpcode() == Instruction::BitCast ||
+                                                          Op->getOpcode() == Instruction::AddrSpaceCast))
+          b = Op->getOperand(0);
+        else
+          return false;
+      }
+    };
+    while (!work.empty()) {
+      Value *v = work.back();
+      work.pop_back();
+      bool isName = tv.count(v), isObj = ov.count(v);
+      for (User *U : v->users()) {
+        if (auto *S = dyn_cast<StoreInst>(U)) {
+          if (S->getValueOperand() != v)
+            continue;
+          if (isName) {
+            for (const Field &g : accessFields(*S, S->getPointerOperand()))
+              if (hits(g) && (!parent || objAddr(S->getPointerOperand())))
+                return true;
+            // Stored into a local (a by-value string_view's fields): the
+            // local carries the name on, as a whole, to the calls it is
+            // passed to.
+            if (auto *A = dyn_cast<AllocaInst>(getUnderlyingObject(S->getPointerOperand())))
+              taint(A);
+          }
+          // A spilled object pointer: its reloads are the object.
+          if (isObj)
+            if (auto *A = dyn_cast<AllocaInst>(S->getPointerOperand()->stripPointerCasts()))
+              otaint(A);
+        } else if (auto *L = dyn_cast<LoadInst>(U)) {
+          if (L->getPointerOperand() != v)
+            continue;
+          if (isName)
+            taint(L);
+          if (isObj && isa<AllocaInst>(v->stripPointerCasts()))
+            otaint(L);
+        } else if (auto *CB = dyn_cast<CallBase>(U)) {
+          auto *C = dyn_cast<Function>(CB->getCalledOperand()->stripPointerCasts());
+          std::set<unsigned> cs;
+          for (unsigned j = 0; j < CB->arg_size(); ++j)
+            if (CB->getArgOperand(j) == v)
+              cs.insert(j);
+          if (cs.empty())
+            continue;
+          if (C && isName) {
+            Function *Bd = C->isDeclaration() ? body(C->getName().str()) : C;
+            for (unsigned j : cs)
+              for (unsigned p : outParams(Bd, j))
+                if (p < CB->arg_size())
+                  taint(CB->getArgOperand(p));
+          }
+          // The interned/derived result carries the name onward.
+          if (isName && !CB->getType()->isVoidTy())
+            taint(CB);
+          // Entered once both colours have saturated here, so the callee
+          // sees the name and the object together (operator=(&m_name, name)).
+          if (C)
+            calls.insert(CB);
+        } else if (isa<GEPOperator>(U) || isa<BitCastOperator>(U)) {
+          if (isName)
+            taint(U);
+          if (isObj)
+            otaint(U);
+        } else if (isa<Instruction>(U)) {
+          if (isName)
+            taint(U);
+        }
+      }
+    }
+    for (CallBase *CB : calls) {
+      auto *C = dyn_cast<Function>(CB->getCalledOperand()->stripPointerCasts());
+      Function *Bd = C->isDeclaration() ? body(C->getName().str()) : C;
+      std::set<unsigned> cs, os;
+      for (unsigned j = 0; j < CB->arg_size(); ++j) {
+        if (tv.count(CB->getArgOperand(j)))
+          cs.insert(j);
+        if (ov.count(CB->getArgOperand(j)))
+          os.insert(j);
+      }
+      if (Bd && run(Bd, cs, os, depth + 1))
+        return true;
+    }
+    return false;
+  };
+  // Seed the parameters the harness can hand the input name to: the name is
+  // text, arriving as a char pointer or by value inside a string_view/
+  // ustring/std::string, so a parameter whose type carries a char pointer.
+  // A held object is not one: a value copied out of another object's field
+  // (deep_merge(dst, A, ..) copying A's name into dst) is that object's
+  // state, not a name the harness supplies. A parameter carrying no text
+  // (a bool, ROI, span<float>) cannot supply the name even though a value
+  // derived from it (a formatted message) may be interned into a ustring.
+  auto carriesText = [&](const DIType *D0) {
+    std::set<const DIType *> seen;
+    std::vector<const DIType *> work{D0};
+    while (!work.empty()) {
+      const DIType *D = strip(work.back());
+      work.pop_back();
+      if (!D || !seen.insert(D).second)
+        continue;
+      if (isPointer(D)) {
+        const DIType *B = strip(cast<DIDerivedType>(D)->getBaseType());
+        if (auto *T = dyn_cast_or_null<DIBasicType>(B))
+          if (T->getEncoding() == dwarf::DW_ATE_signed_char || T->getEncoding() == dwarf::DW_ATE_unsigned_char)
+            return true;
+        continue;
+      }
+      if (auto *C = dyn_cast<DICompositeType>(D)) {
+        if (C->isForwardDecl())
+          if (auto it = composite.find(typeKey(C)); it != composite.end())
+            C = it->second;
+        if (C->getTag() == dwarf::DW_TAG_array_type)
+          work.push_back(C->getBaseType());
+        else
+          for (const DINode *N : C->getElements())
+            if (auto *M = dyn_cast<DIDerivedType>(N))
+              if (!M->isStaticMember() &&
+                  (M->getTag() == dwarf::DW_TAG_member || M->getTag() == dwarf::DW_TAG_inheritance))
+                work.push_back(M->getBaseType());
+      }
+    }
+    return false;
+  };
+  std::vector<int> at = irParams(W);
+  std::vector<Param> sig = signature(W);
+  std::set<unsigned> seeds;
+  for (unsigned i = 0; i < W->arg_size(); ++i) {
+    if (i >= at.size() || at[i] < 0 || (size_t)at[i] >= sig.size())
+      continue;
+    const Param &p = sig[at[i]];
+    if (held(p) || !carriesText(p.di))
+      continue;
+    seeds.insert(i);
+  }
+  return run(W, seeds, {}, 0);
 }
 
 bool Client::carries(Function *W, const Cell &c, Function *E) const {
@@ -3644,6 +3965,26 @@ bool Client::contradicts(Function *W, const Cell &c) const {
 std::vector<Function *> Client::writeCandidates(Function *E, const std::vector<Function *> &es, const Cell &c) const {
   Function *entry = es.empty() ? nullptr : es[0];
   std::string T = heldType(E, c.root);
+  // §3.5 (구조적 의무): an input-name slot — a cell the entry opens the input
+  // file by — is a non-value structural obligation ("this field holds the
+  // input file name"), not a value one. A setter that writes it interns the
+  // name (ustring/std::string → a hash table), so the value taint `carries`
+  // tracks is lost at the intern. For such a slot the admission gate is
+  // structural: the writer takes a name (text) parameter it writes into the
+  // field. The harness then passes the input file name to that parameter.
+  bool nameSlot = entry && fills(entry, c);
+  // The slot is a field of the handle the harness hands the entry, so its
+  // setter must act on that same handle: a method whose receiver (first IR
+  // parameter) is the held root, as the entry's is. A function that takes a
+  // name and some other object of type T (an output, a cache) sets that
+  // object's field, not the handle's.
+  auto receiverIs = [&](Function *W, const std::string &T) {
+    std::vector<int> at = irParams(W);
+    std::vector<Param> sig = signature(W);
+    if (at.empty() || at[0] < 0 || (size_t)at[0] >= sig.size())
+      return false;
+    return held(sig[at[0]]) && sig[at[0]].type == T;
+  };
   FnSet out;
   auto admit = [&](Function *W) {
     if (!ifaceD.count(W) || std::find(es.begin(), es.end(), W) != es.end())
@@ -3655,11 +3996,12 @@ std::vector<Function *> Client::writeCandidates(Function *E, const std::vector<F
       if (!share)
         return;
     }
-    if ((c.boundary || c.prefix) && (!entry || !carries(W, c, entry)))
+    if ((c.boundary || c.prefix) &&
+        (!entry || !(carries(W, c, entry) || (nameSlot && !T.empty() && receiverIs(W, T) && namesCell(W, c)))))
       return;
     out.insert(W);
   };
-  for (Function *W : writers(c))
+  for (Function *W : writers(c, T))
     admit(W);
   if (c.boundary && entry)
     for (Function *W : copySetters(entry, c))
@@ -4643,6 +4985,7 @@ Client::WitnessPlan Client::realize(Function *E, const std::vector<Cell> &phi, c
   }
   auto valueAtom = [](const Cell &c) { return c.op == "=" || c.op == "!=" || c.op == "has" || c.op == "lacks"; };
   std::map<size_t, std::vector<Function *>> cand;
+  std::set<size_t> nameCells;
   std::map<size_t, std::pair<const WitnessPlan *, std::string>> vias;
   auto addKeyed = [&](Function *F, const Keyed &k) {
     for (const auto &[G, o] : W.keyed)
@@ -4694,6 +5037,10 @@ Client::WitnessPlan Client::realize(Function *E, const std::vector<Cell> &phi, c
     } else if (valueAtom(c) && !(wr = admittedWriters(c)).empty()) {
       r.how = Realize::Write;
       cand[W.cells.size()] = wr;
+      // §3.5: the entry opens the input file by this cell, so the chosen
+      // writer must receive the input file name, not fresh text.
+      if (entry && fills(entry, c))
+        nameCells.insert(W.cells.size());
     } else if (const WitnessPlan *via = nullptr; !c.file && establishedBy(E, entry, c, via, at)) {
       r.how = Realize::Construct;
       if (via) {
@@ -4779,6 +5126,11 @@ Client::WitnessPlan Client::realize(Function *E, const std::vector<Cell> &phi, c
     W.cells[i].how = Realize::Open;
     W.cells[i].why = "writer-slots";
   }
+  // §3.5: the writers chosen to cover an input-name slot receive the input
+  // file name (not fresh symbolic text) at their name parameters.
+  for (size_t i : nameCells)
+    if (W.cells[i].how == Realize::Write && W.cells[i].by)
+      W.nameWriters.insert(W.cells[i].by->getName().str());
   // 정의 E: a cell a store establishes brings the calls the reaching
   // sequence's plan realizes; the merged cover stays within the K slots.
   // A via plan that reaches S+ under a φ incompatible with this witness
@@ -4961,6 +5313,7 @@ Client::Plan Client::plan(const Witnesses &ws) const {
       }
     if (W.pass) {
       writerSet.insert(W.cover.begin(), W.cover.end());
+      P.nameWriters.insert(W.nameWriters.begin(), W.nameWriters.end());
       // Key setters likewise bind to the elevated callable entry, so the
       // harness that calls that entry installs them before the call.
       for (Function *Ent : W.entries) {
@@ -6424,6 +6777,15 @@ void Client::emit(const Plan &P, Module &H) const {
           out.push_back(fileNames[i]);
     return out;
   };
+  // The text constants a parameter (or a text field it carries) is compared
+  // against; §3.5: a writer realizing an input-name slot takes the input file
+  // name here, so the file-name variants are offered alongside them.
+  auto texts = [&](Function *F, unsigned i, const std::vector<int64_t> &path) {
+    std::vector<std::string> ts = compared(F, i, path);
+    if (P.nameWriters.count(F->getName().str()) && std::find(ts.begin(), ts.end(), "f") == ts.end())
+      ts.push_back("f");
+    return named(ts);
+  };
   Function *Main = Function::Create(FunctionType::get(Type::getInt32Ty(ctx), false), GlobalValue::ExternalLinkage, "main", &H);
   IRBuilder<> B(BasicBlock::Create(ctx, "entry", Main));
   K.start(B);
@@ -6652,7 +7014,7 @@ void Client::emit(const Plan &P, Module &H) const {
     if (auto *B = dyn_cast_or_null<DIBasicType>(P))
       if (B->getEncoding() == dwarf::DW_ATE_signed_char && B->getName() == "char")
         return nullOr(C, nullable, [&](IRBuilder<> &D) {
-          return w.F ? K.text(D, compared(w.F, w.i, w.path)) : K.text(D);
+          return w.F ? K.text(D, texts(w.F, w.i, w.path)) : K.text(D);
         });
     auto *S = def(P);
     std::string key = S ? typeKey(S) : "";
@@ -6797,7 +7159,7 @@ void Client::emit(const Plan &P, Module &H) const {
             v = C.CreateGlobalStringPtr("");
             break;
           }
-          v = nullOr(C, nullable, [&](IRBuilder<> &D) { return K.text(D, named(compared(F, i))); });
+          v = nullOr(C, nullable, [&](IRBuilder<> &D) { return K.text(D, texts(F, i, {})); });
           break;
         case Kind::Callback: {
           auto ct = fnTypes.find({F, i});

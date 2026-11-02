@@ -190,6 +190,9 @@ public:
     // 정의 R: one per return obligation of the witness, realized like a cell.
     std::vector<Realized> returns;
     std::vector<Function *> cover;
+    // §3.5: writers in the cover that realize an input-name slot. The harness
+    // offers the input file name to their text parameters.
+    std::set<std::string> nameWriters;
     std::vector<std::pair<Function *, Keyed>> keyed;
     // §3.9 정의 E: per Construct cell established by a store, the store's
     // position and the may sequence that reaches it.
@@ -228,6 +231,9 @@ public:
     std::vector<std::string> keys;
     // §3.9: the union of the write covers of the witnesses that pass.
     std::vector<Function *> writers;
+    // §3.5: writers that realize an input-name slot; the harness passes the
+    // input file name to their text parameters.
+    std::set<std::string> nameWriters;
     // §3.9: per witness, the realization of each obligation cell.
     std::vector<WitnessPlan> witnesses;
     // §3.7: per witness, its indirect edges and how Definition D realizes
@@ -495,7 +501,7 @@ private:
   // entry — that soft-accepts and skips the real E that installs φ/named.
   bool entryCallable(Function *F) const;
   std::vector<Function *> entries(Function *E) const;
-  std::vector<Function *> writers(const Cell &c) const;
+  std::vector<Function *> writers(const Cell &c, const std::string &rootType = "") const;
   // Whether any defined function stores to the field (struct type, offset).
   // A field no body writes is immutable after construction: its value is the
   // one the library's own static data (a const table, a zeroed allocation)
@@ -588,6 +594,9 @@ private:
   // W stores a value of its arguments to c's field or a field E copies
   // into it.
   bool carries(Function *W, const Cell &c, Function *E) const;
+  // §3.5: W writes c's field from one of its own name (text) parameters,
+  // tracked through the string interning that defeats `carries`.
+  bool namesCell(Function *W, const Cell &c) const;
   // §7: F's closure calls an input primitive.
   bool readsInput(Function *F) const;
   mutable FnMap<bool> readsOf;
