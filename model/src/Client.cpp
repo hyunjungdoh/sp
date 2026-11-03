@@ -1402,30 +1402,67 @@ const std::vector<std::string> &Client::compared(Function *F, unsigned i, const 
 }
 
 // §2.4 Key(t): the names a function t is registered under, where an indirect
-// call can reach it. A store of t into a field of an object some call made
-// names t by the text constants passed to that call; a constant record that
-// holds t names it by the text constants beside it. A name is a token
+// call can reach it. What a library registers is t itself, an installer of t
+// (the constructor that installs the vtable holding t), or a factory that
+// directly calls that installer (OIIO's raw_input_imageio_create). The
+// names are the text constants beside the registered function's address: in
+// the arguments of the call that registers it (declare_imageio_format("raw",
+// &create, extensions)), in a constant record that holds it (a plugin
+// descriptor, a driver table), or in the arguments of the call that made the
+// object it is stored into (AcquireMagickInfo("TIFF", ..) before
+// entry->decoder = ReadTIFFImage). An argument that is a constant array of
+// text constants (an extension list) names it by each. A name is a token
 // (letters and digits, at most 16), since the client spells it as the
 // extension of the input file's name.
 std::vector<std::string> Client::keysOf(Function *T) const {
   std::vector<std::string> out;
   std::set<std::string> seen;
-  auto add = [&](Value *V) {
+  std::function<void(Value *, int)> add = [&](Value *V, int depth) {
     auto *GV = dyn_cast<GlobalVariable>(getUnderlyingObject(V));
-    auto *D = GV && GV->hasInitializer() ? dyn_cast<ConstantDataSequential>(GV->getInitializer()) : nullptr;
-    if (!D || !D->isCString())
+    if (!GV || !GV->hasInitializer() || depth > 1)
       return;
-    std::string s = D->getAsCString().str();
-    bool token = !s.empty() && s.size() <= 16;
-    for (char c : s)
-      token = token && std::isalnum((unsigned char)c);
-    if (token && out.size() < 8 && seen.insert(s).second)
-      out.push_back(s);
+    if (auto *D = dyn_cast<ConstantDataSequential>(GV->getInitializer())) {
+      if (!D->isCString())
+        return;
+      std::string s = D->getAsCString().str();
+      bool token = !s.empty() && s.size() <= 16;
+      for (char c : s)
+        token = token && std::isalnum((unsigned char)c);
+      if (token && out.size() < 8 && seen.insert(s).second)
+        out.push_back(s);
+      return;
+    }
+    // A table of names: each element names the function.
+    if (auto *A = dyn_cast<ConstantAggregate>(GV->getInitializer()))
+      for (Use &U : A->operands())
+        add(U.get(), depth + 1);
+  };
+  // The registered functions.
+  std::set<Function *> reg{T};
+  FnSet inst = installers(T);
+  for (Function *I : inst)
+    reg.insert(I);
+  for (Module *M : {&down, &up})
+    for (Function &G : *M)
+      for (Instruction &I : instructions(G))
+        if (auto *CB = dyn_cast<CallBase>(&I))
+          if (auto *C = dyn_cast<Function>(CB->getCalledOperand()->stripPointerCasts()))
+            if (Function *B = body(C->getName().str()); B && inst.count(B))
+              if (Function *GB = body(G.getName().str()))
+                reg.insert(GB);
+  auto isReg = [&](Value *V) {
+    auto *F = dyn_cast<Function>(V->stripPointerCasts());
+    if (!F)
+      return false;
+    if (reg.count(F))
+      return true;
+    Function *B = body(F->getName().str());
+    return B && reg.count(B);
   };
   auto maker = [&](Value *Base, auto &self, int depth) -> void {
     if (auto *CB = dyn_cast<CallBase>(Base)) {
       for (Value *A : CB->args())
-        add(A);
+        add(A, 0);
       return;
     }
     auto *L = dyn_cast<LoadInst>(Base);
@@ -1439,19 +1476,30 @@ std::vector<std::string> Client::keysOf(Function *T) const {
   };
   for (Module *M : {&down, &up}) {
     for (Function &G : *M)
-      for (Instruction &I : instructions(G))
-        if (auto *S = dyn_cast<StoreInst>(&I))
-          if (S->getValueOperand()->stripPointerCasts() == T)
+      for (Instruction &I : instructions(G)) {
+        if (auto *S = dyn_cast<StoreInst>(&I)) {
+          if (isReg(S->getValueOperand()))
             maker(getUnderlyingObject(S->getPointerOperand()), maker, 0);
+        } else if (auto *CB = dyn_cast<CallBase>(&I)) {
+          // The registration call: a registered function's address is an
+          // argument; the names are the other arguments.
+          bool regArg = false;
+          for (Value *A : CB->args())
+            regArg = regArg || isReg(A);
+          if (regArg)
+            for (Value *A : CB->args())
+              add(A, 0);
+        }
+      }
     std::function<void(Constant *)> record = [&](Constant *C) {
       if (!C || !isa<ConstantAggregate>(C))
         return;
       bool holds = false;
       for (Use &U : C->operands())
-        holds = holds || U.get()->stripPointerCasts() == T;
+        holds = holds || isReg(U.get());
       for (Use &U : C->operands()) {
         if (holds)
-          add(U.get());
+          add(U.get(), 0);
         record(dyn_cast<Constant>(U.get()));
       }
     };
@@ -5271,6 +5319,7 @@ Client::Plan Client::plan(const Witnesses &ws) const {
       continue;
     WitnessPlan W = realize(E, phi, wi < keyedIn.size() ? keyedIn[wi] : std::vector<Keyed>{},
                             wi < retsIn.size() ? retsIn[wi] : std::vector<Ret>{});
+    W.length = seq.size();
     if (std::find(P.firsts.begin(), P.firsts.end(), E) == P.firsts.end())
       P.firsts.push_back(E);
     for (Function *F : W.entries)
@@ -5634,6 +5683,58 @@ void Client::dispatch(const Witnesses &ws, Plan &P) const {
   }
 }
 
+// The entries main offers, in seed order. Every realized witness is a
+// faithful program, so each one's entry is offered (completeness). The seed
+// path (choice 0, §4 순서는 시드 경로만 정한다) is the one the search starts
+// from. §3.12 says it should establish the names the sink depends on; the
+// Key stage (§3 Own→Lever→Key) says registration keys that select the sink
+// callee must be set too. Per-entry emit offers only one entry's program, so
+// the seed entry must be able to set both — otherwise Key and named split
+// across entries and choice 0 cannot establish the full path.
+// Rank: most sink-dependent named keys (정의 3.8.6), then whether the entry
+// has a Key setter (P.keyed), then shorter witness length among those that
+// set a sink-dependent name. Entries that set none and have no Key keep the
+// witness order.
+std::vector<Function *> Client::seedOrder(const Plan &P) const {
+  std::vector<Function *> entries;
+  std::map<Function *, size_t, FnOrder> shortest;
+  for (const WitnessPlan &W : P.witnesses)
+    if (W.realized)
+      for (Function *E : W.entries) {
+        if (std::find(entries.begin(), entries.end(), E) == entries.end())
+          entries.push_back(E);
+        auto it = shortest.find(E);
+        if (it == shortest.end() || W.length < it->second)
+          shortest[E] = W.length;
+      }
+  if (entries.empty() && !P.firsts.empty())
+    entries = {P.firsts.front()};
+  auto sinkNames = [&](Function *E) {
+    std::set<std::string> ks;
+    if (auto it = P.named.find(E); it != P.named.end())
+      for (const Named &n : it->second)
+        if (n.sinkDep)
+          ks.insert(n.key);
+    return ks.size();
+  };
+  auto hasKey = [&](Function *E) {
+    auto it = P.keyed.find(E);
+    return it != P.keyed.end() && !it->second.empty();
+  };
+  std::stable_sort(entries.begin(), entries.end(), [&](Function *A, Function *B) {
+    size_t a = sinkNames(A), b = sinkNames(B);
+    if (a != b)
+      return a > b;
+    bool ka = hasKey(A), kb = hasKey(B);
+    if (ka != kb)
+      return ka;
+    // Length decides only among entries that set a sink-dependent name: the
+    // rest keep the witness order.
+    return a != 0 && shortest[A] < shortest[B];
+  });
+  return entries;
+}
+
 void Client::report(const Plan &P, raw_ostream &out) const {
   out << "interface D " << ifaceD.size() << " U " << ifaceU.size() << " headers " << headers.size() << "\n";
   out << "producible";
@@ -5679,6 +5780,22 @@ void Client::report(const Plan &P, raw_ostream &out) const {
     out << "key " << k << "\n";
   for (Function *F : P.entries)
     out << "entry " << F->getName() << " (" << sig(F) << ")\n";
+  {
+    std::vector<Function *> order = seedOrder(P);
+    for (size_t i = 0; i < order.size(); ++i) {
+      unsigned n = 0;
+      if (auto it = P.named.find(order[i]); it != P.named.end())
+        for (const Named &nm : it->second)
+          n += nm.sinkDep;
+      size_t len = 0;
+      for (const WitnessPlan &W : P.witnesses)
+        if (W.realized && std::find(W.entries.begin(), W.entries.end(), order[i]) != W.entries.end())
+          len = len ? std::min(len, W.length) : W.length;
+      bool keyed = P.keyed.count(order[i]) && !P.keyed.at(order[i]).empty();
+      out << "seed " << i << " " << order[i]->getName() << " sinkdep " << n << " key " << (keyed ? 1 : 0)
+          << " length " << len << "\n";
+    }
+  }
   for (const auto &h : P.handles) {
     out << "handle " << h.first << " cost " << (cost.count(h.first) ? std::to_string(cost.at(h.first)) : "-")
         << " producers " << h.second.size() << "\n";
@@ -5842,11 +5959,24 @@ struct Builder {
     B.SetInsertPoint(ok);
   }
 
+  // The characters the text last built holds: what a length field or length
+  // argument bounded by it stays within (A3). A fresh text holds textBound;
+  // a named one holds its own length. A slot, since the text may be built
+  // on a branch (nullable, one of several) and the bound is read after it.
+  AllocaInst *lastTextLen = nullptr;
+  AllocaInst *lenSlot(IRBuilder<> &B, uint64_t init) {
+    AllocaInst *A = entryAlloca(B, Type::getInt64Ty(ctx));
+    IRBuilder<> E(A->getNextNode());
+    E.CreateStore(E.getInt64(init), A);
+    return A;
+  }
+
   Value *text(IRBuilder<> &B) {
     const unsigned n = textBound;
     Value *p = B.CreateCall(mallocF, {B.getInt64(n + 1)});
     B.CreateCall(mkSym, {p, B.getInt64(n + 1), B.CreateGlobalStringPtr("text." + std::to_string(names++))});
     B.CreateStore(B.getInt8(0), B.CreateGEP(B.getInt8Ty(), p, B.getInt64(n)));
+    lastTextLen = lenSlot(B, n);
     return p;
   }
 
@@ -5860,22 +5990,28 @@ struct Builder {
     if (named.empty())
       return text(B);
     AllocaInst *slot = entryAlloca(B, PointerType::get(ctx, 0));
+    AllocaInst *len = lenSlot(B, textBound);
     std::vector<std::function<void(IRBuilder<> &)>> alts;
     auto addNamed = [&](const std::string &s) {
-      alts.push_back([&, slot, s](IRBuilder<> &C) {
+      alts.push_back([&, slot, len, s](IRBuilder<> &C) {
         Value *p = C.CreateCall(mallocF, {C.getInt64(s.size() + 1)});
         C.CreateCall(memcpyF, {p, C.CreateGlobalStringPtr(s), C.getInt64(s.size() + 1)});
         C.CreateStore(p, slot);
+        C.CreateStore(C.getInt64(s.size()), len);
       });
     };
     for (const std::string &s : named)
       if (s.size() == 1)
         addNamed(s);
-    alts.push_back([&, slot](IRBuilder<> &C) { C.CreateStore(text(C), slot); });
+    alts.push_back([&, slot, len](IRBuilder<> &C) {
+      C.CreateStore(text(C), slot);
+      C.CreateStore(C.getInt64(textBound), len);
+    });
     for (const std::string &s : named)
       if (s.size() != 1)
         addNamed(s);
     oneOf(B, alts, "text");
+    lastTextLen = len;
     return B.CreateLoad(PointerType::get(ctx, 0), slot);
   }
 
@@ -6759,7 +6895,13 @@ void Client::emit(const Plan &P, Module &H) const {
   // and a prefix also spares it from inferring the key from the bytes. The
   // library opens "f" for a prefixed name (it strips the scheme) and "f.k"
   // for an extension, both of which the file environment serves.
-  std::vector<std::string> fileNames{"f"};
+  // §3 Key: a name that carries a registration key selects the sink's reader
+  // at the dispatch; the bare "f" leaves the key to be inferred from the
+  // bytes or tried against every reader. The keyed names come first so the
+  // seed path (choice 0, §4) opens with a key wherever a name is chosen (a
+  // text parameter or a name field); bare "f" is last. With no keys the
+  // list is "f" alone.
+  std::vector<std::string> fileNames;
   for (const std::string &k : P.keys) {
     std::string lo = k;
     for (char &c : lo)
@@ -6769,12 +6911,27 @@ void Client::emit(const Plan &P, Module &H) const {
       fileNames.push_back("f." + lo);
     }
   }
+  const bool keyedNames = !fileNames.empty();
+  fileNames.push_back("f");
+  // For a text parameter, text() puts one-character alternatives first, so
+  // a bare "f" among the names would be chosen before the keyed ones. The
+  // file environment serves "f.k" and "k:f" exactly as "f", so when keys
+  // exist the keyed names stand in for "f" there; a name without a key
+  // remains available as the fresh text.
   auto named = [&](const std::vector<std::string> &ts) {
-    std::vector<std::string> out = ts;
-    if (std::find(ts.begin(), ts.end(), "f") != ts.end())
-      for (size_t i = 1; i < fileNames.size(); ++i)
-        if (std::find(out.begin(), out.end(), fileNames[i]) == out.end())
-          out.push_back(fileNames[i]);
+    std::vector<std::string> out;
+    bool hasF = false;
+    for (const std::string &s : ts) {
+      if (s == "f" && keyedNames) {
+        hasF = true;
+        continue;
+      }
+      out.push_back(s);
+    }
+    if (hasF)
+      for (const std::string &s : fileNames)
+        if (s != "f" && std::find(out.begin(), out.end(), s) == out.end())
+          out.push_back(s);
     return out;
   };
   // The text constants a parameter (or a text field it carries) is compared
@@ -6961,11 +7118,19 @@ void Client::emit(const Plan &P, Module &H) const {
       K.oneOf(C, alts, "union");
       return;
     }
+    std::map<int64_t, AllocaInst *> textLen;
     for (const DIDerivedType *M : members(S))
-      if (pointerIn(M->getBaseType()))
+      if (pointerIn(M->getBaseType())) {
+        K.lastTextLen = nullptr;
         put(C, M);
+        std::string k;
+        if (K.lastTextLen && classify(strip(M->getBaseType()), k) == Kind::Text)
+          textLen[(int64_t)(M->getOffsetInBits() / 8)] = K.lastTextLen;
+      }
     // A3 for fields: the bounding field stays within what its pointer field
-    // was given, by the rule for formals.
+    // was given, by the rule for formals. A text field was given a text of
+    // a length the client chose (a fresh one, or a name): the bound is that
+    // length, read from the slot the text left it in.
     for (const DIDerivedType *M : members(S)) {
       const DIType *MT = strip(M->getBaseType());
       auto fl = fieldLen.find({name, (int64_t)(M->getOffsetInBits() / 8)});
@@ -6982,8 +7147,20 @@ void Client::emit(const Plan &P, Module &H) const {
                      : E && pointerIn(E) != 0              ? 1
                                                            : K.capacity(E ? std::max<uint64_t>(1, E->getSizeInBits() / 8) : 1);
         Type *IT = C.getIntNTy(NB->getSizeInBits());
-        Value *v = C.CreateLoad(IT, C.CreateGEP(C.getInt8Ty(), at, C.getInt64(fl->second)));
-        K.require(C, C.CreateICmpULE(v, ConstantInt::get(IT, n)));
+        Value *bound = ConstantInt::get(IT, n);
+        auto tl = textLen.find((int64_t)(M->getOffsetInBits() / 8));
+        if (kind == Kind::Text && tl != textLen.end())
+          bound = C.CreateZExtOrTrunc(C.CreateLoad(C.getInt64Ty(), tl->second), IT);
+        // Choice 0 = the whole of what the pointer field holds (a zero
+        // length is an empty text or buffer); symbolic covers {0..bound}.
+        Value *fp = C.CreateGEP(C.getInt8Ty(), at, C.getInt64(fl->second));
+        std::vector<std::function<void(IRBuilder<> &)>> lenAlts;
+        lenAlts.push_back([&, fp, bound](IRBuilder<> &A) { A.CreateStore(bound, fp); });
+        lenAlts.push_back([&, fp, IT, bound](IRBuilder<> &A) {
+          Value *v = A.CreateLoad(IT, fp);
+          K.require(A, A.CreateICmpULE(v, bound));
+        });
+        K.oneOf(C, lenAlts, "length");
       }
     }
   };
@@ -7077,6 +7254,8 @@ void Client::emit(const Plan &P, Module &H) const {
     // with the buffers it bounds: a length that bounds one data buffer is
     // the size of the file in it (named length:<data>).
     std::map<unsigned, std::string> dataArg;
+    // Text arguments → the slot holding the length of the text chosen.
+    std::map<unsigned, AllocaInst *> argTextLen;
     std::vector<std::pair<CallInst *, std::vector<unsigned>>> lengths;
     for (unsigned i = 0; i < FT->getNumParams(); ++i) {
       Type *T = FT->getParamType(i);
@@ -7159,7 +7338,10 @@ void Client::emit(const Plan &P, Module &H) const {
             v = C.CreateGlobalStringPtr("");
             break;
           }
+          K.lastTextLen = nullptr;
           v = nullOr(C, nullable, [&](IRBuilder<> &D) { return K.text(D, texts(F, i, {})); });
+          if (K.lastTextLen)
+            argTextLen[i] = K.lastTextLen;
           break;
         case Kind::Callback: {
           auto ct = fnTypes.find({F, i});
@@ -7203,30 +7385,39 @@ void Client::emit(const Plan &P, Module &H) const {
         // a buffer when it is at most the element count: a buffer of N
         // bytes, a text of L characters, or the one object V-Obj builds. It
         // must stay within every buffer it bounds.
+        // A text already built left its length in a slot: that is its bound.
         uint64_t n = UINT64_MAX;
+        Value *dyn = nullptr;
         for (unsigned b : bs) {
           uint64_t nb = 1;
           if (at[b] >= 0) {
             const Param &q = sig[at[b]];
             const DIType *D = strip(q.di);
             bool one = isPointer(D) && pointerIn(strip(cast<DIDerivedType>(D)->getBaseType())) != 0;
+            auto tl = argTextLen.find(b);
+            if (q.kind == Kind::Text && tl != argTextLen.end()) {
+              Value *l = C.CreateZExtOrTrunc(C.CreateLoad(C.getInt64Ty(), tl->second), T);
+              dyn = dyn ? C.CreateSelect(C.CreateICmpULT(l, dyn), l, dyn) : l;
+              continue;
+            }
             nb = q.kind == Kind::Text ? textBound : one ? 1 : K.capacity(q.elem);
           }
           n = std::min(n, nb);
         }
+        Value *bound = ConstantInt::get(T, n);
+        if (dyn)
+          bound = n == UINT64_MAX ? dyn : C.CreateSelect(C.CreateICmpULT(dyn, bound), dyn, bound);
         // Choice 0 = full buffer: a zero length satisfies ule n but libraries
         // treat it as empty I/O (e.g. TIFFReadEncodedStrip size→0 skips
         // decode). Seed must exercise the bounded call; symbolic covers the
         // rest of {0..n}.
         AllocaInst *lenSlot = K.entryAlloca(C, T);
         std::vector<std::function<void(IRBuilder<> &)>> lenAlts;
-        lenAlts.push_back([&, lenSlot, T, n](IRBuilder<> &A) {
-          A.CreateStore(ConstantInt::get(T, n), lenSlot);
-        });
-        lenAlts.push_back([&, lenSlot, T, n, bs](IRBuilder<> &A) {
+        lenAlts.push_back([&, lenSlot, bound](IRBuilder<> &A) { A.CreateStore(bound, lenSlot); });
+        lenAlts.push_back([&, lenSlot, T, bound, bs](IRBuilder<> &A) {
           Value *s = K.symbolic(A, T, "length");
           lengths.push_back({cast<CallInst>(cast<Instruction>(s)->getPrevNode()), bs});
-          K.require(A, A.CreateICmpULE(s, ConstantInt::get(T, n)));
+          K.require(A, A.CreateICmpULE(s, bound));
           A.CreateStore(s, lenSlot);
         });
         K.oneOf(C, lenAlts, "length");
@@ -7499,10 +7690,18 @@ void Client::emit(const Plan &P, Module &H) const {
   }
   hoist(B, P.entries);
   // §4: (skip | w)^K, w ∈ writers (정의 6의 최소 덮개).
+  // Choice 0 follows the recovered context: slot k calls the k-th writer of
+  // the cover, so the seed path establishes the cells the plan found
+  // necessary; skipping and the other writers remain the client's choice.
   for (unsigned k = 0; k < writerSlots && !P.writers.empty(); ++k) {
-    std::vector<std::function<void(IRBuilder<> &)>> alts{[](IRBuilder<> &) {}};
-    for (Function *W : P.writers)
-      alts.push_back([&, W](IRBuilder<> &C) { call(C, W, "", -1); });
+    std::vector<std::function<void(IRBuilder<> &)>> alts;
+    auto skip = [](IRBuilder<> &) {};
+    if (k < P.writers.size())
+      alts.push_back([&, W = P.writers[k]](IRBuilder<> &C) { call(C, W, "", -1); });
+    alts.push_back(skip);
+    for (unsigned j = 0; j < P.writers.size(); ++j)
+      if (j != k)
+        alts.push_back([&, W = P.writers[j]](IRBuilder<> &C) { call(C, W, "", -1); });
     K.oneOf(B, alts, "write");
   }
   // §3.8 정의 3.8.4 키 세터 레버: entry를 부르기 직전, 보유 핸들 h 위에서 키 세터
@@ -7590,18 +7789,14 @@ void Client::emit(const Plan &P, Module &H) const {
   {
     // Every realized witness reaches the sink; none is more the client's
     // than another, so main offers each one's entry. An unrealized witness
-    // is not offered.
-    std::vector<Function *> entries;
-    for (const WitnessPlan &W : P.witnesses)
-      if (W.realized)
-        for (Function *E : W.entries)
-          if (std::find(entries.begin(), entries.end(), E) == entries.end())
-            entries.push_back(E);
-    if (entries.empty() && !P.firsts.empty())
-      entries = {P.firsts.front()};
-    std::vector<std::function<void(IRBuilder<> &)>> alts;
-    for (Function *E : entries)
-      alts.push_back([&, E](IRBuilder<> &C) {
+    // is not offered. Choice 0 is the seed path (§4): the entry that can
+    // set the most names the sink depends on (§3.12).
+    std::vector<Function *> entries = seedOrder(P);
+    // Each entry's program is a function of its own, client.entry.<k> in
+    // seed order, so a run can take the witnesses one at a time in that
+    // order (one harness per witness) while main, choosing among them, is
+    // the same client as before.
+    auto body = [&](IRBuilder<> &C, Function *E) {
         auto kit = P.keyed.find(E);
         if (kit != P.keyed.end())
           for (const auto &[W, k] : kit->second)
@@ -7620,7 +7815,16 @@ void Client::emit(const Plan &P, Module &H) const {
         auto g = P.guards.find(E);
         auto f = P.files.find(E);
         call(C, E, "", -1, g == P.guards.end() ? nullptr : &g->second, f == P.files.end() ? nullptr : &f->second);
-      });
+    };
+    std::vector<std::function<void(IRBuilder<> &)>> alts;
+    for (size_t k = 0; k < entries.size(); ++k) {
+      Function *EF = Function::Create(FunctionType::get(Type::getVoidTy(ctx), false), Function::ExternalLinkage,
+                                      "client.entry." + std::to_string(k), &H);
+      IRBuilder<> C(BasicBlock::Create(ctx, "entry", EF));
+      body(C, entries[k]);
+      C.CreateRetVoid();
+      alts.push_back([EF](IRBuilder<> &A) { A.CreateCall(EF); });
+    }
     K.oneOf(B, alts, "entry");
   }
   B.CreateRet(B.getInt32(0));

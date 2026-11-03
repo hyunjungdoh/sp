@@ -202,6 +202,8 @@ public:
     std::vector<std::string> excluded;
     // The function sequence the plan is for, when it answers a 정의 E query.
     std::vector<std::string> seq;
+    // The length of the witness (functions from π₀ to the sink line).
+    size_t length = 0;
     // §3.9: iface(callable entry exists) ∧ every obligation cell non-Open.
     // Controls which writers and key setters the harness installs.
     bool pass = false;
@@ -301,6 +303,9 @@ public:
   std::vector<std::pair<std::string, std::string>> openDispatchEdges(const std::vector<std::string> &seq) const;
   void report(const Plan &P, raw_ostream &out) const;
   void emit(const Plan &P, Module &H) const;
+  // The entries main offers, seed (choice 0) first: §3.12 sink-dependent
+  // names decide the seed between entries as they do within one.
+  std::vector<Function *> seedOrder(const Plan &P) const;
   // Bounds of the client search: writer calls before the entry, and the
   // bytes of every input channel.
   void bounds(unsigned writers, unsigned input, unsigned depth, unsigned text) {
