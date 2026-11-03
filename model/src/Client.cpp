@@ -5638,8 +5638,14 @@ void Client::dispatch(const Witnesses &ws, Plan &P) const {
               by.insert(G->getName().str());
         for (const std::string &g : by)
           how += " input:" + g;
-        if (!by.empty() && !(choices.size() == 1 && St.size() > 1))
+        if (!by.empty() && !(choices.size() == 1 && St.size() > 1)) {
+          // The dispatcher A (e.g. ImageInput::create) resolves T's reader
+          // through the library's lazy registry; main() warms it up before
+          // the fork so the registry is built once in the pristine state.
+          if (std::find(P.inputDispatchers.begin(), P.inputDispatchers.end(), A) == P.inputDispatchers.end())
+            P.inputDispatchers.push_back(A);
           inputGates.push_back(std::move(by));
+        }
       }
       for (Function *W : setters) {
         bool by = false;
@@ -7688,6 +7694,110 @@ void Client::emit(const Plan &P, Module &H) const {
     K.require(X, X.CreateICmpNE(got, ConstantPointerNull::get(p0)));
     X.CreateRet(got);
   }
+  // Option 1 (eager library-registry init). Before the client forks on the
+  // symbolic input, call each input-dispatch function once, concretely, with
+  // a file name that carries a registration key. The dispatcher (e.g.
+  // ImageInput::create) resolves the reader by extension, which builds the
+  // library's lazy plugin/codec registry (catalog_all_plugins, run once by
+  // call_once) to completion in this single pristine state. Every state the
+  // search then forks inherits the finished registry, so create() installs
+  // the sink's reader instead of returning null. The registry is a per-state
+  // global, so a catalog built lazily inside one forked state never reaches
+  // the others — the reason the sink was unreachable without this. The call
+  // names a non-existent file with do_open(=the bool/0) false, so it only
+  // populates the registry; it never decodes and never touches the cache.
+  if (!P.inputDispatchers.empty() && !P.keys.empty()) {
+    std::string ext = P.keys.front();
+    for (char &c : ext)
+      c = (char)std::tolower((unsigned char)c);
+    std::string warmName = "f." + ext;
+    Value *gname = B.CreateGlobalStringPtr(warmName, "client.warmup.name");
+    auto *i8 = Type::getInt8Ty(ctx);
+    for (Function *A : P.inputDispatchers) {
+      if (!A)
+        continue;
+      auto sig = signature(A);
+      // Warm up only a create(name, ...)-style dispatcher: one whose first
+      // parameter is the file name itself, so the client can call it with a
+      // name and nulls. A decode(handle, ...) dispatcher (TIFFReadEncodedStrip,
+      // a C++ decode method) takes a receiver the client cannot build before
+      // the fork; calling it with a null handle would fault, so skip it — its
+      // library installs the reader at open/init, not through a name dispatch.
+      bool firstIsName =
+          !sig.empty() && (sig[0].kind == Kind::Text ||
+                           (sig[0].kind == Kind::Aggregate && sig[0].type.find("basic_string") != std::string::npos));
+      if (!firstIsName)
+        continue;
+      auto at = irParams(A);
+      FunctionType *FT = A->getFunctionType();
+      unsigned shift = A->hasParamAttribute(0, Attribute::StructRet) ? 1 : 0;
+      std::vector<Value *> args;
+      int strSeen = 0;
+      for (unsigned i = 0; i < FT->getNumParams();) {
+        Type *T = FT->getParamType(i);
+        if (i < shift) {
+          Type *S = A->getParamStructRetType(i);
+          args.push_back(K.entryAlloca(B, S ? S : (Type *)Type::getInt64Ty(ctx)));
+          ++i;
+          continue;
+        }
+        int s = i < at.size() ? at[i] : -1;
+        Param p;
+        if (s >= 0)
+          p = sig[s];
+        bool strish = p.kind == Kind::Text ||
+                      (p.kind == Kind::Aggregate && p.type.find("basic_string") != std::string::npos);
+        // A non-string aggregate: zero it. By reference it is one pointer to
+        // a zeroed buffer; by value it is its eightbytes, each zero.
+        if (s >= 0 && p.kind == Kind::Aggregate && !strish) {
+          uint64_t sz = std::max<uint64_t>(p.size, 1);
+          if (p.indirect && T->isPointerTy()) {
+            Value *buf = K.entryAlloca(B, ArrayType::get(i8, sz));
+            B.CreateMemSet(buf, B.getInt8(0), B.getInt64(sz), MaybeAlign(1));
+            args.push_back(buf);
+            ++i;
+            continue;
+          }
+          unsigned last = i + 1;
+          while (last < FT->getNumParams() && (last >= at.size() || at[last] < 0))
+            ++last;
+          for (unsigned j = i; j < last; ++j)
+            args.push_back(Constant::getNullValue(FT->getParamType(j)));
+          i = last;
+          continue;
+        }
+        // The first string-like parameter is the file name; later ones (a
+        // format hint) stay empty. A char* takes the global string; a
+        // string_view/string by reference takes a {data, len} it points to.
+        if (strish) {
+          if (p.kind == Kind::Text && T->isPointerTy()) {
+            args.push_back(strSeen == 0 ? gname : (Value *)B.CreateGlobalStringPtr(""));
+            ++strSeen;
+            ++i;
+            continue;
+          }
+          uint64_t sz = std::max<uint64_t>(p.size, 16);
+          Value *sv = K.entryAlloca(B, ArrayType::get(i8, sz));
+          B.CreateMemSet(sv, B.getInt8(0), B.getInt64(sz), MaybeAlign(1));
+          if (strSeen == 0) {
+            B.CreateStore(gname, B.CreateGEP(i8, sv, B.getInt64(0)));
+            B.CreateStore(B.getInt64(warmName.size()), B.CreateGEP(i8, sv, B.getInt64(8)));
+          }
+          args.push_back(sv);
+          ++strSeen;
+          ++i;
+          continue;
+        }
+        if (T->isPointerTy())
+          args.push_back(ConstantPointerNull::get(p0));
+        else
+          args.push_back(Constant::getNullValue(T));
+        ++i;
+      }
+      if (strSeen > 0)
+        B.CreateCall(declare(A), args);
+    }
+  }
   hoist(B, P.entries);
   // §4: (skip | w)^K, w ∈ writers (정의 6의 최소 덮개).
   // Choice 0 follows the recovered context: slot k calls the k-th writer of
@@ -7720,7 +7830,17 @@ void Client::emit(const Plan &P, Module &H) const {
       } else if (at[i] == k.tag && T->isIntegerTy()) {
         args.push_back(ConstantInt::get(T, (uint64_t)k.tagV, true));
       } else if (T->isPointerTy()) {
-        args.push_back(ConstantPointerNull::get(p0));
+        // The setter may be a method: its receiver (and any held object it
+        // dereferences) must be a real value, exactly as `call` builds them.
+        // A null `this` faults before the key is ever set (cf. the null-handle
+        // dispatcher guard above). Build what the harness can; an opaque
+        // pointer with no constructor stays null (§2.2 V-Opaque).
+        const Param *p = at[i] >= 0 ? &sig[at[i]] : nullptr;
+        if (p && (p->kind == Kind::Object || p->kind == Kind::Handle) &&
+            (held(*p) || p->kind == Kind::Handle) && cost.count(p->type))
+          args.push_back(obtain(C, p->type));
+        else
+          args.push_back(ConstantPointerNull::get(p0));
       } else {
         args.push_back(K.symbolic(C, T, "arg"));
       }

@@ -244,6 +244,12 @@ public:
     // §3.7 D item 2 / H3: first input-dispatch installer per witness
     // (`input:F`). The search approaches these before the sink (Π_I gate).
     std::vector<std::string> stInstallers;
+    // Option 1 (eager registry init): the input-dispatch functions (e.g.
+    // ImageInput::create) on the witnesses' `input:` edges. main() warms
+    // each up — a concrete call with a keyed file name before the input is
+    // made symbolic — so the library's lazy plugin/codec registry is built
+    // in the single pristine state and every forked state inherits it.
+    std::vector<Function *> inputDispatchers;
     // Per producer of a held type, the calls that can establish the state
     // it reads before it can produce.
     std::map<std::pair<Function *, std::string>, std::vector<Function *>, FnOrder> deps;
