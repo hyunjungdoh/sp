@@ -6,19 +6,19 @@
 
 \autoref{fig:overview} illustrates the workflow of \sys.
 As formalized in \autoref{sec:moti}, our goal is to determine whether a vulnerability in an upstream library~$U$ can be triggered through a downstream application~$D$.
-This requires finding a path from a public API of~$D$ to the vulnerable operation~$s$, establishing the runtime state needed to execute that path, and finding input data~$X$ that triggers~$s$ under that state.
+This requires finding a path from a public API of~$D$ to the vulnerable operation~$s$ and establishing the runtime state needed to execute that path, so that a given data input~$X$ triggers~$s$ under that state.
 
 \sys addresses these requirements in three phases.
 P1 recovers trigger paths and identifies the public APIs that establish the memory values required along each path.
 P2 uses this information to synthesize a client harness, supplementing it with constants and configuration settings that can affect path execution but are not captured by P1.
-P3 performs concolic execution on the generated harness to find input data that triggers~$s$.
+P3 performs concolic execution on the generated harness, with~$X$ held fixed, to determine whether that input triggers~$s$.
 
 The three phases address different obstacles to reaching~$s$.
 A trigger path specifies the conditions for reaching~$s$, but does not tell a client how to establish them through~$D$.
 P1 addresses this gap through \emph{setup attribution}, which connects path conditions to the public APIs that can establish the required state.
 Even with these APIs, however, a path may not execute as intended: the harness must construct the required objects, select the appropriate indirect-call targets, and account for configuration settings that affect execution outside the entry arguments.
 P2 addresses these issues through \emph{directed harness synthesis}, which turns the attributed context into an executable harness and guides exploration toward the recovered path.
-P3 then searches for the input that triggers the vulnerability.
+P3 then determines whether the given input triggers the vulnerability under the configuration established by the harness.
 
 \begin{figure}[t]
 \centering
@@ -29,9 +29,9 @@ P3 then searches for the input that triggers the vulnerability.
 
 \PP{Design assumptions}
 \sys analyzes the compiled intermediate representations of~$D$ and~$U$ with debug information, which provides function signatures, structure layouts, and field names.
-It takes the location of~$s$ and the public APIs of~$D$ as input.
+It takes the location of~$s$, the public APIs of~$D$, and a data input~$X$ as input.
 We assume that a client interacts with~$D$ only through these public APIs.
-Values that cannot be established through them are treated as input-dependent and left to P3.
+Values that cannot be established through them are treated as depending on~$X$ and are checked against that input in P3.
 
 \subsection{Configuration Context Recovery (P1)}
 \label{subsec:p1}
@@ -85,7 +85,7 @@ $c=(o,\alpha)$, where~$o$ is an argument of~$f_0$ or an object obtained through 
 This representation identifies both the required value and the object on which a client must establish it.
 
 \sys examines the branch predicates along~$\pi$ and retains those whose operands can be expressed as entry-relative cells and constants.
-Predicates that depend on input data are left to P3.
+Predicates that depend on the data input are checked against the given~$X$ in P3.
 When a caller branches on a callee's return value, \sys maps the return-value condition back to the values passed by the caller, allowing the requirement to be expressed in the same entry-relative form.
 It also checks whether the indirect-call targets implied by the path are consistent with the call context; a path with a contradictory target is discarded.
 
@@ -121,7 +121,7 @@ This allows \sys to distinguish an API that configures the object later read by 
 
 Setup attribution is nevertheless an approximation, not a proof that the recovered path will execute.
 The call graph and value information may over-approximate possible behavior, conditions are recovered per path, and the selected setup APIs form a bounded cover rather than an exhaustive set of ways to establish the state.
-P2 therefore treats each retained context as a candidate harness configuration, and P3 determines whether an input can actually trigger~$s$.
+P2 therefore treats each retained context as a candidate harness configuration, and P3 determines whether the given input actually triggers~$s$ under that configuration.
 
 \subsection{Harness Generation (P2)}
 \label{subsec:p2}
@@ -141,12 +141,12 @@ These choices guide concolic exploration without fixing every possible value in 
 For each retained context, \sys generates a harness that interacts with~$D$ only through its public APIs.
 It obtains the objects required by the entry point through public producers, reusing compatible objects when possible, and invokes the setup APIs attributed by P1.
 For required cells that can be initialized directly, the harness writes the corresponding values before invoking the entry point, unless object construction or a setup call has already established them.
-It then invokes the entry point with symbolic input.
+It then invokes the entry point on the given data input.
 
 The harness does not commit to every optional setup operation or argument.
 Instead, it preserves the alternatives identified by P1 as choices for concolic exploration.
 The initial execution follows the attributed context, while subsequent executions can explore other permitted choices.
-Conditions that depend on input bytes remain symbolic and are handled by P3.
+Conditions that depend on bytes of~$X$ are resolved from that input during P3.
 
 \PP{S2: Supply constants associated with registered targets}
 A recovered indirect-call target does not by itself tell the harness how to select that target at runtime.
@@ -199,28 +199,28 @@ Thus, P1 identifies how a client can establish the state required by a path, whi
 \subsection{Concolic Execution (P3)}
 \label{subsec:p3}
 
-In P3, \sys performs concolic execution on each generated harness to find input data~$X$ that triggers~$s$ under the configuration~$C$ the harness establishes.
+In P3, \sys performs concolic execution on each generated harness to determine whether a given data input~$X$ triggers~$s$ under the configuration~$C$ established by the harness.
+\sys holds~$X$ fixed and does not synthesize a new payload.
+It searches the configuration choices that the harness leaves open.
 
-Unlike the original KLEE~\cite{cadar2008klee}, which performs full symbolic execution, \sys adopts concolic execution~\cite{majumdar2007hybrid}: it follows execution paths using concrete inputs and invokes an SMT solver~\cite{de2008z3} only to solve unexplored branch conditions and generate new seeds.
+Unlike the original KLEE~\cite{cadar2008klee}, which performs symbolic execution, \sys uses concolic execution~\cite{majumdar2007hybrid}: it follows execution paths with concrete inputs and invokes an SMT solver~\cite{de2008z3} to solve constraints on those configuration choices.
 
 \PP{Seed scheduling}
-Concolic execution begins from the directed configuration~$C$ that P2 established and explores outward from it.
-\sys maintains a pool of execution states, each carrying a concrete assignment to the symbolic input, and schedules them so that the search makes progress toward~$s$ rather than exploring~$D$ and~$U$ uniformly.
-To this end, it uses the call-graph distance that P2 emits for each function: states whose continuation reduces the distance to~$s$ are preferred, drawing the search along the recovered trigger path.
-When a branch depends on input bytes, \sys consults the SMT solver only for the directions that keep a path toward~$s$ feasible, and each solution becomes a new seed added to the pool.
-The alternatives that P2 left open---optional setup operations, constants associated with registered targets, and configuration settings---are scheduled ahead of unrelated branches, so the initial executions follow the attributed context before other choices are considered.
-This confines exploration to the region of the program relevant to~$s$ and bounds the cost of concolic execution on the large combined module of~$D$ and~$U$.
+Concolic execution starts from the configuration~$C$ established by P2 and the given data input~$X$. \sys maintains a pool of execution states, each carrying~$X$ together with a concrete assignment to the open configuration choices. To guide exploration toward~$s$, it prioritizes states using the call-graph distance emitted by P2. States closer to~$s$ are explored first, directing the search along the recovered trigger path. States with no call-graph path to~$s$ are discarded.
 
-\PP{Indirect-call dispatch}
-A trigger path typically crosses the boundary between~$D$ and~$U$ through indirect calls, such as a factory that returns a registered implementation or a virtual call dispatched through a vtable.
-At such a site the callee is not statically fixed, and resolving it naively either stalls the search or forks into every candidate target, reintroducing the path explosion that the directed search is meant to avoid.
-\sys instead resolves each indirect call using the targets that P1 recovered and P2 supplied as metadata, restricting the callee to the target consistent with the current call context.
-For that target to be selectable, the library's own dispatch state must already be in place: the registry that maps a format or key to its implementation is often populated lazily, and the registration constants from P2 select a target only once that registry exists.
-\sys therefore establishes the relevant registration state before the dispatch point, so that the factory or virtual call resolves to the recovered implementation and execution continues along the trigger path instead of diverging into an unrelated or empty handler.
+A branch that depends only on~$X$ follows the concrete bytes of that input. \sys does not flip such a branch into a different payload. When a branch depends on a configuration choice, \sys flips its condition and invokes the SMT solver to check whether the resulting constraint is satisfiable. Each satisfying assignment becomes a new state in the pool, with~$X$ unchanged. The solver checks the feasibility of the branch condition; it does not determine whether the resulting path reaches~$s$.
+
+\sys also explores alternatives that P2 leaves open, such as optional setup operations and alternative configuration values. For dispatch-table gates identified by the static analysis, it generates additional flips that favor keys selecting installers whose call paths reach~$s$. These targeted flips guide execution toward the required dispatch state without asking the solver to determine sink reachability.
+
+\PP{Indirect-call handling}
+Trigger paths often cross the boundary between~$D$ and~$U$ through indirect calls, such as factory functions that return registered implementations or virtual calls dispatched through vtables. The actual callee depends on the function pointer selected at runtime, which may in turn depend on the library's dispatch state.
+
+To prepare this state, the harness generated by P2 executes the normal initialization path once with a concrete dispatch key before symbolic execution states are forked. This allows lazily populated registries, such as plugin or codec catalogs, to be initialized and inherited by the subsequent states.
+
+During concolic execution, \sys follows the target indicated by the concrete function pointer. It does not replace the runtime target with one of the targets recovered by P1. Instead, it checks whether the observed target is included in the statically recovered call relation for that call site. A mismatch is recorded and reported as a warning, but does not prevent the call. The recovered targets also contribute to call-graph distances used for state prioritization. Thus, static call relations guide the search while the actual dispatch remains governed by the program's runtime state.
 
 \PP{Engine support}
-Executing~$D$ and~$U$ together under concolic execution requires the engine to tolerate the full C/C++ runtime these libraries depend on.
-Off-the-shelf KLEE terminates a state when it reaches an unsupported part of \texttt{libstdc++} or an unmodeled external function such as \texttt{strdup} or \texttt{getenv}, which would abort exploration before it reaches~$s$.
-To prevent this, we built a custom \texttt{libstdc++} library and extended KLEE's symbolic environment models so that these runtime and external calls execute without terminating the state.
-We further avoid over-constraining input expressions when modeling these operations, so that the conditions \sys solves remain those of~$D$ and~$U$ rather than artifacts of the environment model.
+Executing~$D$ and~$U$ together under concolic execution requires support for the C/C++ runtime used by both libraries. Off-the-shelf KLEE may terminate an execution state when it encounters unsupported \texttt{libstdc++} functionality or an unmodeled external function, such as \texttt{strdup} or \texttt{getenv}. Such termination can prevent execution from reaching~$s$.
+
+To address this, we built a custom \texttt{libstdc++} library and extended KLEE's symbolic environment models to support these runtime and external calls. We also avoid over-constraining symbolic expressions when modeling these operations, so that the constraints solved by \sys reflect the behavior of~$D$ and~$U$, rather than artifacts introduced by the environment models.
 

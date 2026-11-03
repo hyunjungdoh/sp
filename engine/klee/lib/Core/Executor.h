@@ -446,10 +446,21 @@ private:
                  std::vector<std::vector<unsigned char>> &values);
   /// The same for a path condition with these objects; bytes the path does
   /// not read keep the parent input's values, if there is one.
+  /// --concolic-data-concrete: the payload X is fixed. Data objects keep the
+  /// bytes fixedDataBytes gives them and the solver assigns configuration
+  /// objects only, over the conjuncts that remain once those bytes are
+  /// substituted (a conjunct they refute makes the path infeasible).
   int solveInput(const ConstraintSet &path,
                  const std::vector<const Array *> &objects,
                  const Assignment *parent, SolverQueryMetaData &meta,
                  std::vector<std::vector<unsigned char>> &values);
+  /// --concolic-data-concrete: the bytes a data object (or the length of
+  /// one) keeps while a flip is solved: the parent input's, else the one
+  /// corpus file's. False for a configuration object, or when no value is
+  /// known (the solver then assigns it).
+  bool fixedDataBytes(const Array *a, const Assignment *parent,
+                      const std::vector<const Array *> &objects,
+                      std::vector<unsigned char> &out);
 
   /// Concolic mode. The fate of every state the search ends, and the
   /// candidates (pending flips) it creates. The run is exhaustive within its
@@ -459,6 +470,10 @@ private:
     uint64_t checkpoints = 0, checkpointAt = 0; // pristine moves, last count
     uint64_t slotMisses = 0; // executed indirect targets the slot rule omits
     uint64_t gates = 0; // Π_I gate flips spawned
+    uint64_t dataConcrete = 0; // --concolic-data-concrete: data-only branches
+                               // followed on the seed (not flipped, not kept)
+    uint64_t configForks = 0;  // --concolic-data-concrete: config branches
+                               // forked instead of collapsed to one seed value
     std::map<std::string, uint64_t> fates, open;
   } ledger;
   void concolicAccount(ExecutionState &state, StateTerminationType reason);
@@ -507,6 +522,10 @@ private:
   std::vector<std::vector<unsigned char>> corpus;
   std::map<const Array *, bool> dataObjects;
   bool isDataObject(const Array *array);
+  /// --concolic-data-concrete: true if every symbolic object e reads is a
+  /// data object (--concolic-data) or the length of one -- a branch on the
+  /// payload alone, with no object the harness left free.
+  bool dataOnly(ref<Expr> e);
   void bindCorpus(ExecutionState &state, ref<Expr> e);
   void bindLength(ExecutionState &state, const Array *data);
 

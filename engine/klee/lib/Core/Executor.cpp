@@ -318,6 +318,20 @@ cl::list<std::string> ConcolicData(
              "such an object takes when a path first depends on it"),
     cl::cat(SeedingCat));
 
+cl::opt<bool> ConcolicDataConcrete(
+    "concolic-data-concrete", cl::init(false),
+    cl::desc(
+        "Concolic mode: partition symbolic objects into seed-backed data "
+        "(--concolic-data) and harness configuration. A data-only branch "
+        "away from the sink follows the corpus concretely -- no flip and no "
+        "path conjunct -- so parser constraints never reach the solver; when "
+        "seeds disagree the state forks and each side keeps its seeds. A "
+        "configuration branch (anything that reads a non-data object) is "
+        "not collapsed by seed-extension concretization: both sides (or "
+        "every switch case) stay in the search while the payload remains "
+        "the seed (default=false)"),
+    cl::cat(SeedingCat));
+
 cl::opt<std::string>
     SeedTime("seed-time",
              cl::desc("Amount of time to dedicate to seeds, before normal "
@@ -1206,6 +1220,9 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
   int decided = (Concolic && isSeeding && !isa<ConstantExpr>(condition))
                     ? seedsDecide(current, condition)
                     : -1;
+  // Under --concolic-data-concrete, a data conjunct on a forked path is not
+  // kept (skipDataConjunct): the seed assignment alone steers the parse.
+  bool skipDataConjunct = false;
   if (decided >= 0) {
     // Concolic: the seeds decide the branch without the solver. The side no
     // seed takes is a flip: created pending (solved once when selected) for
@@ -1214,7 +1231,24 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
     // set (it may hold millions of conjuncts along a long concrete path); a
     // refuted flip is found by the one solver call that tries to seed it.
     unsigned decision = isInternal ? 0 : current.decisions++;
-    if (decided == 2) {
+    const bool atSink =
+        statsTracker && userSearcherRequiresSink() && sinkDistance(current) == 0;
+    // --concolic-data-concrete: X vs C. Data-only branches follow the corpus
+    // with no conjunct; seed disagreement forks and partitions seeds. Config
+    // branches are never locked to a single seed-extended value -- both
+    // sides stay searchable while the payload remains the seed.
+    if (ConcolicDataConcrete && !isInternal && !atSink && dataOnly(condition)) {
+      ++ledger.dataConcrete;
+      skipDataConjunct = true;
+      if (decided == 2)
+        res = Solver::Unknown; // keep every seed's payload path
+      else
+        res = decided ? Solver::True : Solver::False;
+    } else if (ConcolicDataConcrete && !isInternal && !atSink &&
+               !dataOnly(condition)) {
+      ++ledger.configForks;
+      res = Solver::Unknown; // explore C; do not collapse to one alternative
+    } else if (decided == 2) {
       res = Solver::Unknown; // seeds split, both sides seeded
     } else {
       bool flip = false;
@@ -1236,6 +1270,13 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
         addConstraint(current, decided ? condition : Expr::createIsZero(condition));
       }
     }
+  } else if (ConcolicDataConcrete && Concolic && isSeeding && !isInternal &&
+             !(statsTracker && userSearcherRequiresSink() &&
+               sinkDistance(current) == 0) &&
+             !isa<ConstantExpr>(condition) && !dataOnly(condition)) {
+    // Config branch the seeds do not evaluate: skip the solver and fork.
+    ++ledger.configForks;
+    res = Solver::Unknown;
   } else {
     time::Span timeout = coreSolverTimeout;
     if (isSeeding)
@@ -1414,8 +1455,13 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
       }
     }
 
-    addConstraint(*trueState, condition);
-    addConstraint(*falseState, Expr::createIsZero(condition));
+    // Data-only forks under --concolic-data-concrete keep no conjunct: each
+    // side's seeds steer the parse through the assignment alone (solveInput
+    // preserves parent bytes for unread cells). Config forks keep conjuncts.
+    if (!skipDataConjunct) {
+      addConstraint(*trueState, condition);
+      addConstraint(*falseState, Expr::createIsZero(condition));
+    }
 
     // Kinda gross, do we even really still want this option?
     if (MaxDepth && MaxDepth<=trueState->depth) {
@@ -1626,6 +1672,19 @@ bool Executor::isDataObject(const Array *array) {
   return dataObjects[array] = data;
 }
 
+bool Executor::dataOnly(ref<Expr> e) {
+  if (isa<ConstantExpr>(e))
+    return false;
+  std::vector<const Array *> arrays;
+  findSymbolicObjects(e, arrays);
+  if (arrays.empty())
+    return false;
+  for (const Array *a : arrays)
+    if (a->name.rfind("length:", 0) != 0 && !isDataObject(a))
+      return false;
+  return true;
+}
+
 // The length of data object d is the object the harness names "length:d":
 // a file is its bytes and its size, so the seed that gives d file f gives
 // it |f| (at most the size of d).
@@ -1735,6 +1794,42 @@ int Executor::solveInput(ExecutionState &state,
                     state.queryMetaData, values);
 }
 
+bool Executor::fixedDataBytes(const Array *a, const Assignment *parent,
+                              const std::vector<const Array *> &objects,
+                              std::vector<unsigned char> &out) {
+  const bool length = a->name.rfind("length:", 0) == 0;
+  if (!length && !isDataObject(a))
+    return false;
+  if (parent) {
+    auto p = parent->bindings.find(a);
+    if (p != parent->bindings.end() && p->second.size() == a->size) {
+      out = p->second;
+      return true;
+    }
+  }
+  // Not yet bound on this path (bindCorpus binds on first read). With one
+  // corpus file that is the value bindCorpus will give it; with several,
+  // which file this path follows is not recorded here.
+  if (corpus.size() != 1)
+    return false;
+  const std::vector<unsigned char> &f = corpus.front();
+  if (!length) {
+    out.assign(a->size, 0);
+    std::copy_n(f.begin(), std::min<size_t>(f.size(), a->size), out.begin());
+    return true;
+  }
+  const std::string dn = a->name.substr(7);
+  for (const Array *d : objects)
+    if (d->name == dn) { // as bindLength: |file|, at most the object's size
+      uint64_t n = std::min<uint64_t>(f.size(), d->size);
+      out.assign(a->size, 0);
+      for (unsigned b = 0; b < a->size && b < 8; ++b)
+        out[b] = (unsigned char)(n >> (8 * b));
+      return true;
+    }
+  return false;
+}
+
 int Executor::solveInput(const ConstraintSet &path,
                          const std::vector<const Array *> &objects,
                          const Assignment *parent, SolverQueryMetaData &meta,
@@ -1743,19 +1838,86 @@ int Executor::solveInput(const ConstraintSet &path,
     if (ConstantExpr *CE = dyn_cast<ConstantExpr>(c))
       if (CE->isFalse())
         return 0;
+
+  // --concolic-data-concrete: the payload X is fixed. A data object keeps the
+  // bytes its seed gave it (fixedDataBytes); the solver assigns configuration
+  // objects only. Each conjunct is first evaluated under those bytes: one
+  // that becomes false refutes the flip under X, one that becomes true is
+  // dropped, and the rest read configuration objects only. The solver thus
+  // never sees the parser's constraints over X (which it used to time out
+  // on) and cannot give a data byte a value the seed's path excluded. Such
+  // a value's guard was a data-only branch that kept no conjunct, e.g.
+  // klee_div_zero_check: a model with a zero divisor does not evaluate to a
+  // constant (ExprEvaluator keeps the symbolic divisor) and the
+  // IndependentSolver asserts on it.
+  Assignment fixed(/*_allowFreeValues=*/true);
+  std::vector<const Array *> free; // the objects the solver assigns
+  std::map<const Array *, size_t> freeIndex;
+  ConstraintSet reduced;
+  const ConstraintSet *query = &path;
+  if (ConcolicDataConcrete) {
+    for (const Array *a : objects) {
+      std::vector<unsigned char> bytes;
+      if (fixedDataBytes(a, parent, objects, bytes))
+        fixed.bindings[a] = std::move(bytes);
+      else
+        free.push_back(a);
+    }
+  } else {
+    free = objects;
+  }
+  if (!fixed.bindings.empty()) {
+    AssignmentEvaluator eval(fixed); // one visitor: its cache spans conjuncts
+    for (auto &c : path) {
+      ref<Expr> e = eval.visit(c);
+      if (ConstantExpr *CE = dyn_cast<ConstantExpr>(e)) {
+        if (CE->isFalse())
+          return 0;
+        continue;
+      }
+      reduced.push_back(e);
+    }
+    // An object the remaining conjuncts read that is not among `objects`.
+    std::set<const Array *> known(free.begin(), free.end());
+    for (auto &c : reduced) {
+      std::vector<const Array *> rest;
+      findSymbolicObjects(c, rest);
+      for (const Array *a : rest)
+        if (!fixed.bindings.count(a) && known.insert(a).second)
+          free.push_back(a);
+    }
+    query = &reduced;
+  }
+  for (size_t j = 0; j < free.size(); ++j)
+    freeIndex[free[j]] = j;
+
+  std::vector<std::vector<unsigned char>> model;
   bool hasSolution = false;
   solver->setTimeout(coreSolverTimeout);
   bool decided =
-      solver->getInitialValues(path, objects, values, meta, hasSolution);
+      solver->getInitialValues(*query, free, model, meta, hasSolution);
   solver->setTimeout(time::Span());
   if (!decided)
     return -1;
   if (!hasSolution)
     return 0;
+  values.clear();
+  values.reserve(objects.size());
+  for (const Array *a : objects) {
+    auto f = fixed.bindings.find(a);
+    if (f != fixed.bindings.end()) {
+      values.push_back(f->second);
+      continue;
+    }
+    size_t j = freeIndex[a];
+    values.push_back(j < model.size() ? model[j]
+                                      : std::vector<unsigned char>(a->size, 0));
+  }
   if (!parent)
     return 1;
-  // The constraints read only some bytes; the model fixes those, and every
-  // other byte keeps the parent's value, which is then also a model.
+  // The constraints read only some bytes of a free object; the model fixes
+  // those, and every other byte keeps the parent's value, which is then also
+  // a model.
   std::map<const Array *, std::vector<bool>> read;
   std::set<const Array *> whole;
   std::vector<ref<Expr>> stack;
@@ -1765,7 +1927,7 @@ int Executor::solveInput(const ConstraintSet &path,
     if (!isa<ConstantExpr>(e) && visited.insert(e).second)
       stack.push_back(e);
   };
-  for (auto &c : path)
+  for (auto &c : *query)
     push(c);
   while (!stack.empty()) {
     ref<Expr> top = stack.back();
@@ -1794,7 +1956,8 @@ int Executor::solveInput(const ConstraintSet &path,
   }
   for (size_t k = 0; k < objects.size(); ++k) {
     const Array *a = objects[k];
-    if (whole.count(a))
+    if (fixed.bindings.count(a) || whole.count(a) ||
+        values[k].size() != a->size)
       continue;
     auto p = parent->bindings.find(a);
     if (p == parent->bindings.end() || p->second.size() != a->size)
@@ -1888,7 +2051,9 @@ void Executor::writeLedger(bool exhausted) {
      << "checkpoints " << ledger.checkpoints << "\n"
      << "checkpoint-at " << ledger.checkpointAt << "\n"
      << "slot-misses " << ledger.slotMisses << "\n"
-     << "gates " << ledger.gates << "\n";
+     << "gates " << ledger.gates << "\n"
+     << "data-concrete " << ledger.dataConcrete << "\n"
+     << "config-forks " << ledger.configForks << "\n";
   for (auto &kv : ledger.fates)
     *f << "fate:" << kv.first << " " << kv.second << "\n";
 }
@@ -3218,9 +3383,24 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
 
     // Concolic: every case is a candidate; the seeds take one in branch(),
     // the others become pending flips. No solver here.
+    // --concolic-data-concrete: a data-only switch follows the seed value
+    // with no conjunct; a config switch is never collapsed to one case.
     bool concolicSwitch = concolicSeeded(state) && !isa<ConstantExpr>(cond) &&
                           seedsDecide(state, cond) >= 0;
-    if (concolicSwitch) {
+    const bool atSink =
+        statsTracker && userSearcherRequiresSink() && sinkDistance(state) == 0;
+    if (ConcolicDataConcrete && concolicSeeded(state) && !isa<ConstantExpr>(cond) &&
+        !atSink && dataOnly(cond)) {
+      if (ref<ConstantExpr> v = getValueFromSeeds(state, cond)) {
+        ++ledger.dataConcrete;
+        cond = v; // seed steers; no conjunct
+        concolicSwitch = false;
+      }
+    } else if (ConcolicDataConcrete && concolicSeeded(state) &&
+               !isa<ConstantExpr>(cond) && !atSink && !dataOnly(cond)) {
+      ++ledger.configForks;
+      concolicSwitch = true; // every case stays a candidate
+    } else if (concolicSwitch) {
       unsigned decision = state.decisions++;
       bool flip = false;
       if (seedsDecide(state, cond) == 2) {
