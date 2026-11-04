@@ -2203,46 +2203,23 @@
         // 별도로 호출지별로 모아 두어, 아래 피호출자 하강이 목표 ret를 이 제약을
         // 만족할 수 있는 ret로 한정하게 한다.
         std::map<const CallBase *, std::vector<std::pair<unsigned, int64_t>>> retCons;
-        auto noteReturn = [&](CallBase *CB, ICmpInst::Predicate pred, Constant *C) {
-          if (!factAt || !CB)
-            return;
-          Function *Cal = CB->getCalledFunction();
-          if (!Cal)
-            return;
-          std::string k;
-          int64_t kv = 0;
-          if (isa<ConstantPointerNull>(C))
-            k = "0";
-          else if (auto *CI = dyn_cast<ConstantInt>(C)) {
-            k = dec(CI);
-            kv = CI->getSExtValue();
-          } else
-            return;
-          retCons[CB].push_back({(unsigned)pred, kv});
-          Ev ev;
-          ev.at = CB;
-          ev.fn = F;
-          ev.anchor = F == seq[curStep] ? nullptr : myAnchor;
-          ev.callMust = myMust;
-          ev.mustExit = F == seq[curStep] || dominatesReturns(CB);
-          ev.kind = 'q';
-          ev.pred = (int)pred;
-          ev.vals.insert(std::move(k));
-          ev.words.push_back(Cal->getName().str());
-          auto cstr = [](Value *V) -> std::string {
-            auto *G = dyn_cast<GlobalVariable>(V->stripPointerCasts());
-            if (!G || !G->hasInitializer())
-              return {};
-            auto *A = dyn_cast<ConstantDataArray>(G->getInitializer());
-            if (!A || !A->isCString())
-              return {};
-            return A->getAsCString().str();
-          };
-          // An argument built by an earlier call is the constant string that
-          // call passes in, when that call is the last one dominating this one.
+        auto cstr = [](Value *V) -> std::string {
+          auto *G = dyn_cast<GlobalVariable>(V->stripPointerCasts());
+          if (!G || !G->hasInitializer())
+            return {};
+          auto *A = dyn_cast<ConstantDataArray>(G->getInitializer());
+          if (!A || !A->isCString())
+            return {};
+          return A->getAsCString().str();
+        };
+        // The text of a call: its callee, then its constant-string arguments.
+        // An argument built by an earlier call is the constant string that
+        // call passes in, when that call is the last one dominating this one.
+        auto callWords = [&](CallBase *CB, std::vector<std::string> &words) {
+          words.push_back(CB->getCalledFunction()->getName().str());
           for (Value *Op : CB->args()) {
             if (std::string s = cstr(Op); !s.empty()) {
-              ev.words.push_back(std::move(s));
+              words.push_back(std::move(s));
               continue;
             }
             auto *Slot = dyn_cast<AllocaInst>(Op->stripPointerCasts());
@@ -2266,9 +2243,147 @@
               text = std::move(got);
             }
             if (!text.empty())
-              ev.words.push_back(std::move(text));
+              words.push_back(std::move(text));
           }
-          stepEv[curStep].push_back(std::move(ev));
+        };
+        // The 'q' event: on step `step`, in `fn`, the return of the call CB
+        // satisfies `pred k`.
+        auto pushRet = [&](size_t step, Function *fn, Instruction *anchor, bool callMust, bool mustExit, CallBase *CB,
+                           ICmpInst::Predicate pred, std::string k) {
+          Ev ev;
+          ev.at = CB;
+          ev.fn = fn;
+          ev.anchor = anchor;
+          ev.callMust = callMust;
+          ev.mustExit = mustExit;
+          ev.kind = 'q';
+          ev.pred = (int)pred;
+          ev.vals.insert(std::move(k));
+          callWords(CB, ev.words);
+          stepEv[step].push_back(std::move(ev));
+        };
+        auto constText = [](Constant *C, std::string &k, int64_t &kv) {
+          if (isa<ConstantPointerNull>(C)) {
+            k = "0";
+            kv = 0;
+            return true;
+          }
+          if (auto *CI = dyn_cast<ConstantInt>(C)) {
+            k = dec(CI);
+            kv = CI->getSExtValue();
+            return true;
+          }
+          return false;
+        };
+        auto noteReturn = [&](CallBase *CB, ICmpInst::Predicate pred, Constant *C) {
+          if (!factAt || !CB || !CB->getCalledFunction())
+            return;
+          std::string k;
+          int64_t kv = 0;
+          if (!constText(C, k, kv))
+            return;
+          retCons[CB].push_back({(unsigned)pred, kv});
+          pushRet(curStep, F, F == seq[curStep] ? nullptr : myAnchor, myMust, F == seq[curStep] || dominatesReturns(CB),
+                  CB, pred, std::move(k));
+        };
+        // 형식인자를 거친 반환 제약 (정의 R, §3.8.6). The step's path tests a scalar
+        // formal of the step's own function against a constant, and the
+        // sequence call that enters the step binds that formal to the result
+        // of a named lookup — RawInput::open: `force_load =
+        // config.get_int_attribute("raw:ForceLoad")`, then `open_raw(force_load,
+        // …)`, whose `if (unpack)` establishes the cell the sink's call needs.
+        // The test is then a must condition on that lookup's return in the
+        // caller's step: the descent of 셀을 거친 반환 제약, through a formal
+        // instead of a cell. A lookup's value is the client's to set (§3.8.6),
+        // so only a lookup is recorded; any other return stays the library's.
+        auto throughFormal = [&](Value *V, ICmpInst::Predicate pred, Value *Other) -> bool {
+          auto *A = dyn_cast_or_null<Argument>(V);
+          auto *K = dyn_cast_or_null<Constant>(Other ? Other->stripPointerCasts() : nullptr);
+          if (!A || !K || !factAt || A->getParent() != F || F != seq[curStep] || curStep == 0 ||
+              A->getType()->isPointerTy() || !(isa<ConstantInt>(K) || isa<ConstantPointerNull>(K)))
+            return false;
+          auto *Site = dyn_cast_or_null<CallBase>(stepGoal[curStep - 1]);
+          if (!Site || Site->getFunction() != seq[curStep - 1] || A->getArgNo() >= Site->arg_size())
+            return false;
+          // The actual as the caller computed it before the call: casts
+          // peeled, a frame slot read as the last store that dominates the
+          // call — unless a call took the slot's address, which makes the
+          // slot's value that call's.
+          auto actual = [&](Value *X) -> Value * {
+            std::unordered_set<Value *> seen;
+            while (X && seen.insert(X).second) {
+              if (auto *C = dyn_cast<CastInst>(X)) {
+                X = C->getOperand(0);
+                continue;
+              }
+              auto *L = dyn_cast<LoadInst>(X);
+              auto *Al = L ? dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts()) : nullptr;
+              if (!Al)
+                return X;
+              StoreInst *best = nullptr;
+              bool taken = false;
+              for (User *U : Al->users()) {
+                if (auto *S = dyn_cast<StoreInst>(U); S && S->getPointerOperand()->stripPointerCasts() == Al) {
+                  if (dominatesBefore(S, Site) && (!best || dominatesBefore(best, S)))
+                    best = S;
+                } else if (auto *CB = dyn_cast<CallBase>(U); CB && !isa<IntrinsicInst>(CB) && CB != Site &&
+                                                              dominatesBefore(CB, Site))
+                  taken = true;
+              }
+              if (!best || taken)
+                return X;
+              X = best->getValueOperand();
+            }
+            return X;
+          };
+          // (R ⋈ K) reduced to (call ⋈' K'): an icmp against 0/1 is that icmp
+          // or its inverse.
+          Value *R = actual(Site->getArgOperand(A->getArgNo()));
+          ICmpInst::Predicate p = pred;
+          Constant *KK = K;
+          CallBase *G = nullptr;
+          for (int depth = 0; depth < 4 && !G; ++depth) {
+            if (auto *CB = dyn_cast<CallBase>(R)) {
+              G = CB;
+              break;
+            }
+            auto *Inner = dyn_cast<ICmpInst>(R);
+            auto *CI = dyn_cast<ConstantInt>(KK);
+            if (!Inner || !CI || (p != ICmpInst::ICMP_EQ && p != ICmpInst::ICMP_NE))
+              return false;
+            bool truth;
+            if (CI->isZero())
+              truth = p == ICmpInst::ICMP_NE;
+            else if (CI->isOne())
+              truth = p == ICmpInst::ICMP_EQ;
+            else
+              return false;
+            ICmpInst::Predicate ip = truth ? Inner->getPredicate() : Inner->getInversePredicate();
+            Value *a = actual(Inner->getOperand(0)), *b = actual(Inner->getOperand(1));
+            if (isa<ConstantInt>(b) || isa<ConstantPointerNull>(b)) {
+              R = a;
+              KK = cast<Constant>(b);
+              p = ip;
+            } else if (isa<ConstantInt>(a) || isa<ConstantPointerNull>(a)) {
+              R = b;
+              KK = cast<Constant>(a);
+              p = ICmpInst::getSwappedPredicate(ip);
+            } else
+              return false;
+          }
+          if (!G || !G->getCalledFunction() || !G->getType()->isIntegerTy())
+            return false;
+          Function *D = define(G->getCalledFunction()->getName());
+          if (!D)
+            D = G->getCalledFunction();
+          if (!lookupOnly(D) || !fallbackArg(D))
+            return false;
+          std::string k;
+          int64_t kv = 0;
+          if (!constText(KK, k, kv))
+            return false;
+          pushRet(curStep - 1, seq[curStep - 1], nullptr, true, true, G, p, std::move(k));
+          return true;
         };
         // §3.8 정의 3.8.1: 비트 원자. (c & m) = 0은 lacks m, 한 비트 m의 (c & m) ≠ 0과
         // (c & m) = m은 has m이다. 여러 비트의 (c & m) ≠ 0은 논리합이라 제약이 아니다.
@@ -2336,31 +2451,46 @@
           }
           return false;
         };
+        // A field of one object inside F: the same GEP base and constant
+        // indices. This is the step function's own notion of a location,
+        // independent of whether the client can name it as a cell.
+        auto sameFieldPtr = [](Value *A, Value *B) {
+          A = A->stripPointerCasts();
+          B = B->stripPointerCasts();
+          if (A == B)
+            return true;
+          auto *G1 = dyn_cast<GEPOperator>(A);
+          auto *G2 = dyn_cast<GEPOperator>(B);
+          if (!G1 || !G2 || G1->getNumOperands() != G2->getNumOperands())
+            return false;
+          if (G1->getPointerOperand()->stripPointerCasts() != G2->getPointerOperand()->stripPointerCasts())
+            return false;
+          for (unsigned i = 1; i < G1->getNumOperands(); ++i) {
+            auto *C1 = dyn_cast<ConstantInt>(G1->getOperand(i));
+            auto *C2 = dyn_cast<ConstantInt>(G2->getOperand(i));
+            if (!C1 || !C2 || C1->getValue() != C2->getValue())
+              return false;
+          }
+          return true;
+        };
+        // A value the path requires of a load the client cannot name (a
+        // field of the step function's own object, e.g. `this->m_unpacked`).
+        // It is no atom — the client holds no cell for it — but it is still
+        // a requirement of the path, and 확립 store의 가드 below asks which
+        // arm's constant store establishes it.
+        struct LocalReq {
+          LoadInst *L;
+          std::string v;
+          Instruction *at;
+          Function *fn;
+        };
+        std::vector<LocalReq> localReq;
         auto onCmp = [&](ICmpInst *Cmp, ICmpInst::Predicate pred) {
           if (onBits(Cmp, pred))
             return;
           // 셀을 거친 반환 제약 (DESIGN §3.5): store g() → c; load c; cmp c, k.
           // Match the field by GEP base+indices so Loc-alias spelling cannot
           // drop the link. Dominate the branch (factAt), not only the load.
-          auto sameFieldPtr = [](Value *A, Value *B) {
-            A = A->stripPointerCasts();
-            B = B->stripPointerCasts();
-            if (A == B)
-              return true;
-            auto *G1 = dyn_cast<GEPOperator>(A);
-            auto *G2 = dyn_cast<GEPOperator>(B);
-            if (!G1 || !G2 || G1->getNumOperands() != G2->getNumOperands())
-              return false;
-            if (G1->getPointerOperand()->stripPointerCasts() != G2->getPointerOperand()->stripPointerCasts())
-              return false;
-            for (unsigned i = 1; i < G1->getNumOperands(); ++i) {
-              auto *C1 = dyn_cast<ConstantInt>(G1->getOperand(i));
-              auto *C2 = dyn_cast<ConstantInt>(G2->getOperand(i));
-              if (!C1 || !C2 || C1->getValue() != C2->getValue())
-                return false;
-            }
-            return true;
-          };
           auto noteReturnThroughCell = [&](Value *V, ICmpInst::Predicate p, Value *Other) {
             while (auto *C = dyn_cast<CastInst>(V))
               V = C->getOperand(0);
@@ -2407,6 +2537,8 @@
                 return;
               }
           }
+          if (throughFormal(lhs, pred, rhs) || throughFormal(rhs, ICmpInst::getSwappedPredicate(pred), lhs))
+            return;
           unsigned bits = 64;
           if (auto *IT = dyn_cast<IntegerType>(Cmp->getOperand(0)->getType()))
             bits = IT->getBitWidth();
@@ -2552,8 +2684,22 @@
             cell = R;
             C = CL;
             use = ICmpInst::getSwappedPredicate(pred);
-          } else
+          } else {
+            // load == k on a location the client cannot name: a requirement
+            // of the path, kept for 확립 store의 가드.
+            Value *V = CR ? lhs : CL ? rhs : nullptr;
+            ICmpInst::Predicate u = CR ? pred : ICmpInst::getSwappedPredicate(pred);
+            while (V)
+              if (auto *Cst = dyn_cast<CastInst>(V))
+                V = Cst->getOperand(0);
+              else
+                break;
+            if (auto *Ld = dyn_cast_or_null<LoadInst>(V); Ld && factAt && u == ICmpInst::ICMP_EQ) {
+              Constant *K = CR ? CR : CL;
+              localReq.push_back({Ld, isa<ConstantPointerNull>(K) ? "0" : dec(cast<ConstantInt>(K)), factAt, F});
+            }
             return;
+          }
           if (isa<ConstantPointerNull>(C)) {
             if (use == ICmpInst::ICMP_EQ)
               equation(cell, "0");
@@ -2617,6 +2763,9 @@
                   Loc cell;
                   if (locate(L, cell))
                     equation(cell, need ? "1" : "0");
+                  else if (!throughFormal(mustVal(L), need ? ICmpInst::ICMP_NE : ICmpInst::ICMP_EQ,
+                                          ConstantInt::get(L->getType(), 0)))
+                    localReq.push_back({L, need ? "1" : "0", factAt, F});
                   return;
                 }
                 if (auto *BO = dyn_cast<BinaryOperator>(V)) {
@@ -2706,6 +2855,211 @@
             if (n == 1 && onlyV && !def && locate(SW->getCondition(), cell)) {
               factAt = SW;
               equation(cell, dec(onlyV));
+            }
+          }
+        }
+        // 확립 store의 가드 (정의 P, 정의 R). A branch whose other arm also
+        // reaches the goal — an if without else — is no condition by itself:
+        // the arms rejoin, and the loop above dropped it. But when one arm
+        // holds a constant store that establishes a location a later test on
+        // the path requires (`if (unpack) { … m_unpacked = true; }` before
+        // `if (m_unpacked)`), and nothing outside that arm establishes it
+        // before the test, the path must enter that arm: the branch toward
+        // it is a condition of the path. The arm may be the one the chosen
+        // path took or the one it skipped — the path search tracks client
+        // cells only, so it may have walked past the store. The location is
+        // a client cell (matched by its equation event) or a field of the
+        // step function's own object the client cannot name (matched by
+        // field pointer, `localReq`). Its atoms on formals descend to the
+        // caller (throughFormal); its cell atoms are the path search's own
+        // (정의 P) and are not recorded again.
+        if (F == seq[curStep]) {
+          DominatorTree &DT = domTree(F);
+          const bool dbgLift = std::getenv("SP_DBG_LIFT") != nullptr;
+          if (dbgLift) {
+            errs() << "lift: step " << curStep << " " << F->getName() << " localReq " << localReq.size() << "\n";
+            for (const LocalReq &r : localReq)
+              if (r.fn == F) {
+                errs() << "  req v=" << r.v << " load@";
+                if (const DILocation *dl = r.L->getDebugLoc())
+                  errs() << dl->getLine();
+                errs() << " at@";
+                if (const DILocation *dl = r.at->getDebugLoc())
+                  errs() << dl->getLine();
+                errs() << "\n";
+              }
+            errs() << "  path blocks (lines):";
+            for (const BasicBlock *RB : reachOrd) {
+              unsigned lo = 0, hi = 0;
+              for (const Instruction &I : *RB)
+                if (const DILocation *dl = I.getDebugLoc(); dl && dl->getLine()) {
+                  lo = lo ? std::min(lo, dl->getLine()) : dl->getLine();
+                  hi = std::max(hi, dl->getLine());
+                }
+              errs() << " " << lo << "-" << hi;
+            }
+            errs() << "\n";
+          }
+          // A store of a constant. `cell` is set when the client can name the
+          // location; otherwise the location is the store's own field pointer.
+          auto constStore = [&](Instruction &I, std::optional<Loc> &cell, std::string &v) {
+            auto *S = dyn_cast<StoreInst>(&I);
+            if (!S)
+              return (StoreInst *)nullptr;
+            auto *C = dyn_cast<Constant>(S->getValueOperand()->stripPointerCasts());
+            if (!C || !(isa<ConstantInt>(C) || isa<ConstantPointerNull>(C)))
+              return (StoreInst *)nullptr;
+            Loc l;
+            cell.reset();
+            if (objectLoc(m, S->getPointerOperand(), l) && cellAt(l, l))
+              cell = l;
+            v = isa<ConstantPointerNull>(C) ? "0" : dec(cast<ConstantInt>(C));
+            return S;
+          };
+          // Two constant stores write the same location: the same cell, or
+          // the same field of the same object when the client names neither.
+          auto sameTarget = [&](StoreInst *A, const std::optional<Loc> &ca, StoreInst *B, const std::optional<Loc> &cb) {
+            if (ca && cb)
+              return *ca == *cb;
+            if (!ca && !cb)
+              return sameFieldPtr(A->getPointerOperand(), B->getPointerOperand());
+            return false;
+          };
+          std::function<void(Value *, bool)> reqFormal = [&](Value *V, bool need) {
+            while (auto *C = dyn_cast<CastInst>(V))
+              V = C->getOperand(0);
+            if (LoadInst *L = boolLoad(V)) {
+              Loc cell;
+              if (!locate(L, cell))
+                throughFormal(mustVal(L), need ? ICmpInst::ICMP_NE : ICmpInst::ICMP_EQ,
+                              ConstantInt::get(L->getType(), 0));
+              return;
+            }
+            if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+              if (BO->getOpcode() == Instruction::Xor)
+                if (auto *One = dyn_cast<ConstantInt>(BO->getOperand(1)); One && One->isOne()) {
+                  reqFormal(BO->getOperand(0), !need);
+                  return;
+                }
+              if ((need && BO->getOpcode() == Instruction::And) || (!need && BO->getOpcode() == Instruction::Or)) {
+                reqFormal(BO->getOperand(0), need);
+                reqFormal(BO->getOperand(1), need);
+              }
+              return;
+            }
+            if (auto *Cmp = dyn_cast<ICmpInst>(V)) {
+              auto pred = need ? Cmp->getPredicate() : Cmp->getInversePredicate();
+              Value *lhs = mustVal(Cmp->getOperand(0)), *rhs = mustVal(Cmp->getOperand(1));
+              if (!throughFormal(lhs, pred, rhs))
+                throughFormal(rhs, ICmpInst::getSwappedPredicate(pred), lhs);
+            }
+          };
+          // Plain CFG reachability inside F: the arm may lie off the chosen
+          // path, which tracks client cells only and so may have skipped it.
+          auto reachesIn = [&](const BasicBlock *From, const BasicBlock *To) {
+            std::unordered_set<const BasicBlock *> seen;
+            std::vector<const BasicBlock *> work{From};
+            while (!work.empty()) {
+              const BasicBlock *B = work.back();
+              work.pop_back();
+              if (!seen.insert(B).second)
+                continue;
+              if (B == To)
+                return true;
+              for (const BasicBlock *S : successors(B))
+                work.push_back(S);
+            }
+            return false;
+          };
+          for (const BasicBlock *CBB : reachOrd) {
+            auto *BR = dyn_cast<BranchInst>(const_cast<BasicBlock *>(CBB)->getTerminator());
+            if (!BR || !BR->isConditional() || BR->getSuccessor(0) == BR->getSuccessor(1))
+              continue;
+            // The branches the loop above dropped: the path takes one arm and
+            // the other also reaches the goal (the arms rejoin).
+            BasicBlock *only = nullptr;
+            int n = 0;
+            for (BasicBlock *S : successors(BR))
+              if (reach.count(S)) {
+                ++n;
+                only = S;
+              }
+            if (n != 1 || !siblingReachesGoal(BR, only))
+              continue;
+            for (unsigned t = 0; t < 2; ++t) {
+              BasicBlock *T = BR->getSuccessor(t);
+              if (T->getUniquePredecessor() != CBB)
+                continue;
+              bool lifted = false;
+              for (BasicBlock &ABr : *F) {
+                const BasicBlock *AB = &ABr;
+                if (lifted)
+                  break;
+                if (!DT.dominates(T, AB))
+                  continue;
+                for (Instruction &I : ABr) {
+                  std::optional<Loc> cell;
+                  std::string v;
+                  StoreInst *S = constStore(I, cell, v);
+                  if (!S)
+                    continue;
+                  // A later test on the path asks for exactly this value, the
+                  // arm can reach that test, and no store of it outside the
+                  // arm already dominates the test.
+                  auto establishes = [&](Instruction *at) {
+                    if (at->getParent() == AB ? !dominatesBefore(S, at) : !reachesIn(AB, at->getParent()))
+                      return false;
+                    for (BasicBlock &OBr : *F) {
+                      if (DT.dominates(T, &OBr))
+                        continue;
+                      for (Instruction &J : OBr) {
+                        std::optional<Loc> c2;
+                        std::string v2;
+                        StoreInst *S2 = constStore(J, c2, v2);
+                        if (S2 && v2 == v && sameTarget(S, cell, S2, c2) && dominatesBefore(S2, at))
+                          return false;
+                      }
+                    }
+                    return true;
+                  };
+                  bool needed = false;
+                  if (cell) {
+                    for (const Ev &e : stepEv[curStep]) {
+                      if (e.kind != 'e' || e.fn != F || !e.at || e.cell != std::make_pair(cell->arg, cell->suf) ||
+                          !e.vals.count(v))
+                        continue;
+                      if (establishes(e.at)) {
+                        needed = true;
+                        break;
+                      }
+                    }
+                  } else {
+                    for (const LocalReq &r : localReq) {
+                      if (r.fn != F || r.v != v || !sameFieldPtr(S->getPointerOperand(), r.L->getPointerOperand()))
+                        continue;
+                      if (establishes(r.at)) {
+                        needed = true;
+                        break;
+                      }
+                    }
+                  }
+                  if (dbgLift) {
+                    errs() << "  arm@";
+                    if (const DILocation *dl = BR->getDebugLoc())
+                      errs() << dl->getLine();
+                    errs() << " t=" << t << " store v=" << v << " @";
+                    if (const DILocation *dl = S->getDebugLoc())
+                      errs() << dl->getLine();
+                    errs() << (cell ? " cell" : " field") << (needed ? " NEEDED" : "") << "\n";
+                  }
+                  if (!needed)
+                    continue;
+                  factAt = BR;
+                  reqFormal(BR->getCondition(), t == 0);
+                  lifted = true;
+                  break;
+                }
+              }
             }
           }
         }

@@ -110,10 +110,12 @@ public:
     bool covers(const Cell &c) const { return root == c.root && off == c.off && path == c.path; }
   };
   // 정의 R: a call on the witness whose result the path compares, the
-  // obligation `callee pred k` at caller:line.
+  // obligation `callee pred k` at caller:line. When the call is a named-key
+  // lookup (§3.8.6), key is κ, so a Named setting can adopt the obligation.
   struct Ret {
     std::string callee, pred, k, caller;
     unsigned line = 0;
+    std::string key;
   };
   // §3.8 정의 3.8.6 이름 키 설정: 조회 G(o, κ, d)가 읽는 이름 κ의 값을
   // 클라이언트가 같은 o 위의 세터 S(o, κ, v)로 정한다. κ는 조회 지점이 짓는
@@ -139,6 +141,14 @@ public:
     // §3.12: a sink guard or sink operand depends on this name's value, so the
     // seed path sets it (choice 0 = set); otherwise choice 0 = skip.
     bool sinkDep = false;
+    // The lookup's call site (step function, source line): to pair this
+    // setting with a 정의 R return obligation on the same lookup.
+    std::string lookAt;
+    unsigned lookLine = 0;
+    // 정의 R on this lookup, if any: the predicate and constant the sink path
+    // needs the lookup to return. The seed value is chosen to satisfy it —
+    // skip when the fallback already does (e.g. `== 0`), set otherwise.
+    std::optional<std::pair<std::string, int64_t>> must;
   };
   // A constraint on an integer field embedded in an entry argument: the
   // field at byte offset off of argument root, width bits wide.

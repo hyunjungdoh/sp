@@ -1,0 +1,195 @@
+\subsection{Exploitability Assessment (RQ1)}
+\label{subsec:rq1}
+
+To answer RQ1, we evaluate \sys on the 14 pairs where ChainFuzz reaches the vulnerable function through a downstream program but fails to trigger the sink (\autoref{subsec:eval-setup}). These pairs do not come with complete ground-truth labels for downstream exploitability. Instead of measuring precision or recall, we examine whether \sys can go beyond reachability achieved by PoC transfer, recover the missing downstream configuration, and confirm a concrete trigger.
+
+\PP{Metrics}
+We assign each pair one of three labels.
+A pair is \emph{exploitable} if AddressSanitizer~\cite{serebryany2012addresssanitizer} reports the expected memory error at the sink identified from the upstream advisory.
+A pair is \emph{reachable} if an execution path enters the vulnerable function but no explored state produces an AddressSanitizer report at that sink.
+A pair is \emph{unreachable} if no path from a public downstream entry point enters the vulnerable function.
+
+\PP{Results}
+\autoref{tab:rq1-summary} and \autoref{tab:chainfuzz-comparison} summarize the results.
+ChainFuzz labels all 14 pairs as reachable and none as exploitable.
+\sys confirms 5 of the 14 pairs (35.7\%) as exploitable, reports 1 pair as unreachable, and leaves 8 pairs reachable.
+
+All five confirmed cases require downstream configuration that the upstream PoC does not install.
+We examine two representative cases in \autoref{subsec:casestudy}: CVE-2023-1729, which ChainFuzz's authors later marked exploitable only after manually enabling a downstream configuration, and CVE-2020-35538, for which recovering the strip-buffer contract also exposed a distinct NULL-propagation bug in libtiff that we reported.
+
+Of the remaining nine pairs, CVE-2019-7317 is unreachable through any public libgd API. ChainFuzz classified it as reachable using a crafted driver.
+Five libde265--libheif pairs remain reachable because concolic execution stops at unsupported SIMD (vector) instructions before the fault site.
+The other three pairs enter the vulnerable function but do not satisfy the remaining exploit condition within the analysis budget.
+
+\begin{table}[t]
+\centering
+\caption{Results on the 14 pairs where ChainFuzz reaches the sink but does not trigger it.}
+\label{tab:rq1-summary}
+\footnotesize
+\setlength{\tabcolsep}{6pt}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{@{}lccc@{}}
+\hline
+\textbf{Tool}
+& \textbf{Exploitable}
+& \textbf{Reachable}
+& \textbf{Unreachable} \\
+\hline
+ChainFuzz
+& 0
+& 14
+& 0 \\
+\sys
+& 5
+& 8
+& 1 \\
+\hline
+\end{tabular}
+\end{table}
+
+\begin{table*}[t]
+\centering
+\caption{Per-pair comparison of ChainFuzz and \sys on the 14 pairs.}
+\label{tab:chainfuzz-comparison}
+\footnotesize
+\setlength{\tabcolsep}{5pt}
+\renewcommand{\arraystretch}{1.15}
+
+\begin{tabular}{llcll||c|c}
+\hline
+\multirow{2}{*}{\textbf{Upstream}}
+& \multirow{2}{*}{\textbf{Version}}
+& \multirow{2}{*}{\textbf{CVE}}
+& \multirow{2}{*}{\textbf{Type}}
+& \multirow{2}{*}{\textbf{Downstream}}
+& \multicolumn{1}{c|}{\textbf{ChainFuzz}}
+& \multicolumn{1}{c}{\textbf{\sys}} \\
+\cline{6-7}
+& & & & 
+& \textbf{Result}
+& \textbf{Result} \\
+\hline\hline
+
+LibRaw
+& 0.21.1
+& CVE-2023-1729
+& Heap Buffer Overflow
+& OpenImageIO
+& reachable$^{\dag}$
+& exploitable \\
+
+libpng
+& 1.6.37
+& CVE-2019-7317
+& Use-After-Free
+& libgd
+& reachable
+& unreachable \\
+
+FreeType
+& 53dfdcd8
+& CVE-2022-27405
+& Heap Buffer Overflow
+& MuPDF
+& reachable
+& exploitable \\
+
+FreeType
+& 22a0cccb
+& CVE-2022-27406
+& Heap Buffer Overflow
+& MuPDF
+& reachable
+& exploitable \\
+
+OpenJPEG
+& 2.3.1
+& CVE-2020-6851
+& Heap Buffer Overflow
+& MuPDF/libheif
+& reachable
+& exploitable  \\
+
+libde265
+& 1.0.10
+& CVE-2023-24756
+& Null Pointer Dereference
+& libheif
+& reachable
+& reachable$^{\S}$ \\
+
+libde265
+& 1.0.10
+& CVE-2023-24757
+& Null Pointer Dereference
+& libheif
+& reachable
+& reachable$^{\S}$ \\
+
+libde265
+& 1.0.10
+& CVE-2023-24758
+& Null Pointer Dereference
+& libheif
+& reachable
+& reachable$^{\S}$ \\
+
+libde265
+& 1.0.10
+& CVE-2023-25221
+& Heap Buffer Overflow
+& libheif
+& reachable
+& reachable$^{\S}$ \\
+
+libde265
+& 1.0.11
+& CVE-2023-27102
+& Heap Buffer Overflow
+& libheif
+& reachable
+& reachable$^{\S}$ \\
+
+libjpeg
+& 2.0.5
+& CVE-2020-35538
+& Null Pointer Dereference
+& libtiff
+& reachable
+& exploitable$^{\ddagger}$ \\
+
+libtiff
+& b51bb157
+& CVE-2022-1622
+& Out-Of-Bounds Read
+& OpenJPEG/ImageMagick
+& reachable
+& reachable \\
+
+libtiff
+& b51bb157
+& CVE-2022-1623
+& Out-Of-Bounds Read
+& OpenJPEG/ImageMagick
+& reachable
+& reachable  \\
+
+libtiff
+& 4.5.0
+& CVE-2023-2731
+& Null Pointer Dereference
+& OpenJPEG/ImageMagick
+& reachable
+& reachable  \\
+
+\hline
+\end{tabular}
+
+\vspace{4pt}
+\begin{minipage}{\textwidth}
+\footnotesize\raggedright
+$^{\dag}$Later marked exploitable by ChainFuzz's authors after manually enabling a downstream option.
+$^{\ddagger}$Also exposed a distinct NULL-propagation bug in libtiff (\texttt{null\_convert}), which we reported.
+$^{\S}$Concolic execution stops at unsupported SIMD (vector) instructions before the fault site.
+\end{minipage}
+\end{table*}

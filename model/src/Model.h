@@ -1192,6 +1192,8 @@ class Model {
   // 인자에서 도달하지 않는 객체(loc=⊥)의 셀도 단계 함수의 형식인자 기준으로 적는다.
  public:
   void sinkFacts(const std::vector<Function *> &seq, raw_ostream &out);
+  // 진단(SP_SOLVE_ONLY): 한 순서열의 must 사실만 다시 푼다.
+  bool solveSeq(const std::vector<Function *> &seq, raw_ostream &out) { return solve(seq, out); }
   Function *defined(StringRef name) const { return define(name); }
 
  private:

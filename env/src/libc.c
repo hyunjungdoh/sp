@@ -149,6 +149,53 @@ const int32_t **__ctype_toupper_loc(void) {
   return &ctypeUpperP;
 }
 
+// Function forms of <ctype.h>. Compilers usually expand the macros to
+// __ctype_b_loc()[0][c], but a translation unit that calls the functions
+// (or takes their address) needs these definitions. Leaving them undefined
+// makes --external-calls=over-approx return an unconstrained value, which
+// forks parsers on every classifier and can drop a concrete seed path
+// (e.g. LibRaw::remove_trailing_spaces).
+#undef isspace
+#undef isdigit
+#undef isalpha
+#undef isalnum
+#undef isupper
+#undef islower
+#undef isprint
+#undef ispunct
+#undef isxdigit
+#undef iscntrl
+#undef isblank
+#undef isgraph
+#undef tolower
+#undef toupper
+static int ctypeHas(int c, unsigned short bit) {
+  ctypeInit();
+  if (c < -128 || c > 255)
+    return 0;
+  return (ctypeBp[c] & bit) != 0;
+}
+int isspace(int c) { return ctypeHas(c, _ISspace); }
+int isdigit(int c) { return ctypeHas(c, _ISdigit); }
+int isalpha(int c) { return ctypeHas(c, _ISalpha); }
+int isalnum(int c) { return ctypeHas(c, _ISalnum); }
+int isupper(int c) { return ctypeHas(c, _ISupper); }
+int islower(int c) { return ctypeHas(c, _ISlower); }
+int isprint(int c) { return ctypeHas(c, _ISprint); }
+int ispunct(int c) { return ctypeHas(c, _ISpunct); }
+int isxdigit(int c) { return ctypeHas(c, _ISxdigit); }
+int iscntrl(int c) { return ctypeHas(c, _IScntrl); }
+int isblank(int c) { return ctypeHas(c, _ISblank); }
+int isgraph(int c) { return ctypeHas(c, _ISgraph); }
+int tolower(int c) {
+  ctypeInit();
+  return (c < -128 || c > 255) ? c : ctypeLowerP[c];
+}
+int toupper(int c) {
+  ctypeInit();
+  return (c < -128 || c > 255) ? c : ctypeUpperP[c];
+}
+
 // ---------------------------------------------------------------------------
 // Strings.
 
@@ -221,6 +268,21 @@ char *strcasestr(const char *h, const char *n) {
     if (!strncasecmp(h, n, m))
       return (char *)h;
   return m ? NULL : (char *)h;
+}
+// GNU/BSD extension used by LibRaw::memmem. Same contract as glibc: find
+// the first occurrence of needle in haystack, or NULL.
+void *memmem(const void *haystack, size_t haystacklen, const void *needle,
+            size_t needlelen) {
+  const unsigned char *h = (const unsigned char *)haystack;
+  const unsigned char *n = (const unsigned char *)needle;
+  if (needlelen == 0)
+    return (void *)h;
+  if (needlelen > haystacklen)
+    return NULL;
+  for (size_t i = 0; i + needlelen <= haystacklen; ++i)
+    if (!memcmp(h + i, n, needlelen))
+      return (void *)(h + i);
+  return NULL;
 }
 size_t strspn(const char *s, const char *a) {
   size_t i = 0;

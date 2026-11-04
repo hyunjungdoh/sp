@@ -1,6 +1,7 @@
 #include "Model.h"
 #include "Client.h"
 #include "Close.h"
+#include <algorithm>
 #include <chrono>
 #include <sstream>
 
@@ -495,6 +496,9 @@ struct Witness {
     // The may line says this call is a lookup. The harness returns the
     // satisfying constant. A parser result has no such mark and stays a call.
     bool lookup = false;
+    // §3.8.6: the named key κ the lookup reads, when the line carries one
+    // (`... "κ"`), so a Named setting can adopt this obligation.
+    std::string key;
   };
   std::vector<Ret> rets;
   std::vector<Client::Keyed> keyed;
@@ -505,7 +509,7 @@ struct Witness {
 std::vector<Client::Ret> clientRets(const Witness &w) {
   std::vector<Client::Ret> out;
   for (const Witness::Ret &r : w.rets)
-    out.push_back({r.callee, r.pred, r.k, r.caller, r.line});
+    out.push_back({r.callee, r.pred, r.k, r.caller, r.line, r.key});
   return out;
 }
 
@@ -792,6 +796,10 @@ Witness parseWitness(std::istream &st) {
             r.live = true;
           else if (extra == "lookup")
             r.lookup = true;
+          else if (extra.size() >= 2 && extra.front() == '"' && r.key.empty()) {
+            // The named key κ, printed quoted. Strip the quotes.
+            r.key = extra.substr(1, extra.size() - (extra.back() == '"' ? 2 : 1));
+          }
         }
         if (!r.callee.empty() && !r.caller.empty() && !r.pred.empty())
           w.rets.push_back(std::move(r));
@@ -856,18 +864,62 @@ struct Bind {
 struct Setter {
   Function *fn = nullptr;
   std::vector<Bind> binds;
+  // The value slot has exactly the type G returns (an int name is set by the
+  // int setter), not merely a pointer that could carry it.
+  bool exact = false;
 };
 
-// The setter candidates of lookup G (§3.8.6): a function that is not a
-// lookup, takes G's object as its first argument, and has a parameter that
-// can carry the value G returns. Each such parameter is tried as the value
-// slot and takes the witness; the receiver is G's object; each other
-// parameter takes an unused G argument of the same type (never G's fallback,
-// which is the default, not a stored value), else a fresh symbolic value.
-// Signatures are not compared and no field flow is traced: the planted
+// §3.8.6 names the setter S(o, κ, v): it acts on the object o itself, writing
+// v into it. Several shapes cannot be that and would corrupt o if called as
+// one, so they are not nominated:
+//   - A static member or free helper receives o in a slot that is not a
+//     receiver and writes through it (ImageSpec::auto_stride(long &, …) given
+//     the spec as its stride). The declaration's debug info flags it static.
+//   - A constructor or destructor makes or unmakes o rather than setting a
+//     value on it (its name is the class name, or begins with ~).
+//   - A const member cannot write o at all; it is a reader
+//     (ImageSpec::channel_name(int) const), never a setter.
+//   - A function that returns a struct by value takes that result buffer as
+//     its first parameter (sret), so o is not its argument 0: bound as one it
+//     would write the returned struct over o
+//     (ImageSpec::decode_compression_metadata(…) const writing a parsed
+//     result into the spec). Its receiver is elsewhere and it computes a
+//     value rather than setting a name, so it is not a setter.
+static bool instanceMethod(Function *F) {
+  DISubprogram *SP = F->getSubprogram();
+  if (!SP)
+    return false;
+  DISubprogram *D = SP->getDeclaration() ? SP->getDeclaration() : SP;
+  if (D->getFlags() & DINode::FlagStaticMember)
+    return false;
+  auto *Cls = dyn_cast_or_null<DICompositeType>(D->getScope());
+  if (!Cls)
+    return false;
+  StringRef n = D->getName();
+  if (n.empty() || n == Cls->getName() || n.starts_with("~"))
+    return false;
+  if (F->arg_size() && F->hasParamAttribute(0, Attribute::StructRet))
+    return false;
+  std::string d = pretty(F->getName());
+  auto rp = d.rfind(')');
+  return rp == std::string::npos || d.find("const", rp) == std::string::npos;
+}
+
+// The setter candidates of lookup G (§3.8.6): an instance method of G's
+// class that is not a lookup and has a parameter that can carry the value G
+// returns. Each such parameter is tried as the value slot and takes the
+// witness; the receiver is G's object; each other parameter takes an unused
+// G argument of the same type (never G's fallback, which is the default, not
+// a stored value), else a fresh symbolic value. S(o, κ, v) carries the name
+// κ that G(o, κ, d) reads, so every argument of G other than the receiver
+// and the fallback must find a parameter; a candidate that cannot take κ
+// does not set the name. No field flow is traced beyond that: the planted
 // read-back decides at run time which candidate actually sets the name G
 // reads, so a false candidate only costs a path. The sink of the search is
 // correctness; soundness is in nominating every writer of the object.
+// §3.12: choice 0 is the seed path, so the candidates whose value slot is
+// exactly G's return type come first; among those, and among the rest, the
+// order is by name.
 static std::vector<Setter> valueSetters(Module &M, Module *also, Function *G, unsigned fb,
                                         std::map<const Function *, bool> &look) {
   std::string cls = classOf(G->getName());
@@ -877,7 +929,7 @@ static std::vector<Setter> valueSetters(Module &M, Module *also, Function *G, un
   auto scan = [&](Module &Mod) {
     for (Function &S : Mod)
       if (&S != G && !S.isDeclaration() && S.arg_size() > 1 && classOf(S.getName()) == cls &&
-          S.getArg(0)->getType() == G->getArg(0)->getType() && !isLookup(&S, look))
+          S.getArg(0)->getType() == G->getArg(0)->getType() && !isLookup(&S, look) && instanceMethod(&S))
         cands.emplace(S.getName().str(), &S);
   };
   scan(M);
@@ -887,10 +939,10 @@ static std::vector<Setter> valueSetters(Module &M, Module *also, Function *G, un
   for (auto &[name, S] : cands)
     for (unsigned j = 1; j < S->arg_size(); ++j) {
       Type *V = S->getArg(j)->getType();
-      bool value = (V->isIntegerTy() && V == G->getReturnType()) || V->isPointerTy();
-      if (!value)
+      bool exact = V->isIntegerTy() && V == G->getReturnType();
+      if (!exact && !V->isPointerTy())
         continue;
-      Setter st{S, std::vector<Bind>(S->arg_size())};
+      Setter st{S, std::vector<Bind>(S->arg_size()), exact};
       std::set<unsigned> used{0, fb};
       st.binds[0] = {Bind::Arg, 0};
       st.binds[j].kind = Bind::Witness;
@@ -904,8 +956,11 @@ static std::vector<Setter> valueSetters(Module &M, Module *also, Function *G, un
             break;
           }
       }
+      if (used.size() != G->arg_size())
+        continue;
       out.push_back(std::move(st));
     }
+  std::stable_partition(out.begin(), out.end(), [](const Setter &s) { return s.exact; });
   return out;
 }
 
@@ -1681,7 +1736,10 @@ int main(int argc, char **argv) {
             errs() << "sink-only: unresolved function in witness " << want << "\n";
             return 1;
           }
-          m.sinkFacts(seq, outs());
+          if (std::getenv("SP_SOLVE_ONLY"))
+            m.solveSeq(seq, outs());
+          else
+            m.sinkFacts(seq, outs());
           return 0;
         }
         errs() << "sink-only: witness " << want << " not found\n";

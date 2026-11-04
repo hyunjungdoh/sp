@@ -3606,6 +3606,11 @@ std::vector<Client::Named> Client::named(const std::vector<std::string> &seq) co
         if (auto *D = dyn_cast<ConstantInt>(CB->getArgOperand(*fb)))
           nm.fallback = D->getSExtValue();
         nm.sinkDep = sinkNamed.count(nm.key) > 0;
+        // The lookup's call site, to pair this setting with a 정의 R return
+        // obligation on the same lookup (§3.8.6 완전성 + 정의 R).
+        nm.lookAt = CB->getFunction()->getName().str();
+        if (const DebugLoc &DL = CB->getDebugLoc())
+          nm.lookLine = DL.getLine();
         out.push_back(std::move(nm));
         break;
       }
@@ -5349,16 +5354,54 @@ Client::Plan Client::plan(const Witnesses &ws) const {
         if (!dup)
           fs.push_back(c);
       }
-    // Definition 3.8.6: a setting is the client's own choice, like a lever,
-    // at every entry that receives the object the lookup reads.
+    // Definition 3.8.6: a setting is the client's own choice, like a lever, at
+    // the entry that *supplies* the object the lookup reads. The object is an
+    // input the library reads as config, so the entry's held parameter of the
+    // lookup's type must be one the entry does not write through: a `const`
+    // config it carries into library state (ImageBuf::reset's `config`), not an
+    // output slot the entry fills (get_cache_dimensions' `ImageSpec& spec`).
+    // Binding by type alone bound the setting to every entry with a parameter of
+    // that type, so output-only entries ranked first in seed order with a config
+    // they never read. The rule is data flow, not a type match, and names no
+    // library (대원칙: 케이스별 땜질 금지).
+    auto suppliesRead = [&](Function *F, const std::string &ty) {
+      for (const Param &p : signature(F)) {
+        if (!held(p) || p.type != ty)
+          continue;
+        // The lookup reads the object as const config, so the supplying entry
+        // must pass it as a read input the library may not overwrite: a const
+        // pointer/reference (writablePointee is null) or a by-value copy — not a
+        // writable output slot it fills (an `ImageSpec&` it assigns into). This is
+        // the data direction of the parameter, and names no library.
+        if (!isPointer(p.di) || writablePointee(p.di) == nullptr)
+          return true;
+      }
+      return false;
+    };
+    // 정의 R: an obligation on the same lookup this setting reads (matched by
+    // the key, then the call site) tells the seed which value the sink path
+    // needs the lookup to return.
+    const std::vector<Ret> &rets = wi < retsIn.size() ? retsIn[wi] : std::vector<Ret>{};
+    auto obligation = [&](const Named &n) -> std::optional<std::pair<std::string, int64_t>> {
+      for (const Ret &r : rets) {
+        if (r.key.empty() || r.key != n.key)
+          continue;
+        if (!n.lookAt.empty() && !r.caller.empty() && (r.caller != n.lookAt || (n.lookLine && r.line && r.line != n.lookLine)))
+          continue;
+        return std::make_pair(r.pred, (int64_t)std::atoll(r.k.c_str()));
+      }
+      return std::nullopt;
+    };
     for (const Named &n : named(seq))
       for (Function *F : W.entries) {
-        auto sf = signature(F);
-        if (std::none_of(sf.begin(), sf.end(), [&](const Param &p) { return held(p) && p.type == n.type; }))
+        if (!suppliesRead(F, n.type))
           continue;
         auto &ns = P.named[F];
-        if (std::none_of(ns.begin(), ns.end(), [&](const Named &o) { return o.setter == n.setter && o.key == n.key; }))
-          ns.push_back(n);
+        if (std::none_of(ns.begin(), ns.end(), [&](const Named &o) { return o.setter == n.setter && o.key == n.key; })) {
+          Named bound = n;
+          bound.must = obligation(n);
+          ns.push_back(std::move(bound));
+        }
       }
     if (W.pass) {
       writerSet.insert(W.cover.begin(), W.cover.end());
@@ -5478,9 +5521,26 @@ void Client::grammar(Plan &P) const {
     unsigned ca = cost.count(a) ? cost.at(a) : ~0u, cb = cost.count(b) ? cost.at(b) : ~0u;
     return ca != cb ? ca < cb : a < b;
   });
+  // §3.11 Definition O, settings carrier. A type the client configures —
+  // one a named setting is bound to an entry through (§3.8.6) — is built,
+  // not read. A producer that takes the input hands back an object the
+  // file determined (ImageBuf::specmod: the input's own spec), so the
+  // settings would land on the wrong object, and its extraction path (a
+  // lazy read of a handle the harness never filled) dies before the entry
+  // runs. For a carrier type the input-free producers (constructors) come
+  // first; the others remain alternatives. No named setting, no carrier:
+  // the order of Definition O stands as is.
+  std::set<std::string> carrier;
+  for (const auto &[E, ns] : P.named)
+    for (const Named &n : ns)
+      carrier.insert(n.type);
   for (const std::string &T : order) {
     auto it = producers.find(T);
-    P.handles.push_back({T, it == producers.end() ? std::vector<Producer>{} : it->second});
+    std::vector<Producer> ps = it == producers.end() ? std::vector<Producer>{} : it->second;
+    if (carrier.count(T))
+      std::stable_partition(ps.begin(), ps.end(),
+                            [&](const Producer &p) { return channel(p.fn) == Channel::None; });
+    P.handles.push_back({T, std::move(ps)});
   }
 }
 
@@ -5901,13 +5961,15 @@ void Client::report(const Plan &P, raw_ostream &out) const {
 // Arguments follow the parameter's kind. A held input comes from make_T. Other public objects
 // are client allocations of the struct's size whose constrained fields
 // are symbolic. Integers and floats are symbolic. Text is a symbolic
-// string. A byte buffer is n symbolic bytes, and an integer right after it
-// is its length, at most n. A callback is a function of the harness: given
-// a buffer and a length it delivers the next bytes of an n-byte symbolic
-// input and returns their count; otherwise it returns a symbolic value. An
-// out-parameter is a slot the call fills. The file "f" of the environment
-// holds the same n bytes (FileEnv), so every byte the library reads, from
-// an argument, a callback, or the file, is the client's choice.
+// string. A byte buffer is the client's n-byte input (same object as the
+// file and as what callbacks deliver), and an integer that bounds one such
+// buffer is its length, at most n (named length:input). A callback is a
+// function of the harness: given a buffer and a length it delivers the next
+// bytes of that input and returns their count; otherwise it returns a
+// symbolic value. An out-parameter is a slot the call fills. The file "f"
+// of the environment holds the same n bytes (FileEnv), so every byte the
+// library reads, from an argument, a callback, or the file, is the client's
+// choice.
 
 namespace {
 
@@ -6024,11 +6086,24 @@ struct Builder {
   // A buffer of elements of the given size: as many as the input bound
   // allows within 64 KiB, and at least one. Returns the count it holds.
   uint64_t capacity(uint64_t elem) const { return std::max<uint64_t>(1, std::min<uint64_t>(n, 65536 / elem)); }
+  // Same n bytes as client.input / FileEnv / callbacks — not a fresh
+  // "bytes.N" symbolic. A separate object would not receive the seed named
+  // "input", and would break the contract that argument, callback, and file
+  // reads are one client choice. lastBytes is "input" so a length that
+  // bounds this buffer is named length:input (S2').
   Value *bytes(IRBuilder<> &B, uint64_t elem = 1) {
     uint64_t size = capacity(elem) * elem;
+    lastBytes = "input";
+    if (size == n)
+      return data;
+    // Wider element stride: capacity*elem may exceed n. Prefix is the
+    // shared input; the rest is zero. Still one client file, not a new
+    // symbolic domain.
     Value *p = B.CreateCall(mallocF, {B.getInt64(size)});
-    lastBytes = "bytes." + std::to_string(names++);
-    B.CreateCall(mkSym, {p, B.getInt64(size), B.CreateGlobalStringPtr(lastBytes)});
+    B.CreateCall(memcpyF, {p, data, B.getInt64(n)});
+    if (size > n)
+      B.CreateMemSet(B.CreateGEP(B.getInt8Ty(), p, B.getInt64(n)), B.getInt8(0), B.getInt64(size - n),
+                     MaybeAlign(1));
     return p;
   }
   std::string lastBytes;
@@ -7927,7 +8002,21 @@ void Client::emit(const Plan &P, Module &H) const {
             // set there; the others are skipped there (§4 순서는 시드 경로만 정한다).
             std::function<void(IRBuilder<> &)> set = [&](IRBuilder<> &A) { nameSet(A, n); };
             std::function<void(IRBuilder<> &)> skip = [](IRBuilder<> &) {};
-            if (n.sinkDep)
+            // 정의 R: when the sink path constrains this lookup's return (n.must),
+            // the seed value must satisfy it. skip yields the fallback, so skip on
+            // the seed when the fallback already satisfies the obligation (e.g.
+            // `highlight_mode == 0`), and set otherwise — even for a name §3.12 did
+            // not flag, when its obligation needs a non-fallback value. Without an
+            // obligation the §3.12 flag decides.
+            bool seedSet = n.sinkDep;
+            if (n.must) {
+              seedSet = true;
+              if (n.fallback)
+                if (auto h = retHolds(APInt(64, (uint64_t)*n.fallback, true), n.must->first,
+                                      std::to_string(n.must->second)))
+                  seedSet = !*h;
+            }
+            if (seedSet)
               K.oneOf(C, {set, skip}, "named");
             else
               K.oneOf(C, {skip, set}, "named");
