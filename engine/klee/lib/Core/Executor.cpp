@@ -1042,12 +1042,24 @@ bool Executor::branchingPermitted(const ExecutionState &state) const {
 void Executor::branch(ExecutionState &state,
                       const std::vector<ref<Expr>> &conditions,
                       std::vector<ExecutionState *> &result,
-                      BranchType reason) {
+                      BranchType reason, bool configFork) {
   TimerStatIncrementer timer(stats::forkTime);
+  // The generation every result starts from (state.branch() copies it);
+  // read before makePending can advance the input state's own.
+  const unsigned parentGen = state.gen;
   unsigned N = conditions.size();
   assert(N);
 
-  if (!branchingPermitted(state)) {
+  // Concolic seeding decides the cases without the native fork cap, as
+  // fork() does on a binary branch: the seed takes its case and every other
+  // case becomes a pending flip, bounded by the concolic machinery
+  // (ConcolicFlipBound, ConcolicPending), not by --max-forks. Under the cap
+  // a single random case would be kept -- the seed's only by chance -- and
+  // a seed whose case was dropped is lost at that switch (its state becomes
+  // an unseeded pending flip), which breaks the seed path at the first
+  // harness oneOf.
+  const bool concolicSeeding = Concolic && seedMap.count(&state);
+  if (!concolicSeeding && !branchingPermitted(state)) {
     unsigned next = theRNG.getInt32() % N;
     for (unsigned i=0; i<N; ++i) {
       if (i == next) {
@@ -1117,13 +1129,18 @@ void Executor::branch(ExecutionState &state,
         }
       }
     } else if (Concolic) {
-      // Targets no seed took are flips: solved once when selected.
+      // Targets no seed took are flips: solved once when selected. Those of
+      // a configuration switch are sibling seed paths and keep the
+      // generation they split from (keepConfigGeneration).
       std::shared_ptr<const Assignment> parent;
       if (!seeds.empty())
         parent = std::make_shared<Assignment>(seeds.front().assignment);
       for (unsigned i=0; i<N; ++i)
-        if (result[i] && !seedMap.count(result[i]))
+        if (result[i] && !seedMap.count(result[i])) {
           makePending(*result[i], parent);
+          if (configFork)
+            keepConfigGeneration(*result[i], parentGen);
+        }
     }
   }
 
@@ -1223,6 +1240,9 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
   // Under --concolic-data-concrete, a data conjunct on a forked path is not
   // kept (skipDataConjunct): the seed assignment alone steers the parse.
   bool skipDataConjunct = false;
+  // A configuration fork (C): the pending side it creates keeps the parent's
+  // generation (keepConfigGeneration) instead of starting the next one.
+  bool configFork = false;
   if (decided >= 0) {
     // Concolic: the seeds decide the branch without the solver. The side no
     // seed takes is a flip: created pending (solved once when selected) for
@@ -1247,6 +1267,7 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
     } else if (ConcolicDataConcrete && !isInternal && !atSink &&
                !dataOnly(condition)) {
       ++ledger.configForks;
+      configFork = true;
       res = Solver::Unknown; // explore C; do not collapse to one alternative
     } else if (decided == 2) {
       res = Solver::Unknown; // seeds split, both sides seeded
@@ -1276,6 +1297,7 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
              !isa<ConstantExpr>(condition) && !dataOnly(condition)) {
     // Config branch the seeds do not evaluate: skip the solver and fork.
     ++ledger.configForks;
+    configFork = true;
     res = Solver::Unknown;
   } else {
     time::Span timeout = coreSolverTimeout;
@@ -1417,17 +1439,26 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
       std::shared_ptr<const Assignment> parent;
       if (Concolic && !seeds.empty())
         parent = std::make_shared<Assignment>(seeds.front().assignment);
+      // Both sides start from the parent's generation (branch() copied it);
+      // read it before makePending advances the side that becomes pending.
+      const unsigned parentGen = current.gen;
       if (trueSeeds.empty()) {
         if (&current == trueState) swapInfo = true;
         seedMap.erase(trueState);
-        if (Concolic)
+        if (Concolic) {
           makePending(*trueState, parent);
+          if (configFork)
+            keepConfigGeneration(*trueState, parentGen);
+        }
       }
       if (falseSeeds.empty()) {
         if (&current == falseState) swapInfo = true;
         seedMap.erase(falseState);
-        if (Concolic)
+        if (Concolic) {
           makePending(*falseState, parent);
+          if (configFork)
+            keepConfigGeneration(*falseState, parentGen);
+        }
       }
       if (swapInfo) {
         std::swap(trueState->coveredNew, falseState->coveredNew);
@@ -1566,6 +1597,22 @@ const Cell& Executor::eval(KInstruction *ki, unsigned index,
 
 void Executor::bindLocal(KInstruction *target, ExecutionState &state, 
                          ref<Expr> value) {
+  // --concolic-data-concrete: a value derived only from fixed data bytes has
+  // the same value on every path (data bytes never flip in this mode), so
+  // keeping it symbolic buys no exploration. Collapse it to its seed value the
+  // moment it is produced. Otherwise data expressions accumulate across parse
+  // loops (load / modify / store-back / reload) until a single address or
+  // branch carries a multi-million-node expression, and the per-instruction
+  // seed evaluation that concretizes it (getValueFromSeeds / seedsDecide)
+  // turns quadratic -- the replay then crawls at a few instructions per second
+  // (observed deep in LibRaw identify / parse_tiff_ifd). Config-dependent
+  // values are not dataOnly and stay symbolic for the search; their already
+  // concretized data operands keep them small.
+  if (ConcolicDataConcrete && !isa<ConstantExpr>(value) &&
+      concolicSeeded(state) && dataOnly(value)) {
+    if (ref<ConstantExpr> cv = getValueFromSeeds(state, value))
+      value = cv;
+  }
   getDestCell(state, target).value = value;
 }
 
@@ -2053,7 +2100,8 @@ void Executor::writeLedger(bool exhausted) {
      << "slot-misses " << ledger.slotMisses << "\n"
      << "gates " << ledger.gates << "\n"
      << "data-concrete " << ledger.dataConcrete << "\n"
-     << "config-forks " << ledger.configForks << "\n";
+     << "config-forks " << ledger.configForks << "\n"
+     << "config-kept " << ledger.configKept << "\n";
   for (auto &kv : ledger.fates)
     *f << "fate:" << kv.first << " " << kv.second << "\n";
 }
@@ -2141,6 +2189,20 @@ void Executor::makePending(ExecutionState &state,
   }
   if (parent)
     state.parentInput = std::move(parent);
+}
+
+void Executor::keepConfigGeneration(ExecutionState &pending,
+                                    unsigned parentGen) {
+  // The generalization of the Π_I gate rule (spawnGateFlips) to every
+  // configuration fork the engine classifies: a harness choice is a sibling
+  // seed path, ordered by sinkOrder among the parent's peers, not a deeper
+  // generation. orderKey reads gen first, so this alone moves the flip
+  // ahead of every payload flip and every later generation; T_W (witness
+  // distance) then decides among the configurations of one generation.
+  if (pending.gen != parentGen) {
+    pending.gen = parentGen;
+    ++ledger.configKept;
+  }
 }
 
 bool Executor::dropUnreachable(ExecutionState *state) {
@@ -3387,6 +3449,9 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
     // with no conjunct; a config switch is never collapsed to one case.
     bool concolicSwitch = concolicSeeded(state) && !isa<ConstantExpr>(cond) &&
                           seedsDecide(state, cond) >= 0;
+    // A configuration switch: its pending cases keep the parent's
+    // generation (keepConfigGeneration, through branch()).
+    bool configSwitch = false;
     const bool atSink =
         statsTracker && userSearcherRequiresSink() && sinkDistance(state) == 0;
     if (ConcolicDataConcrete && concolicSeeded(state) && !isa<ConstantExpr>(cond) &&
@@ -3400,6 +3465,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
                !isa<ConstantExpr>(cond) && !atSink && !dataOnly(cond)) {
       ++ledger.configForks;
       concolicSwitch = true; // every case stays a candidate
+      configSwitch = true;
     } else if (concolicSwitch) {
       unsigned decision = state.decisions++;
       bool flip = false;
@@ -3532,7 +3598,7 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
         conditions.push_back(branchTargets[*it]);
       }
       std::vector<ExecutionState*> branches;
-      branch(state, conditions, branches, BranchType::Switch);
+      branch(state, conditions, branches, BranchType::Switch, configSwitch);
 
       std::vector<ExecutionState*>::iterator bit = branches.begin();
       for (std::vector<BasicBlock *>::iterator it = bbOrder.begin(),

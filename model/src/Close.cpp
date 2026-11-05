@@ -208,6 +208,11 @@ bool definesExternal(Module &have, StringRef n) {
 
 // An external definition `have` already holds becomes a declaration in mod.
 // The program then has one body under each name: the one in `have`.
+// Appending globals (llvm.global_ctors / llvm.global_dtors / llvm.used) are
+// not demoted: their initializers are the only references to the internal
+// C++ dynamic-init functions they list. Clearing them makes the linker drop
+// those locals, so static tables stay zero and every reader that depends on
+// them sees the wrong values under KLEE.
 unsigned demote(Module &mod, Module &have) {
   unsigned n = 0;
   for (Function &F : mod) {
@@ -219,7 +224,8 @@ unsigned demote(Module &mod, Module &have) {
     ++n;
   }
   for (GlobalVariable &G : mod.globals()) {
-    if (G.isDeclaration() || G.hasLocalLinkage() || !definesExternal(have, G.getName()))
+    if (G.isDeclaration() || G.hasLocalLinkage() || G.hasAppendingLinkage() ||
+        !definesExternal(have, G.getName()))
       continue;
     G.setComdat(nullptr);
     G.setInitializer(nullptr);

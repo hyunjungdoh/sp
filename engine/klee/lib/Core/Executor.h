@@ -346,8 +346,13 @@ private:
   /// a constraint and return the results. The input state is included
   /// as one of the results. Note that the output vector may include
   /// NULL pointers for states which were unable to be created.
+  /// Concolic mode: `configFork` marks a harness configuration branch
+  /// (--concolic-data-concrete, a condition that reads a non-data object);
+  /// the pending flips it creates keep the parent's generation
+  /// (keepConfigGeneration).
   void branch(ExecutionState &state, const std::vector<ref<Expr>> &conditions,
-              std::vector<ExecutionState *> &result, BranchType reason);
+              std::vector<ExecutionState *> &result, BranchType reason,
+              bool configFork = false);
 
   /// Fork current and return states in which condition holds / does
   /// not hold, respectively. One of the states is necessarily the
@@ -474,6 +479,8 @@ private:
                                // followed on the seed (not flipped, not kept)
     uint64_t configForks = 0;  // --concolic-data-concrete: config branches
                                // forked instead of collapsed to one seed value
+    uint64_t configKept = 0;   // pending flips of a config fork that kept the
+                               // parent's generation (keepConfigGeneration)
     std::map<std::string, uint64_t> fates, open;
   } ledger;
   void concolicAccount(ExecutionState &state, StateTerminationType reason);
@@ -567,6 +574,22 @@ private:
   /// generation; parent is the input it followed (kept if null).
   void makePending(ExecutionState &state,
                    std::shared_ptr<const Assignment> parent);
+
+  /// Concolic mode, witness-guided scheduling (DESIGN-D §6). A pending
+  /// flip of a configuration fork -- the side no seed took of a branch
+  /// that reads a non-data object (--concolic-data-concrete's C) -- is a
+  /// sibling seed path: another point of the configuration space the
+  /// harness itself offers (every alternative it emits reaches the sink by
+  /// construction), not a further generation of the search over the
+  /// payload X. Like a Π_I gate state (spawnGateFlips) it keeps the
+  /// generation of the path it splits from, so selectConcolic orders it
+  /// among that path's peers by witness distance (sinkOrder: T_W first)
+  /// instead of behind all of them and every deeper generation -- the
+  /// starvation of configuration flips by payload flips. Payload flips
+  /// (data-only conditions, and every flip outside the X/C partition)
+  /// still advance the generation. Call after makePending with the
+  /// generation the parent had before it.
+  void keepConfigGeneration(ExecutionState &pending, unsigned parentGen);
 
   /// Concolic mode. Keep at most --concolic-pending flips in memory; the
   /// greatest keys are deferred first.

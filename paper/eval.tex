@@ -5,9 +5,12 @@ To answer RQ1, we evaluate \sys on the 14 pairs where ChainFuzz reaches the vuln
 
 \PP{Metrics}
 We assign each pair one of three labels.
-A pair is \emph{exploitable} if AddressSanitizer~\cite{serebryany2012addresssanitizer} reports the expected memory error at the sink identified from the upstream advisory.
+To keep the comparison with ChainFuzz under a common criterion, we treat AddressSanitizer~\cite{serebryany2012addresssanitizer} as the trigger oracle for this research question.
+A pair is \emph{exploitable} if AddressSanitizer reports the expected memory error at the sink identified from the upstream advisory.
 A pair is \emph{reachable} if an execution path enters the vulnerable function but no explored state produces an AddressSanitizer report at that sink.
 A pair is \emph{unreachable} if no path from a public downstream entry point enters the vulnerable function.
+
+
 
 \PP{Results}
 \autoref{tab:rq1-summary} and \autoref{tab:chainfuzz-comparison} summarize the results.

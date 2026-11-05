@@ -696,15 +696,17 @@ must 층은 이것을 own과 같은 자격의 의무로 센다.
   \(S\)가 수정하는 필드(클로저의 MOD)와 \(G\)가 읽는 필드(클로저의 REF)가 겹친다. 의미는
   \(M_o := M_o[\kappa \mapsto v]\)이다. 후보가 여럿이면 이름 순서의 첫 함수다.
 - **설정.** 증인의 단계 함수가 직접 하는 조회 가운데 수신 객체가 그 단계의 형식인자에서 온 것마다,
-  그 수신 타입을 **읽기 입력으로** 받는 entry 앞에서 하네스는 \((S(o, \kappa, v) \mid \text{skip})\)을
+  그 객체를 **읽기 입력으로 받아 조회까지 전달하는** entry 앞에서 하네스는 \((S(o, \kappa, v) \mid \text{skip})\)을
   고른다. 읽기 입력이란 그 타입의 보유 형식인자 가운데 피지시체가 const이거나 포인터가 아닌 것이 있다는
   뜻이다(`const ImageSpec *config`, `const ImageSpec &config`). 피지시체가 쓰기 가능한 참조만 있는 entry
   (`ImageSpec &spec`을 결과로 채우는 `get_cache_dimensions`)는 그 객체를 **내놓는** 자리라 설정이 조회에
-  닿지 않으므로 제외한다. 타입만으로 묶던 이전 규칙은 출력 자리까지 설정 자리로 삼아, 설정이 가장 많이
-  바인딩된 entry — 그래서 시드 entry — 로 출력 전용 함수를 골랐다. \(o\)는 entry가
-  받을 바로 그 보유 핸들(make_T가 메모한 것)이다. \(v\)는 \(S\)가 받는 정수 전체에서 고른 기호 값이다.
-  \(\kappa\)는 조회 지점이 짓는 그대로 짓는다. 지점이 칸을 초기화 호출로 채우면 하네스도 같은 크기의 칸을
-  같은 호출과 같은 상수로 채운다. 그래서 키 표현(`string_view`, `const char *`)의 배치를 가정하지 않는다.
+  닿지 않으므로 제외한다. 그리고 entry의 그 읽기 형식인자가 증인 시퀀스를 따라 조회의 수신 객체에
+  **실제로 닿아야** 한다(인자 전달, 슬롯, 단계 사이에 남는 필드 저장/적재). 타입·읽기 자리만으로
+  묶으면 `make_texture`처럼 config를 받고도 `ImageInput::open`에 null을 넘겨 조회가 다른 객체를 읽는
+  entry가 시드로 올라간다. \(o\)는 entry가 받을 바로 그 보유 핸들(make_T가 메모한 것)이다. \(v\)는
+  \(S\)가 받는 정수 전체에서 고른 기호 값이다. \(\kappa\)는 조회 지점이 짓는 그대로 짓는다. 지점이 칸을
+  초기화 호출로 채우면 하네스도 같은 크기의 칸을 같은 호출과 같은 상수로 채운다. 그래서 키 표현
+  (`string_view`, `const char *`)의 배치를 가정하지 않는다.
 - **완전성.** \(\mathrm{skip}\)은 \(\kappa \notin \mathrm{dom}\,M_o\)를, \(S(o, \kappa, v)\)는 \(M_o(\kappa) = v\)를
   준다. 그러므로 \(G(o, \kappa, d)\)가 낼 수 있는 값 \(\{d\} \cup V\)는 모두 하네스의 선택으로 나온다.
   부르는 것은 실제 클라이언트가 할 수 있는 호출이고(H1), 부르지 않을 수 있다(H2).
@@ -719,13 +721,12 @@ must 층은 이것을 own과 같은 자격의 의무로 센다.
   생긴다. 이 정의 이전의 `client.bc`는 생성자로 만든 빈 `ImageSpec`을 넘겼으므로 모든 조회가 대체값을 냈다.
   그래서 `half_size`는 늘 0이었고, φ의 원자 `get_int_attribute("raw:balance_clamped", 0) ≠ 0`도 만족할 수
   없었다. may 층 잔여 실행(`run.bc`)은 조회 결과를 증인 상수로 바꾸므로 이 빈칸이 드러나지 않았다.
-- *측정(1729, 설정 자리).* 타입 바인딩은 `ImageCache::get_cache_dimensions(ImageCacheFile*, …,
-  ImageSpec &spec, …)`에 여섯 이름을 모두 묶어 그것을 시드 entry(`seed 0 … sinkdep 6`)로 골랐다. 그 함수는
-  `spec`을 채워 내놓을 뿐 `m_configspec`(기본 null)을 읽지 않으므로 어떤 설정도 `open_raw`의 조회에 닿지
-  않는다 — 6회 실행 모두 sink에 이르지 못했다. 읽기 입력 규칙에서 그 entry의 바인딩은 0이 되고, 남는
-  sinkdep-6 entry는 `ImageBufAlgo::make_texture(…, const ImageSpec &config)`×3, `ImageBuf::reset(…,
-  const ImageSpec *config, …)`, `ImageCache::add_file(…, const ImageSpec *config, …)` — 모두 config를
-  리더에 넘기는 입구다. 실현 수는 66/66으로 같다.
+- *측정(1729, 설정 자리).* 타입 바인딩은 `ImageCache::get_cache_dimensions(…, ImageSpec &spec, …)`에
+  여섯 이름을 모두 묶어 시드 entry로 골랐다 — `spec`은 출력 자리라 조회에 안 닿는다. 읽기 입력 규칙은
+  그것을 제거하지만, `make_texture(…, const ImageSpec &config)`는 config를 읽기 입력으로 받으면서도
+  구현이 `ImageInput::open(…, /*config=*/null, …)`을 호출해 조회 객체에 닿지 않는다. 전달 규칙
+  (`carriesNamed`)까지 적용하면 sinkdep-6 entry는 `ImageBuf::reset`·`ImageCache::add_file`처럼
+  config가 open 경로의 조회 객체에 도달하는 입구만 남는다.
 - **시드 값과 반환 의무(정의 R).** 조회 \(G\)의 반환에 경로의 의무 \(\bowtie k\)가 있으면(`model return G ⋈ k`,
   같은 함수·같은 행의 조회) 시드 선택지는 그 의무를 만족하는 쪽이다. skip은 \(d\)를 내므로 \(d \bowtie k\)이면
   skip이 0번, 아니면 set이 0번이다(set의 시드 값은 아래 §3.12의 \(d+1\)). 의무가 없으면 §3.12의 싱크 의존이

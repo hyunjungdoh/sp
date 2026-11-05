@@ -1,213 +1,250 @@
-
 \section{Design of \sys}
+\label{sec:design}
 
-We present the design of \sys, which assesses the exploitability of propagated vulnerabilities by recovering the required downstream configuration context and identifying inputs that trigger vulnerabilities under that context.
+\subsection{Overview}
+\label{subsec:design-overview}
 
-Before describing the analysis procedure, we define its inputs and vulnerability target.
-%
-Given a vulnerable upstream component $U$, a downstream application $D$, and an upstream PoC input $X$, \sys analyzes a vulnerable function $f_v$, which is manually identified by reproducing the upstream PoC. If the fault occurs at a function call (\eg, \texttt{memmove()} in \autoref{lst:moti_vul}), the called function is selected as $f_v$; otherwise, the function containing the faulting instruction is selected.
+\autoref{fig:overview} illustrates the workflow of \sys.
+As formalized in \autoref{sec:moti}, our goal is to determine whether a vulnerability in an upstream library~$U$ can be triggered through a downstream application~$D$.
+This requires finding a path from a public API of~$D$ to the vulnerable operation~$s$ and establishing the runtime state needed to execute that path, so that a given data input~$X$ triggers~$s$ under that state.
 
-\woo{sink는 뭔가 도달만하면 터질거같은 느낌이라 reachability랑 exploitability구분이 모호해지는거같아서.. 함수단위기도하고 취약한함수로 일단 이름바꿨는데..흠}
-\PP{Overview}
-\textcolor{red}{Figure 9} illustrates the overall workflow of \sys.
-P1.. P2.. P3..
+\sys addresses these requirements in three phases.
+P1 recovers trigger paths and identifies the public APIs that establish the memory values required along each path.
+P2 uses this information to synthesize a client harness, supplementing it with constants and configuration settings that can affect path execution but are not captured by P1.
+P3 performs concolic execution on the generated harness, with~$X$ held fixed, to determine whether that input triggers~$s$.
 
+The three phases address different obstacles to reaching~$s$.
+A trigger path specifies the conditions for reaching~$s$, but does not tell a client how to establish them through~$D$.
+P1 addresses this gap through \emph{setup attribution}, which connects path conditions to the public APIs that can establish the required state.
+Even with these APIs, however, a path may not execute as intended: the harness must construct the required objects, select the appropriate indirect-call targets, and account for configuration settings that affect execution outside the entry arguments.
+P2 addresses these issues through \emph{directed harness synthesis}, which turns the attributed context into an executable harness and guides exploration toward the recovered path.
+P3 then determines whether the given input triggers the vulnerability under the configuration established by the harness.
 
-\subsection{Configuration Context Recovery (P1)}\label{subsec:p1}
-P1 recovers the configuration context required to trigger an upstream vulnerability through a downstream application. \sys first constructs a cross-boundary call graph and identifies trigger paths from downstream public APIs to the vulnerable operation. It then analyzes the conditions along these paths and identifies the public APIs that can establish the required memory state.
+\begin{figure}[t]
+\centering
+\includegraphics[width=\linewidth]{./design/overview_HJ_simple.pdf}
+\caption{Overview of \sys.}
+\label{fig:overview}
+\end{figure}
 
-\subsubsection{Call Graph and Entry Points}
-Constructing a cross-boundary call graph requires resolving indirect calls through function pointers and virtual dispatch. For example, a downstream application may register a callback that the upstream component invokes later. 
+\PP{Design assumptions}
+\sys analyzes the compiled intermediate representations of~$D$ and~$U$ with debug information, which provides function signatures, structure layouts, and field names.
+It takes the location of~$s$, the public APIs of~$D$, and a data input~$X$ as input.
+We assume that a client interacts with~$D$ only through these public APIs.
+Values that cannot be established through them are treated as depending on~$X$ and are checked against that input in P3.
 
-To resolve indirect calls across both components, \sys performs a field-sensitive, flow-insensitive points-to analysis. The resulting call graph is represented as $G=(F,E)$, where $F$ denotes functions in both components and $E$ denotes their calling relationships.
+\subsection{Configuration Context Recovery (P1)}
+\label{subsec:p1}
 
+P1 recovers paths from~$D$ to~$s$ and determines how a client can establish the state required along each path.
+It first constructs a call graph that captures direct and indirect calls across the two modules.
+It then recovers trigger paths from suitable public entry points and attributes their required memory values to public setup APIs.
 
-%To resolve these calls, \sys performs a field-sensitive, flow-insensitive points-to analysis over both components. \sys connects function-pointer stores to indirect-call loads and resolves virtual calls through vtable entries. Together with direct calls, these relations form a call graph $G=(F,E)$, where $F$ represents functions in both components and $E$ represents their calling relationships.
+\subsubsection{Call graph and entry points}
 
-Specifically, \sys constructs the call graph by adding three types of edges to $E$. \circled{1} For direct calls, it connects each caller to its explicitly named callee. \circled{2} For indirect calls, it uses points-to analysis to identify possible callees from function-pointer assignments and loads. For example, if a function pointer \texttt{ptr->field} stores the address of $f$ and an indirect call later loads this field, \sys adds an edge from the caller to $f$. \circled{3} For virtual calls, it resolves possible targets through \texttt{vtable} entries, including overriding methods in derived classes.
+A call graph built from direct calls alone misses paths that cross the boundary between~$D$ and~$U$ through indirect calls.
+For example,~$D$ may register a callback that~$U$ invokes later, or either module may dispatch through a function pointer or virtual table.
+To capture these paths, \sys performs a field-sensitive, flow-insensitive points-to analysis over both modules.
+It connects function-pointer stores to indirect-call loads and resolves virtual calls through vtable entries.
+Together with direct calls, these relations form a call graph~$G=(F,E)$.
 
-% \woo{요부분이 조금 모호한데, 어떻게 했는지가 좀 약해서. 예를들어 direct call은 그냥 연결해서 caller$\rightarrow$callee edge추가. Indirect call은 points-to-analysis로 (SVF?툴썻나?) 가능한 callee를 식별하고 해당 edge추가. Virtual call은 Vtable을 어떻게 저떻게 분석해서 가능한 method로 edge추가. 이렇게 세단계를 거쳐서 G를 만든다. 이게 너무길지않아도 드러나야할거같아용}
-% \doh{
-% \sys populates~$E$ in three cases.
-% For a direct call, it adds an edge to the named callee.
-% For an indirect call through a function pointer, the points-to analysis identifies which functions may reside in that pointer's field: if~\texttt{\&f} is stored to~\texttt{ptr$\rightarrow$field} and a later call loads that field into~\texttt{p}, the call of~\texttt{p} contributes an edge to~\texttt{\&f}.
-% For a virtual call such as~\texttt{Base *p; p$\rightarrow$foo();}, \sys adds edges to~\texttt{Base::foo} and to every other \texttt{foo} defined by a type that inherits from~\texttt{Base}.
-% }
-Given the constructed call graph, \sys selects public APIs as starting points for trigger paths. Let $I$ denote the public APIs of $D$, and let $R(f_v)=\{v \mid v \leadsto f_v\}$ denote the functions that can reach the vulnerable function $f_v$. \sys first retains APIs whose arguments a client can construct. Scalars and byte sequences can typically be supplied directly, whereas handles and objects may require initialization through public APIs. Let $I^\star \subseteq I$ denote this constructible subset.
-
-To avoid redundant entry points, \sys excludes an API directly called by another reachable public API. The selected entry points are defined as follows:
-
-\vspace{-0.7em}
-\small{
+The starting points of a trigger path must be public APIs that a client can invoke directly.
+However, not every public API that reaches~$s$ is an independent entry point.
+Let~$I$ denote the public APIs of~$D$, and let
+$R(s)=\{v\mid v\leadsto_G s\}$ denote the functions that can reach~$s$.
+\sys first retains APIs whose arguments a client can construct.
+Scalars and byte sequences can be supplied directly, whereas handles, objects, and aggregates require a public producer.
+Let~$I^\star\subseteq I$ denote this constructible subset.
+Among these APIs, \sys removes an API if another reachable public API directly calls it:
 \[
-B_{\mathrm{entry}} =
-\{f \in I^\star \cap R(f_v)
-\mid \nexists c \in I \cap R(f_v):
-c\neq f \land (c,f)\in E\}.
-\]}
+\begin{aligned}
+B_{\mathrm{entry}} = \{f\in I^\star\cap R(s)\mid\;&
+\nexists c\in I\cap R(s):\\
+&c\neq f\land(c,f)\in E\}.
+\end{aligned}
+\]
+Each remaining API is a public starting point with no direct caller among the reachable public APIs.
 
-Here, $B_{\mathrm{entry}}$ contains constructible public APIs that can reach $f_v$ but are not directly called by another reachable public API $c$, where $(c,f)\in E$ represents a direct call from $c$ to $f$.
+\subsubsection{Setup attribution}
 
-\subsubsection{Setup Attribution}
-For each entry point $f_0 \in B_{\mathrm{entry}}$, \sys recovers trigger paths $\pi=f_0\rightarrow\cdots\rightarrow f_v$ leading to the vulnerable function $f_v$. 
+For each entry point~$f_0\in B_{\mathrm{entry}}$, \sys recovers trigger paths
+$\pi=f_0\rightarrow\cdots\rightarrow f_n$ that reach~$s$.
+A path alone, however, does not explain how a client can satisfy its conditions.
+A condition may refer to a field of an object passed to~$f_0$, even though that field is written only by an earlier public API of~$D$.
+A client cannot directly modify the internals of~$U$; it must establish the required value through the interface exposed by~$D$.
+Thus, path recovery must also identify which public APIs can install the values required along the path.
 
-Executing these paths may require specific values in object fields initialized through earlier downstream API calls. Therefore, \sys identifies the required memory values along each path and the public APIs that can establish them.
+Simply finding APIs that write to the same field is insufficient.
+An API may write to a temporary object or to a different instance, or it may write a value that violates the path condition.
+Calling such an API does not establish the state that the entry point will later read.
+Setup attribution therefore has two tasks: express path conditions in terms of memory reachable from the entry arguments, and identify public APIs that can establish those conditions on the relevant objects.
 
-An API may write to the same field in a different object or assign a value that violates the path condition.
-%Executing these paths may require specific values in object fields initialized through earlier downstream API calls. Therefore, \sys identifies the required memory values along each path and the public APIs that can establish them.
-%An API may write to the required field but modify a different object or assign a value that violates the path condition. 
-To identify valid setup APIs, \sys performs two steps: (1) \textit{entry-relative path condition recovery}, which identifies the required memory values, and (2) \textit{setup API identification}, which finds public APIs that can establish these values.
+\PP{S1: Express path conditions over entry-relative cells}
+For a trigger path~$\pi$, \sys expresses each required memory location as a cell
+$c=(o,\alpha)$, where~$o$ is an argument of~$f_0$ or an object obtained through a prior public call on those arguments, and~$\alpha$ is a constant field path within that object.
+This representation identifies both the required value and the object on which a client must establish it.
 
-%To identify valid setup APIs, \sys performs two steps: (1) recovering path conditions over memory locations reachable from the entry-point arguments and (2) identifying public APIs that can establish the required values at those locations.
+\sys examines the branch predicates along~$\pi$ and retains those whose operands can be expressed as entry-relative cells and constants.
+Predicates that depend on the data input are checked against the given~$X$ in P3.
+When a caller branches on a callee's return value, \sys maps the return-value condition back to the values passed by the caller, allowing the requirement to be expressed in the same entry-relative form.
+It also checks whether the indirect-call targets implied by the path are consistent with the call context; a path with a contradictory target is discarded.
 
+The result is a set of conditions over cells reachable from the entry arguments.
+This restriction identifies state that a client can establish through the objects it supplies to~$D$.
+State outside this reach, such as fields of objects created internally by~$D$, is not attributed here and is handled during harness generation.
 
-%An API may write to the required field but modify a different object or assign a value that violates the path condition. To identify valid setup APIs, \sys performs two steps: S1 for expressing path conditions in terms of memory locations reachable from the entry-point arguments and S2 for identifying public APIs that can establish the required values at those locations.
+\PP{S2: Attribute required cells to setup APIs}
+For each required cell~$c=(o,\alpha)$, \sys identifies public APIs that can establish its required value.
+It first collects stores whose destination field matches the final field of~$\alpha$ by type and byte offset.
+Let~$\mathcal{W}(c)$ denote the functions containing these candidate stores.
+It then walks the call graph backward from~$\mathcal{W}(c)$ to find public APIs that can reach them.
 
+A matching store alone does not establish that an API is a valid setup operation.
+\sys checks that the API operates on the object holding the required field, rather than merely writing a field with the same layout in an unrelated object.
+It also examines the stored value against the required condition.
+A value supplied by the API's caller can establish the condition because the client can choose that value; a constant that contradicts the condition cannot.
+APIs that release the relevant object are also excluded, since the entry point cannot subsequently read the required state from a destroyed object.
 
-\PP{Entry-relative path condition recovery}
-For each trigger path $\pi$, \sys recovers the path conditions and represents their associated memory locations as entry-relative cells $c=(o,\alpha)$, where $o$ denotes an argument of the entry point $f_0$, and $\alpha$ specifies the field access path from that argument to the memory location.
+Among the admitted APIs, \sys retains those closest to the matching stores in the call graph.
+This avoids selecting callers whose only role is to invoke another already identified setup API, while still allowing an API to qualify when its implementation forwards the operation to a private helper.
+When multiple APIs can establish different required cells, \sys uses a greedy selection procedure that prefers APIs covering more uncovered cells, subject to a fixed limit.
 
-For example, consider the following code, where \texttt{process()} is an entry point $f_0$.
-
-% \begin{lstlisting}[
-% caption={Recovering path conditions over a shared entry-relative cell.},
-% label={lst:working},
-% language=C,
-% style=base,
-% basicstyle=\fontsize{8}{9}\ttfamily\color{black},
-% escapeinside={(*@}{@*)},
-% breaklines=true,
-% float=t,
-% frame=none
-% ]
-% void process(Context *ctx) {
-%   if (ctx->config.limit > 10000)
-%     decode(ctx);
-% }
-% void decode(Context *ctx) {
-%   if (ctx->config.limit < 20000)
-%     vulnerable_function();
-% }
-% \end{lstlisting}
-
-
-% \begin{tcolorbox}[
-%   colback=gray!8,
-%   colframe=gray!35,
-%   boxrule=0.4pt,
-%   arc=1pt,
-%   left=5pt,
-%   right=3pt,
-%   top=1pt,
-%   bottom=1pt
-% ]
-% \small
-% \verb|void process(Context *ctx) {|\\
-% \hspace*{2em}\verb|if (ctx->config.limit > 10000)|\\
-% \hspace*{4em}\verb|vulnerable_function();|\\
-% \verb|}|
-% \end{tcolorbox}
-\begin{tcolorbox}[
-  colback=gray!2,
-  colframe=gray!35,
-  boxrule=0.4pt,
-  arc=1pt,
-  left=5pt,
-  right=3pt,
-  top=1pt,
-  bottom=1pt
-]
-\small
-\verb|void process(Context *ctx) {|\\
-\hspace*{2em}\verb|if (ctx->config.limit > 10000)|\\
-\hspace*{4em}\verb|decode(ctx);|\\
-\verb|}|\\
-\verb|void decode(Context *ctx) {|\\
-\hspace*{2em}\verb|if (ctx->config.limit < 20000)|\\
-\hspace*{4em}\verb|vulnerable_function();|\\
-\verb|}|
-\end{tcolorbox}
-Here, \sys identifies $c=(\texttt{ctx},\texttt{config.limit})$ as the same entry-relative cell across both functions, recovering the conditions that \texttt{ctx->config.limit} must exceed 10,000 and remain below 20,000 to reach \texttt{vulnerable\_function()}.
-%Here, \sys identifies $c=(\texttt{ctx},\texttt{config.limit})$ and recovers the condition that \texttt{ctx->config.limit} must exceed 10,000 to reach \texttt{vulnerable\_function()}.
-If the required value is the argument, $\alpha$ is empty.
-
-\sys examines branch predicates along each trigger path $\pi$ and expresses their conditions over entry-relative cells and constants.
-%\sys examines the branch predicates along each trigger path $\pi$ and recovers conditions expressed over entry-relative cells and constants. 
-When a predicate depends on a callee's return value, \sys maps the return-value condition back to the caller's arguments to express it in terms of entry-relative cells. Predicates that depend on input data are deferred to P3, where they are evaluated against the upstream PoC input $X$.
-
-\sys also checks the consistency of recovered path conditions by tracking writes to entry-relative cells along each trigger path. 
-It updates the cell values at store instructions and checks their consistency with the required conditions at branch instructions. Paths with contradictory conditions are discarded. For example, in the code above, \sys checks that the conditions \texttt{ctx->config.limit} \texttt{>} \texttt{10000} and \texttt{ctx->config.limit} \texttt{<} \texttt{20000} are compatible, retaining the path because both can be satisfied.
-%It updates the values of these cells at store instructions and checks the corresponding conditions at branch instructions. Paths with contradictory conditions that cannot be resolved by intervening writes are discarded.
-
-The recovered path conditions specify the values required at entry-relative cells along each trigger path. This representation identifies the state that a client can establish through objects supplied to $D$. Memory locations outside the reach of entry-point arguments, such as fields of objects created internally by $D$, are handled during harness generation in P2.
-
-% For each trigger path $\pi$, \sys represents the required memory locations as entry-relative cells $c=(o,\alpha)$, where $o$ denotes an argument of the entry point $f_0$ or an object obtained through an earlier public API call, and $\alpha$ denotes a constant field path within that object. \woo{constant field path도 좀 모호한데.. 설명을 넣거나 예제를넣거나?}. This representation identifies the specific object and field whose value affects execution of the trigger path.
-% \doh{For each trigger path~$\pi$, \sys represents each required memory location as an entry-relative cell~$c=(o,\alpha)$, where~$o$ identifies an argument of the entry point~$f_0$ and~$\alpha$ specifies the access path from that argument to the memory location. If the argument is value itself, $\alpha$ is empty. Thus, each cell identifies a specific memory location relative to an entry-point argument.}
-
-
-
-
-\PP{Setup API identification}
-For each entry-relative cell $c=(o,\alpha)$ identified in the previous step, \sys identifies public APIs that can establish its required value. It first locates \texttt{store} instructions targeting fields that match the final field of $\alpha$ in type and byte offset. Let $W(c)$ denote the set of functions containing these \texttt{store}s. \sys then traverses the call graph backward from $W(c)$ to identify public APIs that can reach these functions.
-
-However, a matching \texttt{store} does not necessarily indicate a valid setup API. Therefore, \sys checks three requirements: \circled{1} the API modifies the object associated with the required cell, \circled{2} the stored value can satisfy the recovered path condition, and \circled{3} the API does not release the required object. For the second requirement, caller-controlled values are considered configurable, while constants violating the condition are rejected.
-
-For example, consider the following candidate setup APIs for the cell identified in the preceding example. \woo{내 맘대로 넣은 코드라서 확인 요망}
-\begin{tcolorbox}[
-  colback=gray!1,
-  colframe=gray!35,
-  boxrule=0.4pt,
-  arc=1pt,
-  left=5pt,
-  right=3pt,
-  top=1pt,
-  bottom=1pt
-]
-\small
-{\color{gray!70!black}
-\verb|// Valid: satisfies all three requirements|}\\
-\verb|void setLimit(Context *ctx, int n) {|\\
-\hspace*{2em}\verb|ctx->config.limit = n;|\\
-\verb|}|\\[3pt]
-{\color{gray!70!black}
-\verb|// Invalid |\circled{1}\verb|: modifies another object|}\\
-\verb|void setDefaultLimit(int n) {|\\
-\hspace*{2em}\verb|Context tmp;|\\
-\hspace*{2em}\verb|tmp.config.limit = n;|\\
-\verb|}|\\[3pt]
-{\color{gray!70!black}
-\verb|// Invalid |\circled{2}\verb|: incompatible constant|}\\
-\verb|void resetLimit(Context *ctx) {|\\
-\hspace*{2em}\verb|ctx->config.limit = 100;|\\
-\verb|}|\\[3pt]
-{\color{gray!70!black}
-\verb|// Invalid |\circled{3}\verb|: releases the object|}\\
-\verb|void closeContext(Context *ctx) {|\\
-\hspace*{2em}\verb|ctx->config.limit = 15000;|\\
-\hspace*{2em}\verb|delete ctx;|\\
-\verb|}|
-\end{tcolorbox}
-
-Here, \texttt{setLimit()} satisfies all three requirements, whereas the other APIs violate requirements \circled{1}, \circled{2}, and \circled{3}, respectively.
-
-Among the valid candidates, \sys selects public APIs closest to the matching \texttt{store} instructions in the call graph, avoiding redundant callers that only invoke another identified setup API. When multiple cells require configuration, \sys applies a greedy selection strategy that prioritizes APIs covering the most uncovered cells, subject to a fixed limit.
-\woo{조금 기준이 헷갈리는게 만약에 store에 더 가까운 API가 하나의 cell만 딱 설정하고 멀리있는 API가 여러cell을 선택한다면 어케되는거죵..? 그리디로 따라가나? 그러면 그냥 이 코멘트 조용히 삭제}
-
-The recovered configuration context consists of an entry point, its path conditions, and the setup APIs identified for the required cells. \sys retains a context only if each required cell can be initialized directly or through an identified setup API, and the required return-value conditions are feasible. It also excludes contexts with conflicting setup operations that cannot establish the required cell values. The retained contexts are passed to P2 for harness generation.
+The resulting configuration context records an entry point, its path conditions, and the setup APIs attributed to those conditions.
+A context is retained only if every required cell has an attributed setup API or can be initialized directly, and the required return-value conditions are feasible.
+Contexts containing contradictory requirements on the same cell are rejected when neither setup operation overwrites the other's value.
+The retained contexts are passed to P2.
 
 \PP{Precision of setup attribution}
-The recovered configuration contexts are candidates rather than guarantees of executable trigger paths. The call graph and value analysis may over-approximate feasible behavior, and the selected setup APIs represent a bounded set of configuration alternatives. Therefore, P2 uses these contexts to generate executable harnesses, while P3 determines whether the upstream PoC input actually triggers the vulnerability under the established configuration.
+Setup attribution requires more than matching field layouts.
+The entry-relative representation restricts requirements to objects that a client can reach through the entry point, while the setup-API checks exclude operations that do not establish the required state on those objects or that write incompatible values.
+This allows \sys to distinguish an API that configures the object later read by the entry point from a getter, a temporary-object builder, or an unrelated method that happens to write a field with the same layout.
 
-\subsection{Harness Generation (P2)}\label{subsec:p2}
+Setup attribution is nevertheless an approximation, not a proof that the recovered path will execute.
+The call graph and value information may over-approximate possible behavior, conditions are recovered per path, and the selected setup APIs form a bounded cover rather than an exhaustive set of ways to establish the state.
+P2 therefore treats each retained context as a candidate harness configuration, and P3 determines whether the given input actually triggers~$s$ under that configuration.
 
-P2 generates an executable client harness from the configuration context recovered by P1. Beyond invoking the identified setup APIs, \sys incorporates additional configuration choices needed to follow the trigger path, including indirect-call dispatch and settings not captured by P1.
+\subsection{Harness Generation (P2)}
+\label{subsec:p2}
 
-\PP{Materialize the attributed context}
+P1 identifies the state required along a trigger path and the public APIs that can establish it.
+P2 turns this information into an executable client harness.
+However, establishing the attributed cells is not sufficient to ensure that execution reaches~$s$.
+The harness must also construct the objects consumed by the entry point, select the appropriate registered targets at indirect calls, and account for configuration settings that affect execution but are not reachable from the entry arguments.
 
-\PP{Supply constants associated with registered targets}
+To address these requirements, \sys synthesizes a directed harness in three steps.
+First, it materializes the attributed context using public APIs of~$D$.
+Second, it supplies constants associated with registered indirect-call targets so that the harness can exercise the corresponding dispatch choices.
+Third, it identifies configuration settings that influence the trigger path but are outside the entry-relative state recovered by P1.
+These choices guide concolic exploration without fixing every possible value in advance.
 
-\PP{Prioritize configuration settings that affect the trigger path}
+\PP{S1: Materialize the attributed context}
+For each retained context, \sys generates a harness that interacts with~$D$ only through its public APIs.
+It obtains the objects required by the entry point through public producers, reusing compatible objects when possible, and invokes the setup APIs attributed by P1.
+For required cells that can be initialized directly, the harness writes the corresponding values before invoking the entry point, unless object construction or a setup call has already established them.
+It then invokes the entry point on the given data input.
+
+The harness does not commit to every optional setup operation or argument.
+Instead, it preserves the alternatives identified by P1 as choices for concolic exploration.
+The initial execution follows the attributed context, while subsequent executions can explore other permitted choices.
+Conditions that depend on bytes of~$X$ are resolved from that input during P3.
+
+\PP{S2: Supply constants associated with registered targets}
+A recovered indirect-call target does not by itself tell the harness how to select that target at runtime.
+Libraries often choose a registered implementation using additional values stored alongside the function pointer, passed to its installer, or used by a factory that creates an object containing the pointer.
+These values may not appear in any branch predicate, so P1 does not recover them as path conditions.
+Without them, the harness may reach the dispatch point but select a different implementation.
+
+For each indirect-call target~$t$ on a retained path, \sys therefore looks for constants associated with its registration.
+It considers constants stored alongside the address of~$t$ in the registration call, passed alongside~$t$ to the function that installs it, or used by a factory that produces an object holding~$t$.
+When a registration uses a constant table, \sys expands the table into its entries.
+
+The harness offers these constants as candidate values when constructing arguments that select among registered targets, together with an option that supplies no such value.
+When a selected value is associated with a size argument, the harness keeps the size consistent with that value.
+These candidates guide exploration toward a recovered target without forcing a single dispatch choice.
+
+\PP{S3: Prioritize configuration settings that affect the trigger path}
+Even after the attributed cells are established, execution may leave the trigger path before reaching~$s$.
+Some relevant fields belong to objects that~$D$ creates internally, while others are initialized from configuration defaults consulted inside~$U$.
+Because these objects are not reachable from the entry arguments, P1 cannot attribute their fields to setup APIs.
+
+The motivating example in \autoref{lst:moti_oiio} illustrates this case for the field in \autoref{lst:moti_vul}.
+\texttt{RawInput} stores a LibRaw object in its member \texttt{m\_processor}.
+Before calling \texttt{unpack()}, it reads
+\texttt{config.get\_int\_attribute("raw:max\_raw\_memory\_mb", 2048)}
+and writes the result to
+\texttt{m\_processor->imgdata.rawparams.max\_raw\_memory\_mb}.
+The client does not receive the LibRaw object directly.
+Instead, it installs the named attribute on the \texttt{ImageSpec} passed to \texttt{open}.
+Since this setting is outside the entry-relative cells recovered by P1, a harness that relies only on attributed setup calls may leave the default value~$2048$ in place and never reach the vulnerable operation.
+
+To account for such settings, \sys traces the values that determine whether execution reaches~$s$ back to client-controlled sources.
+The trace starts from branch conditions that govern progress along the trigger path and from the operands of~$s$.
+It follows each value to its definitions and each field read to writes of the corresponding field, eventually identifying sources that a client can influence through public APIs of~$D$.
+These sources commonly include named configuration lookups and the public setters that install their values.
+
+The trace is restricted to functions reachable from the selected entry point.
+It also preserves caller context when following shared helpers, preventing a value used by an unrelated caller from being incorrectly associated with the trigger path.
+For example, without this restriction, a common utility such as \texttt{std::min} could connect a value used near~$s$ to unrelated callers of the same utility.
+
+Each configuration setting identified by the trace becomes a choice in the harness.
+Settings not reached by the trace are not prioritized initially.
+When a lookup uses a default value~$d$, the harness explores both leaving the setting unset, thereby retaining~$d$, and explicitly invoking the setter with a non-default value.
+In the motivating example, the trace identifies \texttt{raw:max\_raw\_memory\_mb}, so the harness offers an explicit non-default limit before exploring unrelated attributes.
+These settings are exploration preferences rather than constraints: they guide the search toward the trigger path, while P3 determines whether the resulting execution satisfies the required conditions.
+
+For each retained context, \sys emits the generated harness together with the indirect-call targets recovered by P1 and the call-graph distance of each function to~$s$.
+P3 uses this metadata to resolve indirect calls and prioritize exploration toward the vulnerable operation.
+Thus, P1 identifies how a client can establish the state required by a path, while P2 makes that state executable and supplies additional choices that help preserve the path during exploration.
+
+\subsection{Concolic Execution (P3)}
+\label{subsec:p3}
+
+In P3, \sys determines whether a given data input~$X$ triggers~$s$ under the configuration~$C$ established by the harness.
+It does so by running concolic execution~\cite{majumdar2007hybrid} on each generated harness.
+\sys holds~$X$ fixed and does not synthesize a new payload; it searches the configuration choices that the harness leaves open.
+
+\sys builds this executor on KLEE~\cite{cadar2008klee}.
+Stock KLEE explores a program under fully symbolic inputs and may fork a new state at every branch whose condition remains symbolic.
+\sys instead runs KLEE in a concolic mode: each state carries a concrete assignment---the fixed bytes of~$X$ together with a concrete valuation of the open configuration choices---and interprets instructions symbolically as in KLEE.
+When execution reaches a branch, \sys first follows the arm selected by that concrete assignment, rather than forking on every feasible alternative.
+Branches that depend only on~$X$ stay on this concrete arm: \sys does not ask the solver for a different payload.
+Branches that depend on a configuration choice may be flipped and checked with an SMT solver~\cite{de2008z3}, as described next.
+
+\PP{Seed scheduling}
+Concolic execution starts from the configuration~$C$ established by P2 and the given data input~$X$.
+\sys maintains a pool of execution states, each carrying~$X$ together with a concrete assignment to the open configuration choices.
+To guide exploration toward~$s$, it prioritizes states using the call-graph distance emitted by P2.
+States closer to~$s$ are explored first, directing the search along the recovered trigger path.
+States with no call-graph path to~$s$ are discarded.
+
+When a branch depends on a configuration choice, \sys may flip its condition and invoke the SMT solver to check whether the resulting constraint is satisfiable.
+Each satisfying assignment becomes a new state in the pool, with~$X$ unchanged.
+The solver checks the feasibility of the branch condition; it does not determine whether the resulting path reaches~$s$.
+
+\sys also explores alternatives that P2 leaves open, such as optional setup operations and alternative configuration values.
+For dispatch-table gates identified by the static analysis, it generates additional flips that favor keys selecting installers whose call paths reach~$s$.
+These targeted flips guide execution toward the required dispatch state without asking the solver to determine sink reachability.
+
+\PP{Indirect-call handling}
+Trigger paths often cross the boundary between~$D$ and~$U$ through indirect calls, such as factory functions that return registered implementations or virtual calls dispatched through vtables.
+The actual callee depends on the function pointer selected at runtime, which may in turn depend on the library's dispatch state.
+
+To prepare this state, the harness generated by P2 executes the normal initialization path once with a concrete dispatch key before concolic states are forked.
+This allows lazily populated registries, such as plugin or codec catalogs, to be initialized and inherited by the subsequent states.
+
+During concolic execution, \sys follows the target indicated by the concrete function pointer.
+It does not replace the runtime target with one of the targets recovered by P1.
+Instead, it checks whether the observed target is included in the statically recovered call relation for that call site.
+A mismatch is recorded and reported as a warning, but does not prevent the call.
+The recovered targets also contribute to call-graph distances used for state prioritization.
+Thus, static call relations guide the search while the actual dispatch remains governed by the program's runtime state.
+
+\PP{Engine support}
+Executing~$D$ and~$U$ together under concolic execution requires support for the C/C++ runtime used by both libraries.
+KLEE may terminate an execution state when it encounters unsupported \texttt{libstdc++} functionality or an unmodeled external function, such as \texttt{strdup} or \texttt{getenv}.
+Such termination can prevent execution from reaching~$s$.
+
+To address this, we built a custom \texttt{libstdc++} library and extended KLEE's symbolic environment models to support these runtime and external calls.
+We also avoid over-constraining symbolic expressions when modeling these operations, so that the constraints solved by \sys reflect the behavior of~$D$ and~$U$, rather than artifacts introduced by the environment models.
 
 
-\vspace{7px}
-\textcolor{purple}{\textbf{==============★응원의 벽☆==============}}

@@ -3,10 +3,12 @@
 #include "Close.h"
 #include <algorithm>
 #include <chrono>
+#include <functional>
 #include <sstream>
 
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/Transforms/Utils/BuildLibCalls.h"
 
@@ -62,7 +64,8 @@ static std::set<std::string> projectExports;
 // reach the sink only when gaps could return. An indirect call goes to
 // Tgt_sig, or with refined to Tgt (§3.10, klee/Support/CallTargets.h).
 static bool flowReach(Module &M, const klee::calls::Targets &tg, std::set<std::string> &gaps,
-                      std::vector<std::string> &chain, bool refined) {
+                      std::vector<std::string> &chain, bool refined,
+                      std::set<const Function *> *maySink = nullptr) {
   std::map<const Function *, std::pair<const Function *, bool>> via;
   auto gap = [&](const Function *C) {
     return C && C->isDeclaration() && !C->isIntrinsic() && projectExports.count(C->getName().str());
@@ -167,7 +170,1399 @@ static bool flowReach(Module &M, const klee::calls::Targets &tg, std::set<std::s
       for (const Instruction &I : instructions(*F))
         if (auto *CB = dyn_cast<CallBase>(&I); CB && gap(CB->getCalledFunction()))
           gaps.insert(CB->getCalledFunction()->getName().str());
+  if (maySink)
+    *maySink = sinksIf;
   return sinks.count(Main) > 0;
+}
+
+// Which library defined a function, recorded before linking: D, U, or B
+// when both define the name (a template instantiation, an inline). The
+// linked module keeps the surviving definition's mark. '-' is anything else
+// (the harness, an environment declaration).
+static void markSides(Module &D, Module &U) {
+  LLVMContext &C = D.getContext();
+  for (auto [side, M, other] :
+       {std::tuple<const char *, Module *, Module *>{"D", &D, &U}, {"U", &U, &D}})
+    for (Function &F : *M) {
+      if (F.isDeclaration())
+        continue;
+      const Function *O = F.hasLocalLinkage() ? nullptr : other->getFunction(F.getName());
+      F.setMetadata("sp.side", MDNode::get(C, {MDString::get(C, O && !O->isDeclaration() ? "B" : side)}));
+    }
+}
+
+static char sideOf(const Function &F) {
+  if (MDNode *n = F.getMetadata("sp.side"))
+    if (auto *s = dyn_cast<MDString>(n->getOperand(0)))
+      return s->getString().empty() ? '-' : s->getString()[0];
+  return '-';
+}
+
+// Observer elision. U calls back into D through a function pointer D
+// installed (an EXIF tag reporter, a progress hook). Such a callback is an
+// observer when the sink path cannot depend on it: (1) the sink marker is
+// unreachable from it (call graph over Tgt, gaps assumed to return), (2) U
+// ignores the call's result, (3) every store it and its D callees make goes
+// to memory U cannot read: its own locals and heap, D-private globals, or the
+// object U hands back opaquely (a cell U only loads and passes, never
+// dereferences), and (4) it never ends the process. Calls it makes into U's
+// own code are taken as queries (the same assumption §3.8 makes of the
+// harness's queries); their pointer results count as U memory.
+//
+// An observer is not removed: at each U site that may call it, the model
+// guards the call with `callee == observer`, so U's dispatch, D's own uses
+// of the function, sp.tgt, and the sink line are untouched. Every decision
+// is written to the reach report (observer / observer-kept <reason>).
+namespace {
+struct ObserverElision {
+  Module &M;
+  const klee::calls::Targets &tg;
+  const std::set<const Function *> &maySink;
+  std::set<const GlobalVariable *> uVisible;
+  std::map<std::string, std::vector<const LoadInst *>> uLoads;
+  std::map<std::string, std::vector<const StoreInst *>> uStores;
+  std::map<std::string, std::vector<const StoreInst *>> allStores;
+  using Key = std::pair<const Function *, std::vector<bool>>;
+  std::map<Key, std::pair<bool, bool>> memo; // (clean, result tainted)
+  std::set<Key> active;
+  std::vector<std::string> stack;
+  std::string why, note;
+  unsigned visited = 0;
+  static constexpr unsigned budget = 20000;
+
+  ObserverElision(Module &m, const klee::calls::Targets &t, const std::set<const Function *> &s)
+      : M(m), tg(t), maySink(s) {
+    for (GlobalVariable &G : M.globals())
+      if (G.isDeclaration())
+        uVisible.insert(&G);
+    for (Function &F : M) {
+      if (F.isDeclaration())
+        continue;
+      if (sideOf(F) == 'D') {
+        std::string key;
+        for (Instruction &I : instructions(F))
+          if (auto *S = dyn_cast<StoreInst>(&I); S && cellOf(S->getPointerOperand(), key))
+            allStores[key].push_back(S);
+        continue;
+      }
+      for (Instruction &I : instructions(F)) {
+        std::vector<const Value *> work(I.op_begin(), I.op_end());
+        std::set<const Value *> seen;
+        while (!work.empty()) {
+          const Value *V = work.back();
+          work.pop_back();
+          if (!seen.insert(V).second)
+            continue;
+          if (auto *G = dyn_cast<GlobalVariable>(V))
+            uVisible.insert(G);
+          else if (auto *C = dyn_cast<Constant>(V); C && !isa<GlobalValue>(C))
+            for (const Value *op : C->operands())
+              work.push_back(op);
+        }
+        std::string key;
+        if (auto *L = dyn_cast<LoadInst>(&I); L && ObserverElision::cellOf(L->getPointerOperand(), key))
+          uLoads[key].push_back(L);
+        else if (auto *S = dyn_cast<StoreInst>(&I); S && cellOf(S->getPointerOperand(), key)) {
+          uStores[key].push_back(S);
+          allStores[key].push_back(S);
+        }
+      }
+    }
+  }
+
+  // Whether the value a store writes came from outside the storing function
+  // (an argument, a constant null): a setter that keeps what its caller gave.
+  static bool fromCaller(const Value *V, unsigned depth = 0) {
+    V = V->stripPointerCasts();
+    if (auto *C = dyn_cast<Constant>(V))
+      return C->isNullValue();
+    if (isa<Argument>(V))
+      return true;
+    if (depth > 4)
+      return false;
+    if (auto *L = dyn_cast<LoadInst>(V))
+      if (auto *A = dyn_cast<AllocaInst>(L->getPointerOperand()->stripPointerCasts())) {
+        for (const User *u : A->users())
+          if (auto *S = dyn_cast<StoreInst>(u); S && S->getPointerOperand() == A && !fromCaller(S->getValueOperand(), depth + 1))
+            return false;
+        return true;
+      }
+    return false;
+  }
+
+  // Functions whose address may be V: through casts, locals, the cells
+  // stores write, and the arguments of direct callers. Type-free, so a
+  // callback D registers through a cast function pointer is found where the
+  // typed layers (Tgt_sig, sp.tgt) see no target.
+  bool trace = false;
+  void sources(const Value *V, std::set<const Function *> &out, std::set<const Value *> &seen, unsigned depth) {
+    V = V->stripPointerCasts();
+    if (trace)
+      errs() << "  sources d" << depth << ": " << *V << "\n";
+    if (!seen.insert(V).second || depth > 6)
+      return;
+    if (auto *F = dyn_cast<Function>(V)) {
+      out.insert(F);
+    } else if (auto *L = dyn_cast<LoadInst>(V)) {
+      const Value *p = L->getPointerOperand()->stripPointerCasts();
+      std::string key;
+      if (auto *A = dyn_cast<AllocaInst>(p)) {
+        for (const User *u : A->users())
+          if (auto *S = dyn_cast<StoreInst>(u); S && S->getPointerOperand() == A)
+            sources(S->getValueOperand(), out, seen, depth);
+      } else if (cellOf(p, key)) {
+        for (const StoreInst *S : allStores[key])
+          sources(S->getValueOperand(), out, seen, depth + 1);
+      }
+    } else if (auto *Arg = dyn_cast<Argument>(V)) {
+      for (const Use &U : Arg->getParent()->uses())
+        if (auto *CB = dyn_cast<CallBase>(U.getUser()); CB && CB->isCallee(&U) && Arg->getArgNo() < CB->arg_size())
+          sources(CB->getArgOperand(Arg->getArgNo()), out, seen, depth + 1);
+    } else if (auto *P = dyn_cast<PHINode>(V)) {
+      for (const Value *in : P->incoming_values())
+        sources(in, out, seen, depth);
+    } else if (auto *S = dyn_cast<SelectInst>(V)) {
+      sources(S->getTrueValue(), out, seen, depth);
+      sources(S->getFalseValue(), out, seen, depth);
+    }
+  }
+
+  // A cell: a constant-index field of a typed object, or a global.
+  static bool cellOf(const Value *p, std::string &key) {
+    key.clear();
+    p = p->stripPointerCasts();
+    if (auto *G = dyn_cast<GlobalVariable>(p)) {
+      key = "@" + G->getName().str();
+      return true;
+    }
+    auto *GEP = dyn_cast<GEPOperator>(p);
+    if (!GEP || !GEP->hasAllConstantIndices())
+      return false;
+    raw_string_ostream os(key);
+    os << (const void *)GEP->getSourceElementType();
+    for (const Use &U : GEP->indices())
+      os << ':' << cast<ConstantInt>(U.get())->getSExtValue();
+    return true;
+  }
+
+  // U only compares the value, keeps it in a local, or passes it to an
+  // indirect call: it never reads through it.
+  static bool derefFree(const Value *root) {
+    std::vector<const Value *> work{root};
+    std::set<const Value *> seen;
+    while (!work.empty()) {
+      const Value *V = work.back();
+      work.pop_back();
+      if (!seen.insert(V).second)
+        continue;
+      for (const Use &U : V->uses()) {
+        const User *usr = U.getUser();
+        if (isa<CastInst>(usr) || isa<PHINode>(usr) || isa<SelectInst>(usr)) {
+          work.push_back(usr);
+        } else if (isa<ICmpInst>(usr)) {
+        } else if (auto *S = dyn_cast<StoreInst>(usr)) {
+          auto *A = dyn_cast<AllocaInst>(S->getPointerOperand()->stripPointerCasts());
+          if (S->getValueOperand() != V || !A)
+            return false;
+          for (const User *au : A->users()) {
+            if (auto *L = dyn_cast<LoadInst>(au))
+              work.push_back(L);
+            else if (auto *as = dyn_cast<StoreInst>(au); as && as->getPointerOperand() == A)
+              continue;
+            else if (isa<DbgInfoIntrinsic>(au))
+              continue;
+            else
+              return false;
+          }
+        } else if (auto *CB = dyn_cast<CallBase>(usr)) {
+          if (CB->isCallee(&U) || !klee::calls::indirect(*CB))
+            return false;
+        } else if (isa<DbgInfoIntrinsic>(usr)) {
+        } else {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  // Argument i of U site S is a pointer U treats as opaque.
+  bool opaqueArg(const CallBase &S, unsigned i) {
+    const Value *a = S.getArgOperand(i)->stripPointerCasts();
+    if (isa<ConstantPointerNull>(a))
+      return true;
+    auto *L = dyn_cast<LoadInst>(a);
+    std::string key;
+    if (!L || !cellOf(L->getPointerOperand(), key))
+      return false;
+    for (const StoreInst *St : uStores[key])
+      if (!fromCaller(St->getValueOperand()))
+        return false;
+    for (const LoadInst *Ld : uLoads[key])
+      if (!derefFree(Ld))
+        return false;
+    return true;
+  }
+
+  static bool benignEnv(StringRef n) {
+    static const std::set<StringRef> ok = {
+        "fprintf", "vfprintf", "fwrite",  "fputs",   "fputc",   "putc",    "puts",     "printf",  "vprintf",
+        "fflush",  "perror",   "strlen",  "strcmp",  "strncmp", "memcmp",  "strchr",   "strrchr", "strstr",
+        "memchr",  "strtol",   "strtoul", "strtoll", "strtoull", "strtod", "strtof",   "atoi",    "atol",
+        "atof",    "isatty",   "fileno",  "ftell",   "ftello",  "feof",    "ferror",
+        "strncasecmp", "strcasecmp", "toupper", "tolower", "isspace",
+        "isdigit", "isalpha",  "isalnum", "isprint", "isupper", "islower", "sqrt",     "pow",     "floor",
+        "ceil",    "fabs",     "log",     "exp",     "sin",     "cos",     "tan",      "atan2",   "fmod",
+        "__cxa_atexit", "atexit", "__cxa_guard_acquire", "__cxa_guard_release", "__cxa_guard_abort"};
+    return ok.count(n) > 0;
+  }
+  static bool fresh(StringRef n) {
+    return n == "malloc" || n == "calloc" || n == "realloc" || n == "strdup" || n == "_Znwm" || n == "_Znam" ||
+           n == "_ZnwmRKSt9nothrow_t" || n == "_ZnamRKSt9nothrow_t";
+  }
+  static bool exits(StringRef n) {
+    return n == "exit" || n == "_exit" || n == "_Exit" || n == "abort" || n == "__assert_fail" ||
+           n == "longjmp" || n == "siglongjmp" || n == "_longjmp" || n == "klee_silent_exit" ||
+           n == "klee_abort" || n == "quick_exit";
+  }
+
+  // Memory effects of F under a parameter taint: clean when no store reaches
+  // U-visible memory; second is whether the result may point into it.
+  std::pair<bool, bool> summarize(const Function *F, const std::vector<bool> &mask) {
+    Key k{F, mask};
+    if (auto it = memo.find(k); it != memo.end())
+      return it->second;
+    if (active.count(k))
+      return {true, false};
+    if (++visited > budget) {
+      why = "budget";
+      return {false, true};
+    }
+    active.insert(k);
+    std::set<const Value *> T;
+    std::set<const AllocaInst *> TA;
+    bool clean = true, retT = false;
+    // Taint is a capability to reach U memory: a pointer, an aggregate that
+    // carries one, or an integer a tainted pointer was cast to (ABI
+    // coercion). A number loaded from U memory or returned by U is data.
+    auto data = [](const Type *t) { return t->isIntegerTy() || t->isFloatingPointTy() || t->isVoidTy(); };
+    for (unsigned i = 0; i < mask.size() && i < F->arg_size(); ++i)
+      if (mask[i])
+        T.insert(F->getArg(i));
+    std::function<bool(const Value *)> isT = [&](const Value *V) -> bool {
+      V = V->stripPointerCasts();
+      if (T.count(V))
+        return true;
+      // An environment global (stderr, a typeinfo) is the environment's own
+      // object; a library global the bitcode lacks is U's.
+      if (auto *G = dyn_cast<GlobalVariable>(V))
+        return uVisible.count(G) > 0 &&
+               (!G->isDeclaration() ||
+                (G->getName() != "__dso_handle" && projectExports.count(G->getName().str())));
+      if (auto *C = dyn_cast<Constant>(V); C && !isa<GlobalValue>(C))
+        for (const Value *op : C->operands())
+          if (op->getType()->isPointerTy() && isT(op))
+            return true;
+      return false;
+    };
+    auto baseAlloca = [](const Value *V) -> const AllocaInst * {
+      V = V->stripPointerCasts();
+      while (auto *GEP = dyn_cast<GEPOperator>(V))
+        V = GEP->getPointerOperand()->stripPointerCasts();
+      return dyn_cast<AllocaInst>(V);
+    };
+    auto fail = [&](const std::string &r) {
+      if (clean) {
+        why = r;
+        if (std::getenv("SP_OBSERVER_DEBUG") && why.find(" <-") == std::string::npos) {
+          why += " <-";
+          for (auto it = stack.rbegin(); it != stack.rend(); ++it)
+            why += " " + *it;
+        }
+      }
+      clean = false;
+    };
+    {
+      std::string m = F->getName().str() + "[";
+      for (bool b : mask)
+        m += b ? '1' : '0';
+      stack.push_back(m + "]");
+    }
+    struct Pop {
+      std::vector<std::string> &s;
+      ~Pop() { s.pop_back(); }
+    } pop{stack};
+    // Classify one callee of a call; returns whether the result is tainted.
+    auto callTo = [&](const CallBase *CB, const Function *C, bool &anyT) -> bool {
+      bool argT = false;
+      for (const Use &U : CB->args())
+        if (isT(U.get()) || (baseAlloca(U.get()) && TA.count(baseAlloca(U.get()))))
+          argT = true;
+      anyT = argT;
+      const bool ptrResult = !data(CB->getType());
+      if (!C) {
+        if (argT)
+          fail("unresolved-call");
+        return ptrResult;
+      }
+      StringRef n = C->getName();
+      if (C->isIntrinsic()) {
+        if (isa<DbgInfoIntrinsic>(CB) || n.starts_with("llvm.lifetime") || n.starts_with("llvm.va_") ||
+            n.starts_with("llvm.experimental"))
+          return false;
+        if (argT)
+          fail("intrinsic " + n.str());
+        return argT && ptrResult;
+      }
+      // A process exit on some path (an assertion deep in a helper) is noted,
+      // not a bar: the observer returns on its other paths, and the state
+      // that exits ends as it would in any run.
+      if (exits(n) && note.empty())
+        note = "may-exit " + n.str();
+      char side = C->isDeclaration() ? '-' : sideOf(*C);
+      if (side == 'D' || side == 'B') {
+        std::vector<bool> m;
+        for (const Use &U : CB->args())
+          m.push_back(isT(U.get()));
+        auto [c, r] = summarize(C, m);
+        if (!c) {
+          std::string w = why.empty() ? "callee " + n.str() : why;
+          fail(w);
+        }
+        return r;
+      }
+      // A query of U: its result may point into U memory. (A U pointer it
+      // writes into a local out-parameter is not followed.)
+      if (side == 'U')
+        return ptrResult;
+      // Environment or harness: unknown body. It can hand U memory to a local
+      // only when it was given U memory, which is already the violation.
+      if (fresh(n))
+        return false;
+      if (benignEnv(n))
+        return argT && ptrResult;
+      if (argT) {
+        std::string what = "env-write " + n.str();
+        if (std::getenv("SP_OBSERVER_DEBUG")) {
+          raw_string_ostream os(what);
+          os << " :: " << *CB;
+        }
+        fail(what);
+      }
+      return argT && ptrResult;
+    };
+    for (bool changed = true; changed && clean;) {
+      changed = false;
+      for (const Instruction &I : instructions(*F)) {
+        if (T.count(&I))
+          continue;
+        bool t = false;
+        if (auto *L = dyn_cast<LoadInst>(&I)) {
+          const AllocaInst *A = baseAlloca(L->getPointerOperand());
+          // A local holds what was stored in it; U memory yields locations
+          // only as pointers.
+          t = (A && TA.count(A)) || (!data(L->getType()) && isT(L->getPointerOperand()));
+        } else if (auto *S = dyn_cast<StoreInst>(&I)) {
+          if (isT(S->getPointerOperand()))
+            fail("store");
+          const AllocaInst *A = baseAlloca(S->getPointerOperand());
+          if (A && isT(S->getValueOperand()) && TA.insert(A).second)
+            changed = true;
+          continue;
+        } else if (isa<AtomicRMWInst>(&I) || isa<AtomicCmpXchgInst>(&I)) {
+          if (isT(I.getOperand(0)))
+            fail("atomic-store");
+          t = true;
+        } else if (auto *CB = dyn_cast<CallBase>(&I)) {
+          if (CB->isInlineAsm()) {
+            // Assembly reaches only what it is handed (a spin pause: nothing).
+            for (const Use &U : CB->args())
+              if (isT(U.get()) || (baseAlloca(U.get()) && TA.count(baseAlloca(U.get()))))
+                fail("inline-asm");
+            continue;
+          }
+          const Function *C = klee::calls::callee(*CB);
+          bool anyT = false;
+          if (C) {
+            t = callTo(CB, C, anyT);
+          } else {
+            // Tgt(c) = (sp.tgt ∪ Out) ∩ Tgt_sig. When the may layer resolved
+            // the site (sp.tgt names functions of D or U), those are its
+            // callees; Out, the environment's address-taken functions of the
+            // same type, stands in only for a site the layer left open.
+            const auto &ts = tg.of(*CB);
+            std::vector<const Function *> in, out;
+            for (const Function *Tg : ts)
+              (Tg->getMetadata("sp.fn") ? in : out).push_back(Tg);
+            if (ts.empty())
+              t = callTo(CB, nullptr, anyT);
+            for (const Function *Tg : in.empty() ? out : in)
+              t = callTo(CB, Tg, anyT) || t;
+          }
+        } else if (auto *R = dyn_cast<ReturnInst>(&I)) {
+          if (R->getReturnValue() && isT(R->getReturnValue()))
+            retT = true;
+          continue;
+        } else if (isa<AllocaInst>(&I) || isa<LandingPadInst>(&I) || isa<ResumeInst>(&I) ||
+                   isa<BranchInst>(&I) || isa<SwitchInst>(&I) || isa<UnreachableInst>(&I)) {
+          continue;
+        } else if (isa<ICmpInst>(&I) || isa<FCmpInst>(&I)) {
+          continue;
+        } else {
+          for (const Use &U : I.operands())
+            if (isT(U.get()))
+              t = true;
+        }
+        if (t && T.insert(&I).second)
+          changed = true;
+      }
+    }
+    active.erase(k);
+    return memo[k] = {clean, retT};
+  }
+
+  // Whether F may be skipped at site S.
+  bool elidable(const CallBase &S, const Function &F, std::string &reason) {
+    if (maySink.count(&F)) {
+      reason = "reaches-sink";
+      return false;
+    }
+    if (!S.getType()->isVoidTy() && !S.use_empty()) {
+      reason = "result-used";
+      return false;
+    }
+    if (F.getMetadata("sp.wit")) {
+      reason = "witness";
+      return false;
+    }
+    std::vector<bool> mask;
+    for (unsigned i = 0; i < F.arg_size(); ++i)
+      mask.push_back(F.getArg(i)->getType()->isPointerTy() && !(i < S.arg_size() && opaqueArg(S, i)));
+    why.clear();
+    note.clear();
+    visited = 0;
+    auto [clean, r] = summarize(&F, mask);
+    if (!clean) {
+      reason = why.empty() ? "writes" : why;
+      return false;
+    }
+    reason = note;
+    return true;
+  }
+};
+} // namespace
+
+static unsigned elideObservers(Module &M, raw_ostream &rs) {
+  if (!M.getFunction("main"))
+    return 0;
+  klee::calls::Targets tg;
+  tg.index(M);
+  std::set<std::string> gaps;
+  std::vector<std::string> chain;
+  std::set<const Function *> maySink;
+  flowReach(M, tg, gaps, chain, true, &maySink);
+  ObserverElision E(M, tg, maySink);
+  // Decide per (site, target); then edit, since editing moves instructions.
+  std::vector<std::pair<CallBase *, std::vector<Function *>>> plan;
+  std::map<const Function *, std::string> kept, notes;
+  std::set<const Function *> chosen;
+  for (Function &G : M) {
+    if (G.isDeclaration() || sideOf(G) != 'U')
+      continue;
+    for (Instruction &I : instructions(G)) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB || !klee::calls::indirect(*CB) || !CB->getMetadata("sp.tgt"))
+        continue;
+      std::vector<Function *> es;
+      std::set<const Function *> cands(tg.of(*CB).begin(), tg.of(*CB).end());
+      {
+        std::set<const Value *> seen;
+        E.sources(CB->getCalledOperand(), cands, seen, 0);
+      }
+      for (const Function *Tc : cands) {
+        Function *T = const_cast<Function *>(Tc);
+        if (T->isDeclaration() || sideOf(*T) != 'D')
+          continue;
+        std::string reason;
+        if (E.elidable(*CB, *T, reason)) {
+          es.push_back(T);
+          chosen.insert(T);
+          if (!reason.empty())
+            notes[T] = reason;
+        } else if (!kept.count(T)) {
+          kept[T] = reason;
+        }
+      }
+      if (!es.empty())
+        plan.emplace_back(CB, es);
+    }
+  }
+  unsigned sites = 0;
+  if (std::getenv("SP_OBSERVER_DEBUG")) {
+    unsigned uFns = 0, uSites = 0, withCands = 0;
+    for (Function &G : M) {
+      if (G.isDeclaration() || sideOf(G) != 'U')
+        continue;
+      ++uFns;
+      for (Instruction &I : instructions(G))
+        if (auto *CB = dyn_cast<CallBase>(&I); CB && klee::calls::indirect(*CB) && CB->getMetadata("sp.tgt")) {
+          ++uSites;
+          std::set<const Function *> c;
+          std::set<const Value *> seen;
+          const char *want = std::getenv("SP_OBSERVER_SITE");
+          E.trace = want && G.getName() == want;
+          if (E.trace) {
+            std::string key;
+            if (auto *L = dyn_cast<LoadInst>(CB->getCalledOperand()->stripPointerCasts()); L && ObserverElision::cellOf(L->getPointerOperand(), key))
+              errs() << "site key " << key << " stores " << E.allStores[key].size() << "\n";
+            else
+              errs() << "site callee not a cell load: " << *CB->getCalledOperand() << "\n";
+          }
+          E.sources(CB->getCalledOperand(), c, seen, 0);
+          E.trace = false;
+          if (!c.empty()) {
+            ++withCands;
+            rs << "debug-site " << G.getName() << " cands";
+            for (const Function *F : c)
+              rs << " " << F->getName() << "(" << sideOf(*F) << ")";
+            rs << "\n";
+          }
+        }
+    }
+    rs << "debug u-fns " << uFns << " u-sites " << uSites << " with-sources " << withCands << " stores-keys "
+       << E.allStores.size() << "\n";
+    if (const char *fn = std::getenv("SP_OBSERVER_FN"))
+      if (Function *F = M.getFunction(fn)) {
+        errs() << "fn " << fn << " side " << sideOf(*F) << " decl " << F->isDeclaration() << "\n";
+        for (Instruction &I : instructions(*F))
+          if (auto *S = dyn_cast<StoreInst>(&I)) {
+            std::string key;
+            bool c = ObserverElision::cellOf(S->getPointerOperand(), key);
+            errs() << "  store cell=" << c << " key=" << key << " : " << *S << "\n";
+          }
+      } else
+        errs() << "fn " << fn << " not found\n";
+  }
+  for (auto &[CB, es] : plan) {
+    BasicBlock *pre = CB->getParent();
+    IRBuilder<> B(CB);
+    B.SetCurrentDebugLocation(CB->getDebugLoc());
+    Value *fn = CB->getCalledOperand();
+    Value *skip = nullptr;
+    for (Function *F : es) {
+      Value *eq = B.CreateICmpEQ(fn, F);
+      skip = skip ? B.CreateOr(skip, eq) : eq;
+    }
+    BasicBlock *callBB = pre->splitBasicBlock(CB, "observer.call");
+    BasicBlock *cont;
+    if (auto *II = dyn_cast<InvokeInst>(CB)) {
+      cont = II->getNormalDest();
+      for (PHINode &P : cont->phis()) {
+        Value *v = P.getIncomingValueForBlock(callBB);
+        P.addIncoming(v == CB ? Constant::getNullValue(P.getType()) : v, pre);
+      }
+    } else {
+      cont = callBB->splitBasicBlock(CB->getNextNode(), "observer.cont");
+    }
+    pre->getTerminator()->eraseFromParent();
+    IRBuilder<> T(pre);
+    T.SetCurrentDebugLocation(CB->getDebugLoc());
+    T.CreateCondBr(skip, cont, callBB);
+    ++sites;
+    for (Function *F : es)
+      rs << "observer " << F->getName() << " at " << pre->getParent()->getName()
+         << (notes.count(F) ? " " + notes[F] : std::string()) << "\n";
+  }
+  for (const auto &[F, r] : kept)
+    if (!chosen.count(F))
+      rs << "observer-kept " << F->getName() << " " << r << "\n";
+  rs << "observer-sites " << sites << " elided " << chosen.size() << " kept " << kept.size() << "\n";
+  for (const Function *F : chosen)
+    errs() << "observer: " << F->getName() << "\n";
+  return chosen.size();
+}
+
+// Sink-irrelevant subsystem elision. A function on the way to the sink can call
+// into a self-contained subsystem that the sink does not depend on and that this
+// environment cannot execute. The motivating case: a RawInput open reaches
+// OpenColorIO's color management, whose Config::CreateFromFile compiles a static
+// std::regex. libstdc++'s regex compiler mis-executes here (its ctype-driven
+// scanner takes a spurious backref branch and __throw_regex_error's message
+// pointer is out of bounds), so the state faults deep inside the regex compiler,
+// far short of the sink -- even though the colour configuration has no bearing
+// on the LibRaw dimension-driven overflow at the sink.
+//
+// Rather than name a library, this cuts at the minimal, result-preserving point.
+// A direct call to F is skipped when all of:
+//   (a) F is off the sink path but reachable from it (sideRegion = reachable
+//       from a sink-reaching function, minus the sink-reaching functions);
+//   (b) F transitively depends on a primitive this environment cannot run
+//       (std::regex or formatted istream extraction) -- "unrunnable";
+//   (c) F is not a witness and not a constructor/destructor (lifecycle work its
+//       callers rely on must still run);
+//   (d) the sink does not depend on F's result -- every caller discards it, and
+//       this call's result is discarded or only forwarded to such returns;
+//   (e) F is the minimal cut: it directly invokes an unrunnable, value-producing
+//       call whose result it consumes (so the cut cannot be pushed deeper), or
+//       it directly raises. Its callers (reset, the ctor) are therefore not cut,
+//       which keeps their allocations -- the object still exists, only its colour
+//       configuration stays empty, which downstream code null-guards;
+//   (f) F and its callees write no memory the sink path reads.
+// The call is left in place but bypassed with its result defaulted, so the state
+// reaches the sink as if it had run; the sink line, sp.tgt, and every other
+// decision stand.
+namespace {
+// A standard-library facility this KLEE build does not model and cannot execute
+// correctly: std::regex compilation/scanning and formatted istream extraction.
+static bool isUnrunnablePrimitive(StringRef n) {
+  return n.contains("9_CompilerI") || n.contains("8_ScannerI") ||
+         n.contains("12regex_traitsI") || n.contains("11basic_regexI") ||
+         n.starts_with("_ZNSi") || n.starts_with("_ZNKSi") ||
+         n.contains("7num_getIcSt") || n.contains("num_getIwSt");
+}
+// The call returns a class by value through a hidden sret pointer argument, so
+// its SSA result is void even though the caller consumes the filled object.
+static bool callHasSret(const CallBase &CB) {
+  const Function *C = klee::calls::callee(CB);
+  for (unsigned i = 0; i < CB.arg_size() && i < 2; ++i)
+    if (CB.paramHasAttr(i, Attribute::StructRet) ||
+        (C && i < C->arg_size() && C->getArg(i)->hasStructRetAttr()))
+      return true;
+  return false;
+}
+// Whether a GEP source element type can stand for a memory region. A scalar
+// type is pointer arithmetic over a buffer (ushort*/int*) and would match every
+// int or bool in the program. A literal struct, or a named struct whose leaves
+// are all pointers ({ptr,ptr}, {ptr,ptr,ptr}: std::pair, std::vector's impl),
+// is structurally identical across unrelated types under opaque pointers and the
+// module linker unifies them -- the sink's {ptr,ptr} and fmt's custom_value
+// become one LLVM type. Only a named aggregate with some non-pointer leaf keeps
+// a layout distinct enough to identify the data it belongs to.
+static bool identifiesMemory(Type *ty) {
+  while (auto *AT = dyn_cast<ArrayType>(ty))
+    ty = AT->getElementType();
+  auto *ST = dyn_cast<StructType>(ty);
+  if (!ST || ST->isLiteral() || !ST->hasName())
+    return false;
+  std::vector<Type *> work{ST};
+  std::set<Type *> seen;
+  while (!work.empty()) {
+    Type *t = work.back();
+    work.pop_back();
+    if (!seen.insert(t).second)
+      continue;
+    while (auto *AT = dyn_cast<ArrayType>(t))
+      t = AT->getElementType();
+    if (auto *S = dyn_cast<StructType>(t)) {
+      for (Type *e : S->elements())
+        work.push_back(e);
+      continue;
+    }
+    if (!t->isPointerTy())
+      return true;
+  }
+  return false;
+}
+
+static bool isCtorDtor(StringRef n) {
+  return n.contains("C1E") || n.contains("C2E") || n.contains("C0E") ||
+         n.contains("D0E") || n.contains("D1E") || n.contains("D2E") ||
+         n.contains("C1Ev") || n.contains("C2Ev") || n.contains("D1Ev") ||
+         n.contains("D2Ev");
+}
+struct SinkSlice {
+  Module &M;
+  const klee::calls::Targets &tg;
+  const std::set<const Function *> &maySink;
+  const std::set<const Function *> &unrunnable;
+  const std::set<const Function *> &sideRegion;
+  std::set<Type *> readTypes;
+  std::set<std::string> readGlobals;
+  using Key = std::pair<const Function *, std::vector<bool>>;
+  std::map<Key, std::pair<bool, std::string>> cleanMemo; // result, reason
+  std::set<Key> cleanActive;
+  std::map<const Function *, bool> resSafeMemo;
+  unsigned visited = 0;
+  static constexpr unsigned budget = 300000;
+  // Set when a clean() walk ran out of budget. A false reached under exhaustion
+  // is inconclusive and must not be memoized, or every caller on that chain
+  // would stay "unclean" for later candidates.
+  bool exhausted = false;
+  std::string why;
+
+  SinkSlice(Module &m, const klee::calls::Targets &t, const std::set<const Function *> &s,
+            const std::set<const Function *> &u, const std::set<const Function *> &sr)
+      : M(m), tg(t), maySink(s), unrunnable(u), sideRegion(sr) {
+    for (const Function *F : maySink) {
+      if (F->isDeclaration())
+        continue;
+      for (const Instruction &I : instructions(*F))
+        if (auto *L = dyn_cast<LoadInst>(&I)) {
+          const Value *p = L->getPointerOperand()->stripPointerCasts();
+          if (auto *G = dyn_cast<GlobalVariable>(p))
+            readGlobals.insert(G->getName().str());
+          else if (auto *GEP = dyn_cast<GEPOperator>(p)) {
+            if (identifiesMemory(GEP->getSourceElementType()))
+              readTypes.insert(GEP->getSourceElementType());
+          }
+        }
+    }
+  }
+
+  // F is the minimal cut for an unrunnable subsystem: it directly raises, or it
+  // directly invokes an unrunnable value-producing call whose result is consumed
+  // (so the cut cannot be pushed into that callee). If instead every unrunnable
+  // call F makes has a discarded result, the cut belongs deeper and F is kept --
+  // this is what spares reset/the ctor, whose allocations must still run.
+  bool mustCut(const Function *F) {
+    for (const Instruction &I : instructions(*F)) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB || CB->isInlineAsm())
+        continue;
+      const Function *C = klee::calls::callee(*CB);
+      if (!C)
+        continue;
+      StringRef n = C->getName();
+      if (n == "__cxa_throw" || n == "__cxa_rethrow")
+        return true;
+      if (unrunnable.count(C) && !funcResultSafe(C, 0))
+        return true;
+    }
+    return false;
+  }
+
+  // The sink does not depend on this value: it is used only where it cannot
+  // steer or feed the sink -- discarded, or forwarded to a return the callers
+  // in turn discard. A branch, store, comparison, or call argument may carry
+  // it onto the sink path, so it is kept.
+  bool resultSafe(const Value *V, unsigned depth, std::set<const Value *> &seen) {
+    if (depth > 8 || !seen.insert(V).second)
+      return true;
+    // A value returned by value through the C++ ABI is passed via a hidden sret
+    // pointer, so the call's SSA result is void and looks unused. Treat such a
+    // call as consuming its result -- the object it fills is read by the caller.
+    if (auto *CB = dyn_cast<CallBase>(V))
+      if (callHasSret(*CB))
+        return false;
+    for (const Use &U : V->uses()) {
+      const User *usr = U.getUser();
+      if (isa<CastInst>(usr) || isa<PHINode>(usr) || isa<SelectInst>(usr)) {
+        if (!resultSafe(cast<Value>(usr), depth + 1, seen))
+          return false;
+      } else if (auto *R = dyn_cast<ReturnInst>(usr)) {
+        if (!funcResultSafe(R->getFunction(), depth + 1))
+          return false;
+      } else if (auto *St = dyn_cast<StoreInst>(usr)) {
+        // -O0 forwards a returned value through a return slot: store the value
+        // into a local alloca, then load it to feed the ret. Follow the slot's
+        // loads so such forwarding counts as a (discarded) return, not a use.
+        if (St->getValueOperand() != V)
+          return false; // the value's address is taken, or it is a store target
+        auto *A = dyn_cast<AllocaInst>(St->getPointerOperand()->stripPointerCasts());
+        if (!A)
+          return false; // stored into non-local memory
+        for (const User *su : A->users()) {
+          if (su == St)
+            continue;
+          if (auto *L = dyn_cast<LoadInst>(su)) {
+            if (!resultSafe(L, depth + 1, seen))
+              return false;
+          } else if (isa<StoreInst>(su) || isa<DbgInfoIntrinsic>(su)) {
+          } else if (auto *IC = dyn_cast<IntrinsicInst>(su);
+                     IC && (IC->getIntrinsicID() == Intrinsic::lifetime_start ||
+                            IC->getIntrinsicID() == Intrinsic::lifetime_end)) {
+          } else {
+            return false; // the slot escapes
+          }
+        }
+      } else if (isa<DbgInfoIntrinsic>(usr)) {
+      } else {
+        return false;
+      }
+    }
+    return true;
+  }
+  bool funcResultSafe(const Function *F, unsigned depth) {
+    if (auto it = resSafeMemo.find(F); it != resSafeMemo.end())
+      return it->second;
+    if (depth > 16)
+      return false;
+    resSafeMemo[F] = true; // optimistic on recursion
+    bool ok = true;
+    for (const Use &U : F->uses()) {
+      auto *CB = dyn_cast<CallBase>(U.getUser());
+      // An sret call's result lives in a pointer argument, so its SSA value is
+      // void and use_empty(); it must still be examined, not skipped as unused.
+      if (!CB || !CB->isCallee(&U) || (CB->use_empty() && !callHasSret(*CB)))
+        continue;
+      std::set<const Value *> seen;
+      if (!resultSafe(CB, depth, seen)) {
+        ok = false;
+        break;
+      }
+    }
+    return resSafeMemo[F] = ok;
+  }
+
+  // F and its non-sink callees write no memory the sink path reads.
+  bool clean(const Function *F, const std::vector<bool> &argTaint) {
+    Key k{F, argTaint};
+    if (auto it = cleanMemo.find(k); it != cleanMemo.end()) {
+      if (!it->second.first)
+        why = it->second.second;
+      return it->second.first;
+    }
+    if (cleanActive.count(k))
+      return true;
+    if (++visited > budget) {
+      why = "budget";
+      exhausted = true;
+      return false;
+    }
+    cleanActive.insert(k);
+    std::set<const Value *> T;
+    for (unsigned i = 0; i < argTaint.size() && i < F->arg_size(); ++i)
+      if (argTaint[i])
+        T.insert(F->getArg(i));
+    std::function<bool(const Value *)> isT = [&](const Value *V) -> bool {
+      V = V->stripPointerCasts();
+      if (T.count(V))
+        return true;
+      // A write is sink memory when it lands in a struct type the sink navigates
+      // (its GEPs' source element types) or a global of such a type -- not merely
+      // any global the sink happens to load, which would flag unrelated error or
+      // logging globals an OCIO/OIIO utility writes.
+      if (auto *GEP = dyn_cast<GEPOperator>(V)) {
+        if (readTypes.count(GEP->getSourceElementType()))
+          return true;
+        return isT(GEP->getPointerOperand());
+      }
+      if (auto *G = dyn_cast<GlobalVariable>(V))
+        return readTypes.count(G->getValueType()) > 0;
+      return false;
+    };
+    bool ok = true;
+    for (bool changed = true; changed && ok;) {
+      changed = false;
+      for (const Instruction &I : instructions(*F)) {
+        if (auto *S = dyn_cast<StoreInst>(&I)) {
+          if (isT(S->getPointerOperand())) {
+            ok = false;
+            why = "store-sink-mem";
+            break;
+          }
+        } else if (auto *L = dyn_cast<LoadInst>(&I)) {
+          if (L->getType()->isPointerTy() && isT(L->getPointerOperand()) && T.insert(L).second)
+            changed = true;
+        } else if (isa<AtomicRMWInst>(&I) || isa<AtomicCmpXchgInst>(&I)) {
+          if (isT(I.getOperand(0))) {
+            ok = false;
+            why = "atomic-sink-mem";
+            break;
+          }
+        } else if (auto *CB = dyn_cast<CallBase>(&I)) {
+          if (CB->isInlineAsm())
+            continue;
+          std::vector<bool> m;
+          bool anyT = false;
+          for (const Use &U : CB->args()) {
+            bool t = isT(U.get());
+            m.push_back(t);
+            anyT |= t;
+          }
+          auto handle = [&](const Function *C) {
+            if (!ok)
+              return;
+            if (!C) {
+              if (anyT) {
+                ok = false;
+                why = "unresolved-call";
+              }
+              return;
+            }
+            // An unrunnable callee will not execute once this subsystem is
+            // skipped, so its writes never happen -- do not recurse into it (that
+            // would scan the whole regex/iostream subsystem) and do not flag it.
+            if (unrunnable.count(C))
+              return;
+            StringRef n = C->getName();
+            if (C->isIntrinsic()) {
+              if ((n.starts_with("llvm.memcpy") || n.starts_with("llvm.memset") ||
+                   n.starts_with("llvm.memmove")) &&
+                  CB->arg_size() && isT(CB->getArgOperand(0))) {
+                ok = false;
+                why = "mem-intrinsic-sink";
+              }
+              return;
+            }
+            if (!C->isDeclaration()) {
+              if (!clean(C, m) && ok) {
+                ok = false;
+                // Keep the chain: "<deep reason> <-callee <-caller ..."
+                why = (why.empty() ? std::string("callee") : why) + " <-" + n.str();
+              }
+              return;
+            }
+            if (ObserverElision::fresh(n) || ObserverElision::benignEnv(n))
+              return;
+            if (anyT) {
+              ok = false;
+              why = "env-write " + n.str();
+            }
+          };
+          const Function *C = klee::calls::callee(*CB);
+          if (C)
+            handle(C);
+          else {
+            const auto &ts = tg.of(*CB);
+            if (ts.empty())
+              handle(nullptr);
+            for (const Function *Tg : ts)
+              handle(Tg);
+          }
+          if (!ok)
+            break;
+        }
+      }
+    }
+    cleanActive.erase(k);
+    if (!ok && exhausted)
+      return false; // inconclusive: do not memoize
+    cleanMemo[k] = {ok, ok ? std::string() : why};
+    return ok;
+  }
+
+  // Whether the direct call CB to F is a skippable sink-irrelevant subsystem.
+  bool skippable(const CallBase &CB, const Function &F, std::string &reason) {
+    if (!sideRegion.count(&F)) {
+      reason = "off-sideregion";
+      return false;
+    }
+    if (!unrunnable.count(&F)) {
+      reason = "runnable";
+      return false;
+    }
+    if (F.getMetadata("sp.wit")) {
+      reason = "witness";
+      return false;
+    }
+    if (isCtorDtor(F.getName())) {
+      reason = "lifecycle";
+      return false;
+    }
+    if (!funcResultSafe(&F, 0)) {
+      reason = "result-used";
+      return false;
+    }
+    if (!CB.getType()->isVoidTy() && !CB.use_empty()) {
+      std::set<const Value *> seen;
+      if (!resultSafe(&CB, 0, seen)) {
+        reason = "result-used-here";
+        return false;
+      }
+    }
+    if (!mustCut(&F)) {
+      reason = "not-minimal-cut";
+      return false;
+    }
+    std::vector<bool> argTaint;
+    for (unsigned i = 0; i < F.arg_size(); ++i) {
+      Type *t = F.getArg(i)->getType();
+      argTaint.push_back(t->isPointerTy() && i < CB.arg_size() &&
+                         sinkTypedArg(CB.getArgOperand(i)));
+    }
+    why.clear();
+    visited = 0;
+    exhausted = false;
+    if (!clean(&F, argTaint)) {
+      reason = why.empty() ? "writes-sink-mem" : why;
+      return false;
+    }
+    reason.clear();
+    return true;
+  }
+
+  // The actual argument points into memory the sink path reads (by struct type
+  // or global), so writes F makes through the matching parameter are suspect.
+  bool sinkTypedArg(const Value *a) {
+    a = a->stripPointerCasts();
+    std::set<const Value *> seen;
+    std::vector<const Value *> work{a};
+    while (!work.empty()) {
+      const Value *V = work.back()->stripPointerCasts();
+      work.pop_back();
+      if (!seen.insert(V).second)
+        return false; // cycle; be conservative elsewhere
+      if (auto *G = dyn_cast<GlobalVariable>(V))
+        return readGlobals.count(G->getName().str()) > 0;
+      if (auto *GEP = dyn_cast<GEPOperator>(V)) {
+        if (readTypes.count(GEP->getSourceElementType()))
+          return true;
+        work.push_back(GEP->getPointerOperand());
+      } else if (auto *L = dyn_cast<LoadInst>(V)) {
+        work.push_back(L->getPointerOperand());
+      }
+    }
+    // No evidence it is sink memory; taint by formal-type as a fallback.
+    return false;
+  }
+};
+} // namespace
+
+static unsigned elideSinkIrrelevant(Module &M, raw_ostream &rs) {
+  if (!M.getFunction("main"))
+    return 0;
+  klee::calls::Targets tg;
+  tg.index(M);
+  std::set<std::string> gaps;
+  std::vector<std::string> chain;
+  std::set<const Function *> maySink;
+  flowReach(M, tg, gaps, chain, true, &maySink);
+  // Call graph over direct callees and resolved indirect targets.
+  std::map<const Function *, std::set<const Function *>> callees, callers;
+  for (Function &G : M) {
+    if (G.isDeclaration())
+      continue;
+    for (Instruction &I : instructions(G)) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB || CB->isInlineAsm())
+        continue;
+      auto add = [&](const Function *C) {
+        if (!C)
+          return;
+        callees[&G].insert(C);
+        callers[C].insert(&G);
+      };
+      if (const Function *C = klee::calls::callee(*CB))
+        add(C);
+      else
+        for (const Function *Tg : tg.of(*CB))
+          add(Tg);
+    }
+  }
+  // Unrunnable: a function that can reach a primitive this environment cannot
+  // execute (std::regex / formatted istream), found by walking callers back.
+  std::set<const Function *> unrunnable;
+  {
+    std::vector<const Function *> work;
+    for (Function &F : M)
+      if (isUnrunnablePrimitive(F.getName()) && unrunnable.insert(&F).second)
+        work.push_back(&F);
+    while (!work.empty()) {
+      const Function *C = work.back();
+      work.pop_back();
+      auto it = callers.find(C);
+      if (it == callers.end())
+        continue;
+      for (const Function *P : it->second)
+        if (unrunnable.insert(P).second)
+          work.push_back(P);
+    }
+  }
+  // Precise sink-reachability. flowReach's maySink marks a function as reaching
+  // the sink whenever MLTA resolves one of its indirect calls to a sink-reaching
+  // target; inside an unrunnable subsystem (OpenColorIO's std::function and
+  // virtual calls) those edges are spurious, so the whole colour-config chain is
+  // wrongly flagged and would be protected from slicing. Recompute reachability
+  // over edges that can actually execute: every direct call, plus indirect calls
+  // made from runnable code only. A function reaches the sink if a path of such
+  // edges leads to a sink-marker function.
+  std::set<const Function *> sinkFns;
+  auto isSinkMarker = [](const CallBase *CB) {
+    const Function *C = klee::calls::callee(*CB);
+    if (!C || C->getName() != "klee_warning_once" || CB->arg_size() == 0)
+      return false;
+    const Value *a = CB->getArgOperand(0)->stripPointerCasts();
+    if (auto *GV = dyn_cast<GlobalVariable>(a))
+      if (GV->hasInitializer())
+        if (auto *CDA = dyn_cast<ConstantDataArray>(GV->getInitializer()))
+          return CDA->isCString() && CDA->getAsCString() == "SINK-REACHED";
+    return false;
+  };
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    for (Instruction &I : instructions(F))
+      if (auto *CB = dyn_cast<CallBase>(&I))
+        if (isSinkMarker(CB)) {
+          sinkFns.insert(&F);
+          break;
+        }
+  }
+  if (sinkFns.empty())
+    sinkFns = maySink; // defensive: keep prior behaviour if the marker moved
+  std::map<const Function *, std::set<const Function *>> pcallers;
+  for (Function &G : M) {
+    if (G.isDeclaration())
+      continue;
+    for (Instruction &I : instructions(G)) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB || CB->isInlineAsm())
+        continue;
+      if (const Function *C = klee::calls::callee(*CB))
+        pcallers[C].insert(&G);
+      else if (!unrunnable.count(&G))
+        for (const Function *Tg : tg.of(*CB))
+          pcallers[Tg].insert(&G);
+    }
+  }
+  std::set<const Function *> reachSink(sinkFns.begin(), sinkFns.end());
+  {
+    std::vector<const Function *> work(sinkFns.begin(), sinkFns.end());
+    while (!work.empty()) {
+      const Function *C = work.back();
+      work.pop_back();
+      auto it = pcallers.find(C);
+      if (it == pcallers.end())
+        continue;
+      for (const Function *P : it->second)
+        if (reachSink.insert(P).second)
+          work.push_back(P);
+    }
+  }
+  // sideRegion: reachable from a sink-reaching function, minus those functions.
+  std::set<const Function *> sideRegion;
+  {
+    std::set<const Function *> seen(reachSink.begin(), reachSink.end());
+    std::vector<const Function *> work(reachSink.begin(), reachSink.end());
+    while (!work.empty()) {
+      const Function *G = work.back();
+      work.pop_back();
+      auto it = callees.find(G);
+      if (it == callees.end())
+        continue;
+      for (const Function *C : it->second)
+        if (seen.insert(C).second)
+          work.push_back(C);
+    }
+    for (const Function *F : seen)
+      if (!reachSink.count(F))
+        sideRegion.insert(F);
+  }
+  // Memory the sink can read is what the sink function and the functions it calls
+  // load -- not what earlier path functions (main, the open) touch. A skipped
+  // side call runs after the dimensions are already set, so only the sink's own
+  // read set must be preserved; a broader set would protect unrelated globals
+  // and wrongly keep the cut (OCIO writes an OCIO logging global that main also
+  // happens to load).
+  // Follow direct edges, and indirect edges only when MLTA resolves them to a
+  // precise target (<= 2 candidates: a devirtualised call). A wide target set
+  // is a callback registry (LibRaw's progress/exif callbacks); treating it as
+  // part of the sink's computation would pull the whole program -- and every
+  // struct type in it -- into the sink's read set.
+  std::set<const Function *> sinkReaders;
+  {
+    std::set<const Function *> seen(sinkFns.begin(), sinkFns.end());
+    std::vector<const Function *> work(sinkFns.begin(), sinkFns.end());
+    while (!work.empty()) {
+      const Function *G = work.back();
+      work.pop_back();
+      for (const Instruction &I : instructions(*G)) {
+        auto *CB = dyn_cast<CallBase>(&I);
+        if (!CB || CB->isInlineAsm())
+          continue;
+        if (const Function *C = klee::calls::callee(*CB)) {
+          if (!C->isDeclaration() && seen.insert(C).second)
+            work.push_back(C);
+          continue;
+        }
+        const auto &ts = tg.of(*CB);
+        if (ts.size() > 2)
+          continue;
+        for (const Function *C : ts)
+          if (!C->isDeclaration() && seen.insert(C).second)
+            work.push_back(C);
+      }
+    }
+    sinkReaders.swap(seen);
+  }
+  SinkSlice S(M, tg, sinkReaders, unrunnable, sideRegion);
+  // The sink's memory is the data model of the library the sink lives in. A
+  // type the other library navigates more often than the sink's own library is
+  // not that model: it is a layout the linker unified across unrelated structs
+  // (LibRaw's {ptr,i32} record and std::locale::facet became one type here).
+  {
+    char sinkSide = sideOf(**sinkFns.begin());
+    std::map<Type *, std::pair<unsigned, unsigned>> users; // same, other
+    for (Function &F : M) {
+      if (F.isDeclaration())
+        continue;
+      char s = sideOf(F);
+      if (s != 'U' && s != 'D')
+        continue;
+      std::set<Type *> here;
+      for (const Instruction &I : instructions(F))
+        if (auto *GEP = dyn_cast<GetElementPtrInst>(&I))
+          if (S.readTypes.count(GEP->getSourceElementType()))
+            here.insert(GEP->getSourceElementType());
+      for (Type *T : here)
+        (s == sinkSide ? users[T].first : users[T].second)++;
+    }
+    for (auto it = S.readTypes.begin(); it != S.readTypes.end();) {
+      auto u = users[*it];
+      if (u.second > u.first) {
+        rs << "slice-readtype-drop " << *(*it) << " same " << u.first << " other " << u.second
+           << "\n";
+        it = S.readTypes.erase(it);
+      } else
+        ++it;
+    }
+  }
+  rs << "slice-scope sink-fns " << sinkFns.size() << " reach-sink " << reachSink.size()
+     << " side-region " << sideRegion.size() << " unrunnable " << unrunnable.size()
+     << " sink-readers " << sinkReaders.size() << " read-types " << S.readTypes.size()
+     << "\n";
+  for (const Function *F : reachSink)
+    rs << "slice-path " << F->getName() << "\n";
+  if (const char *d = std::getenv("SP_SLICE_DEBUG"); d && *d) {
+    for (Type *T : S.readTypes) {
+      std::string s;
+      raw_string_ostream os(s);
+      T->print(os, false, true);
+      rs << "dbg-readtype " << os.str();
+      for (const Function *F : sinkReaders) {
+        bool hit = false;
+        for (const Instruction &I : instructions(*F)) {
+          auto *L = dyn_cast<LoadInst>(&I);
+          if (!L)
+            continue;
+          auto *GEP = dyn_cast<GEPOperator>(L->getPointerOperand()->stripPointerCasts());
+          if (GEP && GEP->getSourceElementType() == T) {
+            hit = true;
+            break;
+          }
+        }
+        if (hit)
+          rs << " <" << F->getName() << ">";
+      }
+      rs << "\n";
+    }
+    for (Function &F : M) {
+      if (!F.getName().contains(d))
+        continue;
+      rs << "dbg " << F.getName() << " maySink=" << maySink.count(&F)
+         << " side=" << sideRegion.count(&F) << " unrun=" << unrunnable.count(&F)
+         << " ctor=" << isCtorDtor(F.getName())
+         << " funcResSafe=" << S.funcResultSafe(&F, 0) << " mustCut=" << S.mustCut(&F)
+         << "\n";
+      for (const Instruction &I : instructions(F))
+        if (auto *CB = dyn_cast<CallBase>(&I)) {
+          const Function *C = klee::calls::callee(*CB);
+          if (C && (C->getName().contains("ColorConfig") ||
+                    C->getName().contains("CreateFromFile") || unrunnable.count(C)))
+            rs << "  dbg-callee " << C->getName() << " may=" << maySink.count(C)
+               << " side=" << sideRegion.count(C) << " unrun=" << unrunnable.count(C)
+               << " funcResSafe=" << S.funcResultSafe(C, 0) << "\n";
+          if (!C && !tg.of(*CB).empty())
+            for (const Function *T : tg.of(*CB))
+              if (T->getName().contains("ColorConfig") ||
+                  T->getName().contains("CreateFromFile"))
+                rs << "  dbg-indirect-target " << T->getName() << "\n";
+        }
+    }
+  }
+  std::vector<std::pair<CallBase *, Function *>> plan;
+  std::map<const Function *, std::string> kept;
+  std::set<const Function *> chosen;
+  for (Function &G : M) {
+    if (G.isDeclaration())
+      continue;
+    for (Instruction &I : instructions(G)) {
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB || CB->isInlineAsm() || klee::calls::indirect(*CB))
+        continue;
+      Function *F = const_cast<Function *>(klee::calls::callee(*CB));
+      if (!F || F->isDeclaration() || F == &G)
+        continue;
+      std::string reason;
+      if (S.skippable(*CB, *F, reason)) {
+        plan.emplace_back(CB, F);
+        chosen.insert(F);
+      } else if (reason != "off-sideregion" && reason != "runnable" &&
+                 reason != "witness" && reason != "lifecycle" &&
+                 reason != "result-used" && reason != "result-used-here" &&
+                 reason != "not-minimal-cut" && !kept.count(F))
+        kept[F] = reason; // reached the memory check and was held back
+    }
+  }
+  // Keep only outermost cuts: drop F when another chosen cut G strictly
+  // dominates it (F is reachable from G in the call graph but not vice versa),
+  // since bypassing G already bypasses F's whole subtree. This collapses the
+  // many internal cuts of one unrunnable subsystem to its single entry (the
+  // regex compiler's internals fall away once its init-level entry is cut).
+  {
+    std::map<const Function *, std::set<const Function *>> reach;
+    auto R = [&](const Function *F) -> const std::set<const Function *> & {
+      auto it = reach.find(F);
+      if (it != reach.end())
+        return it->second;
+      std::set<const Function *> &S = reach[F];
+      std::set<const Function *> seen;
+      std::vector<const Function *> work{F};
+      while (!work.empty()) {
+        const Function *g = work.back();
+        work.pop_back();
+        auto ci = callees.find(g);
+        if (ci == callees.end())
+          continue;
+        for (const Function *c : ci->second)
+          if (seen.insert(c).second) {
+            S.insert(c);
+            work.push_back(c);
+          }
+      }
+      return S;
+    };
+    std::set<const Function *> dominated;
+    std::vector<const Function *> cs(chosen.begin(), chosen.end());
+    for (const Function *F : cs)
+      for (const Function *G : cs)
+        if (F != G && R(G).count(F) && !R(F).count(G)) {
+          dominated.insert(F);
+          break;
+        }
+    if (!dominated.empty()) {
+      std::vector<std::pair<CallBase *, Function *>> np;
+      for (auto &pr : plan)
+        if (!dominated.count(pr.second))
+          np.push_back(pr);
+      plan.swap(np);
+      for (const Function *F : dominated)
+        chosen.erase(F);
+    }
+  }
+  unsigned sites = 0;
+  for (auto &[CB, F] : plan) {
+    StringRef where = CB->getFunction()->getName();
+    if (!CB->getType()->isVoidTy())
+      CB->replaceAllUsesWith(Constant::getNullValue(CB->getType()));
+    if (auto *II = dyn_cast<InvokeInst>(CB)) {
+      // An invoke terminates its block with a normal and an unwind edge. Bypass
+      // the call: default its result, drop the unwind edge, and fall straight to
+      // the normal successor.
+      BasicBlock *bb = II->getParent();
+      BasicBlock *normal = II->getNormalDest();
+      II->getUnwindDest()->removePredecessor(bb);
+      II->eraseFromParent();
+      BranchInst::Create(normal, bb);
+    } else {
+      auto *CI = cast<CallInst>(CB);
+      BasicBlock *pre = CI->getParent();
+      BasicBlock *callBB = pre->splitBasicBlock(CI, "slice.call");
+      BasicBlock *cont = callBB->splitBasicBlock(CI->getNextNode(), "slice.cont");
+      pre->getTerminator()->eraseFromParent();
+      IRBuilder<> T(pre);
+      T.SetCurrentDebugLocation(CI->getDebugLoc());
+      T.CreateBr(cont);
+    }
+    ++sites;
+    rs << "slice " << F->getName() << " at " << where << "\n";
+  }
+  for (const auto &[F, r] : kept)
+    if (!chosen.count(F))
+      rs << "slice-kept " << F->getName() << " " << r << "\n";
+  rs << "slice-sites " << sites << " elided " << chosen.size() << "\n";
+  return chosen.size();
 }
 
 // The linked program a harness runs: declarations bound to the bodies the
@@ -358,6 +1753,14 @@ static int finish(Module &harness, LLVMContext &ctx, const fs::path &outDir, con
       }
     }
   }
+  // Callbacks U makes into D that the sink path cannot depend on are skipped
+  // at U's sites (observer elision above); the decisions go to the report.
+  std::string observerLog;
+  {
+    raw_string_ostream os(observerLog);
+    elideObservers(harness, os);
+    elideSinkIrrelevant(harness, os);
+  }
   // Block only structural breakage. Debug-metadata defects that linking left
   // in the library bitcode (a subprogram shared by two merged definitions) are
   // reported through the separate flag and tolerated, matching how KLEE loads
@@ -450,6 +1853,7 @@ static int finish(Module &harness, LLVMContext &ctx, const fs::path &outDir, con
         rs << "mlta-path " << c << "\n";
       for (const std::string &g : gaps)
         rs << "closure-gap " << g << "\n";
+      rs << observerLog;
     }
     raw_fd_ostream open((outDir / (stem == "run" ? std::string("open.txt") : stem + ".open.txt")).string(), ec);
     for (Function &F : harness) {
@@ -1641,6 +3045,7 @@ int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, cons
     return 1;
   markWitnesses(*down2, witnesses);
   markWitnesses(*up2, witnesses);
+  markSides(*down2, *up2);
   markStInstallers(*down2, plan.stInstallers);
   markStInstallers(*up2, plan.stInstallers);
   Linker l2(ch);
@@ -1681,6 +3086,33 @@ int main(int argc, char **argv) {
   fs::path dir = argv[1];
   fs::path outDir = argv[2];
   int seqPick = argc == 4 ? std::atoi(argv[3]) : 0;
+  // Inspection: SP_ELIDE_ONLY=<cve-dir> model <linked.bc> <out.bc> runs
+  // observer elision alone on an already linked program and prints its
+  // report; the cve-dir supplies the installed exports.
+  if (const char *e = std::getenv("SP_ELIDE_ONLY"); e && *e) {
+    if (fs::is_directory(e))
+      projectExports = Client::installedExports(e);
+    LLVMContext ctx;
+    SMDiagnostic err;
+    auto m = parseIRFile(dir.string(), err, ctx);
+    if (!m) {
+      err.print("model", errs());
+      return 1;
+    }
+    std::string log;
+    {
+      raw_string_ostream os(log);
+      elideObservers(*m, os);
+      elideSinkIrrelevant(*m, os);
+    }
+    outs() << log;
+    if (verifyModule(*m, &errs()))
+      return 1;
+    std::error_code ec;
+    raw_fd_ostream out(outDir.string(), ec);
+    WriteBitcodeToFile(*m, out);
+    return 0;
+  }
   std::string file;
   unsigned line = 0;
   if (!loadSink(dir / "sink.yaml", file, line)) {
@@ -1884,6 +3316,7 @@ int main(int argc, char **argv) {
     return 1;
   markWitnesses(*down, witnesses);
   markWitnesses(*up, witnesses);
+  markSides(*down, *up);
   Linker linker(harness);
   if (linker.linkInModule(std::move(down)) || linker.linkInModule(std::move(up))) {
     errs() << "link failed\n";

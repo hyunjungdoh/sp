@@ -633,6 +633,11 @@ private:
   // §3.8 정의 3.8.6: the named settings of the lookups the steps make.
   std::vector<Named> named(const std::vector<std::string> &seq) const;
   Function *namedSetter(Function *G, unsigned obj, unsigned name, unsigned fallback) const;
+  // True when E's read formal of n.type reaches the lookup object of n along
+  // seq (argument pass, local slots, and fields that persist across steps).
+  // Binding by type alone admitted entries whose config never arrives at the
+  // lookup (e.g. make_texture passes null to ImageInput::open).
+  bool carriesNamed(Function *E, const Named &n, const std::vector<std::string> &seq) const;
   std::vector<Function *> writeCandidates(Function *E, const std::vector<Function *> &es, const Cell &c) const;
   // §3.9 정의 E. Whether c is established, and when a store establishes it
   // under Lemma E, the plan of the sequence reaching that store (via).

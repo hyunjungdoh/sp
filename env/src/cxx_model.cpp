@@ -204,6 +204,28 @@ extern "C" void *_ZSt9use_facetIKSt5ctypeIcEERKT_RKSt6locale(const void *) {
   return &facet;
 }
 
+// std::__cxx11::regex_traits<char>::value(char, int) const.
+// The header body builds a std::basic_istringstream and runs "is >> long" to
+// read a digit; neither the istringstream constructor nor istream::operator>>
+// is modeled, so they run against host memory and fault (the exact out-of-bound
+// read hit while OpenColorIO compiles a regex during a RawInput open). The
+// function only converts one character to its value in a radix, which needs no
+// stream. This stand-in must win over the program's own weak (header)
+// definition, so build.sh keeps it strong instead of weakening it.
+extern "C" int _ZNKSt7__cxx1112regex_traitsIcE5valueEci(const void * /*this*/,
+                                                        char ch, int radix) {
+  int d;
+  if (ch >= '0' && ch <= '9')
+    d = ch - '0';
+  else if (ch >= 'a' && ch <= 'z')
+    d = ch - 'a' + 10;
+  else if (ch >= 'A' && ch <= 'Z')
+    d = ch - 'A' + 10;
+  else
+    return -1;
+  return d < radix ? d : -1;
+}
+
 // Numeric facets are not part of this model. _M_cache_locale stores null
 // and the string insertion path never dereferences them.
 extern "C" bool

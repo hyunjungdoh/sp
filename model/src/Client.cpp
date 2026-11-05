@@ -3504,6 +3504,277 @@ Function *Client::namedSetter(Function *G, unsigned obj, unsigned name, unsigned
   return nullptr;
 }
 
+// Definition 3.8.6: E supplies the lookup object of n when a read formal of
+// E of n.type reaches that object along seq. Pointer identity, field
+// store/load across steps, and content-copy (assign/copy that returns the
+// destination) all carry the object. A null constant does not, so an entry
+// that drops its config before open does not bind.
+bool Client::carriesNamed(Function *E, const Named &n, const std::vector<std::string> &seq) const {
+  if (!E || n.type.empty() || n.lookAt.empty())
+    return false;
+  Function *Look = body(n.lookAt);
+  if (!Look)
+    return false;
+  int si = -1, ei = -1;
+  for (size_t i = 0; i < seq.size(); ++i) {
+    Function *B = body(seq[i]);
+    if (B == E)
+      si = (int)i;
+    if (seq[i] == n.lookAt || B == Look)
+      ei = (int)i;
+  }
+  if (ei < 0)
+    return false;
+  bool elevated = si < 0;
+  if (elevated)
+    si = 0;
+  else if (si > ei)
+    return false;
+
+  auto readFormal = [&](Function *F, unsigned i) {
+    if (!F || i >= F->arg_size())
+      return false;
+    auto sg = signature(F);
+    auto ag = irParams(F);
+    int k = i < ag.size() ? ag[i] : -1;
+    if (k < 0 || !held(sg[k]) || sg[k].type != n.type)
+      return false;
+    return !isPointer(sg[k].di) || writablePointee(sg[k].di) == nullptr;
+  };
+
+  std::map<Function *, std::set<unsigned>> tformals;
+  for (unsigned i = 0; i < E->arg_size(); ++i)
+    if (readFormal(E, i))
+      tformals[E].insert(i);
+  if (tformals[E].empty())
+    return false;
+
+  std::set<Function *> onPath;
+  if (elevated)
+    onPath.insert(E);
+  for (int i = si; i <= ei; ++i)
+    if (Function *B = body(seq[i]))
+      onPath.insert(B);
+
+  std::set<Field> tf;
+  std::set<Value *> tv;
+  std::vector<Value *> work;
+  auto taint = [&](Value *v) {
+    if (!v || isa<ConstantPointerNull>(v->stripPointerCasts()))
+      return;
+    Value *s = v->stripPointerCasts();
+    if (tv.insert(s).second)
+      work.push_back(s);
+  };
+  // tf holds only fields that store the config *pointer* (ImageBuf::m_configspec),
+  // not content bytes inside an ImageSpec — those collide across unrelated copies
+  // (make_texture's local configspec vs open_raw's).
+  auto fromTainted = [&](Value *v) {
+    if (!v)
+      return false;
+    Value *s = v->stripPointerCasts();
+    if (tv.count(s))
+      return true;
+    for (const Field &f : fieldsOf(s))
+      if (tf.count(f))
+        return true;
+    return false;
+  };
+
+  auto calleesOf = [&](CallBase &CB) {
+    std::vector<Function *> out;
+    if (const Function *C = klee::calls::callee(CB)) {
+      if (Function *B = body(C->getName().str()))
+        out.push_back(B);
+      return out;
+    }
+    for (Function *T : targets.of(CB))
+      if (Function *B = body(T->getName().str()))
+        out.push_back(B);
+    return out;
+  };
+
+  // Discover from E's formal: do not pre-scan later witness steps. A step that
+  // appears on seq only because of a null-config open must not inherit E's
+  // object (make_texture → ImageInput::open(null) → RawInput::open). Later
+  // steps join only when a call marks their formals or a field load hits tf.
+  std::set<Function *> queued;
+  std::vector<Function *> fwork;
+  auto enqueue = [&](Function *F) {
+    if (F && !F->isDeclaration() && queued.insert(F).second)
+      fwork.push_back(F);
+  };
+
+  auto passCall = [&](CallBase &CB) {
+    for (Function *Bd : calleesOf(CB)) {
+      bool gave = false;
+      for (unsigned j = 0; j < CB.arg_size() && j < Bd->arg_size(); ++j) {
+        Value *Arg = CB.getArgOperand(j);
+        // Null kills this edge for the config object — do not mark the formal.
+        if (isa<ConstantPointerNull>(Arg->stripPointerCasts()))
+          continue;
+        if (!fromTainted(Arg))
+          continue;
+        gave = true;
+        if (tformals[Bd].insert(j).second)
+          taint(Bd->getArg(j));
+        if (returnsArg(Bd, j))
+          taint(&CB);
+      }
+      if (!gave)
+        continue;
+      // Content copy / assign into a *member* (GEP) carries settings onward
+      // (RawInput::open assigns config into a field, then passes that field to
+      // open_raw). A whole-object local alloca copy (make_texture's configspec)
+      // stays local — tainting it would flood callees without reaching Look.
+      auto carryDest = [&](Value *Dest) {
+        Dest = Dest->stripPointerCasts();
+        if (tv.count(Dest) || isa<AllocaInst>(Dest))
+          return;
+        taint(Dest);
+      };
+      for (unsigned d = 0; d < CB.arg_size() && d < Bd->arg_size(); ++d) {
+        if (!returnsArg(Bd, d))
+          continue;
+        bool src = false;
+        for (unsigned s = 0; s < CB.arg_size() && s < Bd->arg_size(); ++s)
+          src = src || (s != d && fromTainted(CB.getArgOperand(s)));
+        if (src)
+          carryDest(CB.getArgOperand(d));
+      }
+      if (Bd->getReturnType()->isVoidTy() && CB.arg_size() >= 2) {
+        Value *Dest = CB.getArgOperand(0);
+        Type *DT = Dest->stripPointerCasts()->getType();
+        if (DT->isPointerTy()) {
+          for (unsigned s = 1; s < CB.arg_size() && s < Bd->arg_size(); ++s)
+            if (CB.getArgOperand(s)->getType() == Dest->getType() &&
+                fromTainted(CB.getArgOperand(s))) {
+              carryDest(Dest);
+              break;
+            }
+        }
+      }
+      if (onPath.count(Bd) || !(ifaceD.count(Bd) || ifaceU.count(Bd)))
+        enqueue(Bd);
+      else if (onPath.count(CB.getFunction()) || queued.count(CB.getFunction()))
+        enqueue(Bd);
+    }
+  };
+
+  auto drain = [&]() {
+    while (!fwork.empty() || !work.empty()) {
+      while (!work.empty()) {
+        Value *v = work.back();
+        work.pop_back();
+        for (User *U : v->users()) {
+          if (auto *S = dyn_cast<StoreInst>(U)) {
+            if (S->getValueOperand()->stripPointerCasts() != v)
+              continue;
+            if (auto *A = dyn_cast<AllocaInst>(S->getPointerOperand()->stripPointerCasts()))
+              taint(A);
+            // Only when the stored value is the config pointer itself.
+            for (const Field &f : accessFields(*S, S->getPointerOperand()))
+              tf.insert(f);
+          } else if (auto *L = dyn_cast<LoadInst>(U)) {
+            if (L->getPointerOperand()->stripPointerCasts() == v)
+              taint(L);
+          } else if (auto *CB = dyn_cast<CallBase>(U)) {
+            passCall(*CB);
+          } else if (isa<Instruction>(U) && !isa<CallBase>(U)) {
+            taint(U);
+          }
+        }
+      }
+      if (fwork.empty())
+        break;
+      Function *F = fwork.back();
+      fwork.pop_back();
+      for (unsigned i : tformals[F])
+        if (i < F->arg_size())
+          taint(F->getArg(i));
+      for (Instruction &I : instructions(*F)) {
+        if (auto *L = dyn_cast<LoadInst>(&I)) {
+          for (const Field &f : accessFields(*L, L->getPointerOperand()))
+            if (tf.count(f))
+              taint(L);
+          if (fromTainted(L->getPointerOperand()))
+            taint(L);
+        } else if (auto *S = dyn_cast<StoreInst>(&I)) {
+          if (fromTainted(S->getValueOperand())) {
+            if (auto *A = dyn_cast<AllocaInst>(S->getPointerOperand()->stripPointerCasts()))
+              taint(A);
+            for (const Field &f : accessFields(*S, S->getPointerOperand()))
+              tf.insert(f);
+          }
+        } else if (auto *CB = dyn_cast<CallBase>(&I)) {
+          bool any = false;
+          for (unsigned j = 0; j < CB->arg_size(); ++j)
+            any = any || fromTainted(CB->getArgOperand(j));
+          if (any)
+            passCall(*CB);
+        }
+      }
+    }
+  };
+
+  enqueue(E);
+  drain();
+  // Field persistence across API steps on the witness (reset → read → open):
+  // a later step joins when it loads a field E's object was stored into, or
+  // when a prior call already marked its formals.
+  for (int i = si; i <= ei; ++i) {
+    Function *F = body(seq[i]);
+    if (!F || queued.count(F))
+      continue;
+    bool hit = !tformals[F].empty();
+    if (!hit) {
+      for (Instruction &I : instructions(*F))
+        if (auto *L = dyn_cast<LoadInst>(&I))
+          for (const Field &f : accessFields(*L, L->getPointerOperand()))
+            if (tf.count(f)) {
+              hit = true;
+              break;
+            }
+    }
+    if (!hit)
+      continue;
+    enqueue(F);
+    drain();
+  }
+
+  for (Instruction &I : instructions(*Look)) {
+    auto *CB = dyn_cast<CallBase>(&I);
+    Function *Cal = CB ? CB->getCalledFunction() : nullptr;
+    Function *G = Cal ? body(Cal->getName().str()) : nullptr;
+    if (!CB || !G || !G->getReturnType()->isIntegerTy() || !lookupOnly(G))
+      continue;
+    if (n.lookLine) {
+      const DebugLoc &DL = CB->getDebugLoc();
+      if (!DL || DL.getLine() != n.lookLine)
+        continue;
+    }
+    auto fb = fallbackArg(G);
+    if (!fb || *fb >= CB->arg_size())
+      continue;
+    auto sg = signature(G);
+    auto ag = irParams(G);
+    std::optional<unsigned> obj;
+    for (unsigned i = 0; i < ag.size(); ++i)
+      if (ag[i] >= 0 && held(sg[ag[i]]) && !obj)
+        obj = i;
+    if (!obj || *obj >= CB->arg_size() || sg[ag[*obj]].type != n.type)
+      continue;
+    std::set<AllocaInst *> open;
+    bool cut = false;
+    Position p = positionOf(CB->getArgOperand(*obj), open, cut);
+    if (p.root >= 0 && tformals[Look].count((unsigned)p.root))
+      return true;
+    if (fromTainted(CB->getArgOperand(*obj)))
+      return true;
+  }
+  return false;
+}
+
 // Definition 3.8.6: the named settings of the lookups each step makes on an
 // object it receives. A lookup is a call that writes no memory its caller
 // sees (lookupOnly), returns an integer, and can return one argument
@@ -5355,29 +5626,11 @@ Client::Plan Client::plan(const Witnesses &ws) const {
           fs.push_back(c);
       }
     // Definition 3.8.6: a setting is the client's own choice, like a lever, at
-    // the entry that *supplies* the object the lookup reads. The object is an
-    // input the library reads as config, so the entry's held parameter of the
-    // lookup's type must be one the entry does not write through: a `const`
-    // config it carries into library state (ImageBuf::reset's `config`), not an
-    // output slot the entry fills (get_cache_dimensions' `ImageSpec& spec`).
-    // Binding by type alone bound the setting to every entry with a parameter of
-    // that type, so output-only entries ranked first in seed order with a config
-    // they never read. The rule is data flow, not a type match, and names no
-    // library (대원칙: 케이스별 땜질 금지).
-    auto suppliesRead = [&](Function *F, const std::string &ty) {
-      for (const Param &p : signature(F)) {
-        if (!held(p) || p.type != ty)
-          continue;
-        // The lookup reads the object as const config, so the supplying entry
-        // must pass it as a read input the library may not overwrite: a const
-        // pointer/reference (writablePointee is null) or a by-value copy — not a
-        // writable output slot it fills (an `ImageSpec&` it assigns into). This is
-        // the data direction of the parameter, and names no library.
-        if (!isPointer(p.di) || writablePointee(p.di) == nullptr)
-          return true;
-      }
-      return false;
-    };
+    // the entry that *supplies* the object the lookup reads. suppliesRead alone
+    // was not enough: an entry can take a const config and still drop it (pass
+    // null into open) so the lookup reads a different object. carriesNamed
+    // requires the entry's read formal of the lookup's type to reach the
+    // lookup object along this witness (args, slots, fields). Names no library.
     // 정의 R: an obligation on the same lookup this setting reads (matched by
     // the key, then the call site) tells the seed which value the sink path
     // needs the lookup to return.
@@ -5394,7 +5647,7 @@ Client::Plan Client::plan(const Witnesses &ws) const {
     };
     for (const Named &n : named(seq))
       for (Function *F : W.entries) {
-        if (!suppliesRead(F, n.type))
+        if (!carriesNamed(F, n, seq))
           continue;
         auto &ns = P.named[F];
         if (std::none_of(ns.begin(), ns.end(), [&](const Named &o) { return o.setter == n.setter && o.key == n.key; })) {
