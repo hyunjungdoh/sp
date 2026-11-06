@@ -214,6 +214,9 @@ public:
     std::vector<std::string> seq;
     // The length of the witness (functions from π₀ to the sink line).
     size_t length = 0;
+    // §3.12: origins of the sink guard along this witness (0 = the guard is
+    // fixed on this witness; nothing the harness or input sets reaches it).
+    unsigned guardFacts = 0;
     // §3.9: iface(callable entry exists) ∧ every obligation cell non-Open.
     // Controls which writers and key setters the harness installs.
     bool pass = false;
@@ -275,6 +278,9 @@ public:
   std::vector<std::vector<Keyed>> keyedIn;
   // 정의 R: the return obligations of each witness, aligned likewise.
   std::vector<std::vector<Ret>> retsIn;
+  // §3.12: the number of sink-guard origins of each witness, aligned
+  // likewise. The seed order reads it (seedOrder).
+  std::vector<unsigned> guardFactsIn;
   // §3.12: the names (κ of `sinkdep … named "κ"`) a sink guard or sink operand
   // of any witness depends on through the ICFG value flow.
   std::set<std::string> sinkNamed;
@@ -319,9 +325,14 @@ public:
   std::vector<std::pair<std::string, std::string>> openDispatchEdges(const std::vector<std::string> &seq) const;
   void report(const Plan &P, raw_ostream &out) const;
   void emit(const Plan &P, Module &H) const;
-  // The entries main offers, seed (choice 0) first: §3.12 sink-dependent
-  // names decide the seed between entries as they do within one.
+  // The entries main offers, seed (choice 0) first: the entry whose seed
+  // path is seedable (reaches its call) and realizes the most sink facts
+  // (§3.12 sinkdep, 정의 R), then the shortest witness.
   std::vector<Function *> seedOrder(const Plan &P) const;
+  // §4 시드 가능: whether the emitted seed body of an entry reaches the
+  // entry call (no constant-false require). emit() fills it before taking
+  // the final order; empty until then (every entry counts as seedable).
+  mutable std::map<Function *, bool> seedable;
   // Bounds of the client search: writer calls before the entry, and the
   // bytes of every input channel.
   void bounds(unsigned writers, unsigned input, unsigned depth, unsigned text) {

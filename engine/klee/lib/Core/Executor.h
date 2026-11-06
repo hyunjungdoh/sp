@@ -492,7 +492,8 @@ private:
   /// (advanceCheckpoint); decisions before floor are not flipped again.
   /// Nothing is discarded for lack of memory.
   struct Deferred {
-    std::tuple<unsigned, unsigned, uint64_t> key; // orderKey of the deferred state
+    // orderKey: {gen, pending, hunt, sinkOrder}
+    std::tuple<unsigned, unsigned, unsigned, uint64_t> key;
     unsigned floor;
     std::vector<KTest *> inputs; // the state's seeds, re-run together
     std::set<std::string> fixed;
@@ -560,7 +561,8 @@ private:
   /// gate is not starved by siblings still approaching T_st; then its sink
   /// order g (sinkOrder, or 1 without a sink guide; unreachable sorts last).
   /// Selection takes the least key, deferral the greatest.
-  std::tuple<unsigned, unsigned, uint64_t> orderKey(ExecutionState &state);
+  std::tuple<unsigned, unsigned, unsigned, uint64_t>
+  orderKey(ExecutionState &state);
 
   /// Concolic mode. The input-carrying state now running: it runs for a
   /// quantum of --batch-instructions, or until it ends, is deferred, or loses

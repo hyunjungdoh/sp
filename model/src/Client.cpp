@@ -5596,6 +5596,7 @@ Client::Plan Client::plan(const Witnesses &ws) const {
     WitnessPlan W = realize(E, phi, wi < keyedIn.size() ? keyedIn[wi] : std::vector<Keyed>{},
                             wi < retsIn.size() ? retsIn[wi] : std::vector<Ret>{});
     W.length = seq.size();
+    W.guardFacts = wi < guardFactsIn.size() ? guardFactsIn[wi] : 0;
     if (std::find(P.firsts.begin(), P.firsts.end(), E) == P.firsts.end())
       P.firsts.push_back(E);
     for (Function *F : W.entries)
@@ -5650,10 +5651,21 @@ Client::Plan Client::plan(const Witnesses &ws) const {
         if (!carriesNamed(F, n, seq))
           continue;
         auto &ns = P.named[F];
-        if (std::none_of(ns.begin(), ns.end(), [&](const Named &o) { return o.setter == n.setter && o.key == n.key; })) {
+        // §3.8.6 정의 R: the same (setter, κ) may appear on many witnesses.
+        // The first one that carries it installs the setting; a later witness
+        // can still supply the return obligation the sink path needs. Without
+        // the upgrade, a pre-obligation witness pins choice 0 to skip and the
+        // obligation from a later witness (1729: ForceLoad on sequence 27) is
+        // dropped — the seed never unpacks.
+        auto it = std::find_if(ns.begin(), ns.end(),
+                               [&](const Named &o) { return o.setter == n.setter && o.key == n.key; });
+        if (it == ns.end()) {
           Named bound = n;
           bound.must = obligation(n);
           ns.push_back(std::move(bound));
+        } else if (!it->must) {
+          if (auto ob = obligation(n))
+            it->must = ob;
         }
       }
     if (W.pass) {
@@ -6010,13 +6022,17 @@ void Client::dispatch(const Witnesses &ws, Plan &P) const {
 // callee must be set too. Per-entry emit offers only one entry's program, so
 // the seed entry must be able to set both — otherwise Key and named split
 // across entries and choice 0 cannot establish the full path.
-// Rank: most sink-dependent named keys (정의 3.8.6), then whether the entry
-// has a Key setter (P.keyed), then shorter witness length among those that
-// set a sink-dependent name. Entries that set none and have no Key keep the
-// witness order.
+// Rank: seedable, then most sink-dependent named keys (정의 3.8.6), then
+// whether a witness through the entry gives the sink guard an origin, then
+// shorter witness length (see the comment at the sort below).
 std::vector<Function *> Client::seedOrder(const Plan &P) const {
   std::vector<Function *> entries;
   std::map<Function *, size_t, FnOrder> shortest;
+  // §3.12: does some realized witness through E carry an origin of the sink
+  // guard? A guard with no origin inside the closure of E is fixed on that
+  // witness — the sink is reached only if the constant happens to be right,
+  // and nothing the harness or the input sets can change it.
+  std::map<Function *, bool, FnOrder> guardOpen;
   for (const WitnessPlan &W : P.witnesses)
     if (W.realized)
       for (Function *E : W.entries) {
@@ -6025,6 +6041,7 @@ std::vector<Function *> Client::seedOrder(const Plan &P) const {
         auto it = shortest.find(E);
         if (it == shortest.end() || W.length < it->second)
           shortest[E] = W.length;
+        guardOpen[E] = guardOpen[E] || W.guardFacts > 0;
       }
   if (entries.empty() && !P.firsts.empty())
     entries = {P.firsts.front()};
@@ -6036,20 +6053,43 @@ std::vector<Function *> Client::seedOrder(const Plan &P) const {
           ks.insert(n.key);
     return ks.size();
   };
-  auto hasKey = [&](Function *E) {
-    auto it = P.keyed.find(E);
-    return it != P.keyed.end() && !it->second.empty();
+  // The seed (choice 0, §4) is the entry whose seed path most surely executes
+  // the sink s (Definition 2) — bug-driven, not coverage- or key-driven:
+  //   1. seedable: the seed body reaches `call E` (no ⊥_silent the emitter
+  //      proves, Val = ∅ on a non-nullable argument). An entry that dies
+  //      before its call installs nothing, whatever names it could set.
+  //   2. L(E): the sink facts the seed realizes — names the sink depends on
+  //      (§3.12 sinkdep) and lookups the sink path obliges (정의 R).
+  //   3. guard open: some witness through E gives the sink guard an origin
+  //      (`sinkdep guard …`). With none, the guard's operands come from
+  //      constants of the closure alone (35538: on the TIFFWrite* witnesses
+  //      the row count at jutils.c:110 is fixed by the encoder; on the
+  //      TIFFRead* ones it is the decoder's state from the input) — SAVIOR's
+  //      distinction between an unverified and a verified label. A count is
+  //      not used: more origins means a larger slice, not a surer sink.
+  //   4. the shortest realized witness through E.
+  // Whether E has a key setter does not rank it: a key is a means of ρ, not
+  // evidence that s is executed (35538: the key put TIFFWrite* ahead of the
+  // TIFFRead* witnesses the sink's input actually flows through).
+  auto sinkLabels = [&](Function *E) {
+    std::set<std::string> ks;
+    if (auto it = P.named.find(E); it != P.named.end())
+      for (const Named &n : it->second)
+        if (n.sinkDep || n.must)
+          ks.insert(n.key);
+    return ks.size();
   };
   std::stable_sort(entries.begin(), entries.end(), [&](Function *A, Function *B) {
-    size_t a = sinkNames(A), b = sinkNames(B);
+    bool sa = seedable.count(A) == 0 || seedable.at(A);
+    bool sb = seedable.count(B) == 0 || seedable.at(B);
+    if (sa != sb)
+      return sa;
+    size_t a = sinkLabels(A), b = sinkLabels(B);
     if (a != b)
       return a > b;
-    bool ka = hasKey(A), kb = hasKey(B);
-    if (ka != kb)
-      return ka;
-    // Length decides only among entries that set a sink-dependent name: the
-    // rest keep the witness order.
-    return a != 0 && shortest[A] < shortest[B];
+    if (guardOpen[A] != guardOpen[B])
+      return guardOpen[A];
+    return shortest[A] < shortest[B];
   });
   return entries;
 }
@@ -6112,7 +6152,10 @@ void Client::report(const Plan &P, raw_ostream &out) const {
           len = len ? std::min(len, W.length) : W.length;
       bool keyed = P.keyed.count(order[i]) && !P.keyed.at(order[i]).empty();
       out << "seed " << i << " " << order[i]->getName() << " sinkdep " << n << " key " << (keyed ? 1 : 0)
-          << " length " << len << "\n";
+          << " length " << len;
+      if (auto s = seedable.find(order[i]); s != seedable.end())
+        out << " seedable " << (s->second ? 1 : 0);
+      out << "\n";
     }
   }
   for (const auto &h : P.handles) {
@@ -6149,6 +6192,8 @@ void Client::report(const Plan &P, raw_ostream &out) const {
           << "\" value arg" << n.value;
       if (n.fallback)
         out << " fallback " << *n.fallback;
+      if (n.must)
+        out << " must " << n.must->first << " " << n.must->second;
       if (n.sinkDep)
         out << " sinkdep";
       out << "\n";
@@ -6269,7 +6314,14 @@ struct Builder {
 
   // A path on which the client cannot proceed is not a client: it ends
   // silently rather than as an infeasible assumption.
+  // dead counts the requires whose condition is the constant false: a
+  // ⊥_silent the emitter already knows every execution of that code takes
+  // (Val = ∅ for a non-nullable argument). The seed order reads it: an entry
+  // whose seed body holds one never calls the entry (§4 시드 가능).
+  unsigned dead = 0;
   void require(IRBuilder<> &B, Value *cond) {
+    if (auto *CI = dyn_cast<ConstantInt>(cond); CI && CI->isZero())
+      ++dead;
     Function *F = B.GetInsertBlock()->getParent();
     auto *ok = BasicBlock::Create(ctx, "ok", F);
     auto *no = BasicBlock::Create(ctx, "no", F);
@@ -8020,6 +8072,31 @@ void Client::emit(const Plan &P, Module &H) const {
     K.oneOf(X, alts, "make");
     Value *got = X.CreateLoad(p0, slotOf(h.first));
     K.require(X, X.CreateICmpNE(got, ConstantPointerNull::get(p0)));
+    // A producer sets its type's representation invariant (CustomStreamInfo's
+    // signature) but leaves the function-pointer fields the library later
+    // null-checks (CustomStreamInfo.reader) null, so the entry dies on that
+    // null assert before nurs:sink can walk π. The same rule that fills a
+    // nested held type's reader for an entry argument (above) applies to a
+    // produced handle: a function-pointer field is V-Fn, the client's
+    // callback of its type — the reader that delivers the input, the
+    // seeker/teller that move its cursor. Fill each that the producer left
+    // null (select, not a fork: no new choice, the seed path is unchanged).
+    if (auto cit = composite.find(h.first); cit != composite.end())
+      for (const DIDerivedType *M : members(cit->second)) {
+        const DIType *BT = strip(M->getBaseType());
+        if (!isPointer(BT))
+          continue;
+        const DIType *Pointee = strip(cast<DIDerivedType>(BT)->getBaseType());
+        if (!Pointee || !isa<DISubroutineType>(Pointee))
+          continue;
+        int64_t o = (int64_t)(M->getOffsetInBits() / 8);
+        Value *slot = X.CreateGEP(X.getInt8Ty(), got, X.getInt64(o));
+        Value *cur = X.CreateLoad(p0, slot);
+        Value *cb = pointer(X, M->getBaseType(), objectDepth, false, Where{});
+        Value *use = X.CreateSelect(
+            X.CreateICmpEQ(cur, ConstantPointerNull::get(p0)), cb, cur);
+        X.CreateStore(use, slot);
+      }
     X.CreateRet(got);
   }
   // Option 1 (eager library-registry init). Before the client forks on the
@@ -8278,13 +8355,29 @@ void Client::emit(const Plan &P, Module &H) const {
         auto f = P.files.find(E);
         call(C, E, "", -1, g == P.guards.end() ? nullptr : &g->second, f == P.files.end() ? nullptr : &f->second);
     };
+    // Emit every entry's seed body first and record whether it reaches its
+    // call (§4 시드 가능): a constant-false require inside it is a ⊥_silent
+    // the emitter proved for every execution of that body. Only then take
+    // the seed order, so choice 0 is an entry that actually calls.
+    std::map<Function *, Function *> fnOf;
+    seedable.clear();
+    for (Function *E : entries) {
+      Function *EF = Function::Create(FunctionType::get(Type::getVoidTy(ctx), false), Function::ExternalLinkage,
+                                      "client.entry", &H);
+      IRBuilder<> C(BasicBlock::Create(ctx, "entry", EF));
+      unsigned before = K.dead;
+      body(C, E);
+      C.CreateRetVoid();
+      seedable[E] = K.dead == before;
+      fnOf[E] = EF;
+    }
+    entries = seedOrder(P);
     std::vector<std::function<void(IRBuilder<> &)>> alts;
     for (size_t k = 0; k < entries.size(); ++k) {
-      Function *EF = Function::Create(FunctionType::get(Type::getVoidTy(ctx), false), Function::ExternalLinkage,
-                                      "client.entry." + std::to_string(k), &H);
-      IRBuilder<> C(BasicBlock::Create(ctx, "entry", EF));
-      body(C, entries[k]);
-      C.CreateRetVoid();
+      Function *EF = fnOf.at(entries[k]);
+      EF->setName("client.entry." + std::to_string(k));
+      errs() << "seed " << k << " " << entries[k]->getName() << " seedable "
+             << (seedable[entries[k]] ? 1 : 0) << "\n";
       alts.push_back([EF](IRBuilder<> &A) { A.CreateCall(EF); });
     }
     K.oneOf(B, alts, "entry");

@@ -7,6 +7,7 @@
 #include <sstream>
 
 #include "llvm/Analysis/TargetLibraryInfo.h"
+#include "llvm/BinaryFormat/Dwarf.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/TargetParser/Triple.h"
@@ -1908,6 +1909,23 @@ struct Witness {
   std::vector<Client::Keyed> keyed;
   // §3.12: names (κ) a sink guard or sink operand depends on (`sinkdep … named "κ"`).
   std::set<std::string> sinkNamed;
+  // §3.12: the lookup site of a sinkdep name — `named "κ" lookup G at F line N`.
+  // When no 정의 R return pins the same site, the harness plants a read-back
+  // that forces a non-fallback value (the seed rule for sinkDep without a must
+  // the fallback already satisfies). Parsing only the name left the site
+  // unplanted; the CLIENT named setting alone does not always reach the object
+  // the lookup reads.
+  struct SinkLookup {
+    std::string key, callee, caller;
+    unsigned line = 0;
+  };
+  std::vector<SinkLookup> sinkLookups;
+  // §3.12: the origins of the sink guard (`sinkdep guard <origin>`) along
+  // this witness. Zero means the guard's operands trace to no origin inside
+  // the closure of f_0 — the guard is fixed on this witness and cannot be
+  // steered by the harness or the input. The seed order reads it as whether
+  // the witness opens the sink's guard (SAVIOR's unverified bug label).
+  unsigned guardFacts = 0;
 };
 
 std::vector<Client::Ret> clientRets(const Witness &w) {
@@ -2177,11 +2195,26 @@ Witness parseWitness(std::istream &st) {
     } else if (head == "sinkdep") {
       // §3.12: `sinkdep <seed> named "κ" lookup G at F line N` — the name κ
       // whose value a sink guard or sink operand depends on.
+      // `sinkdep guard <origin>`: one origin of the sink guard on this
+      // witness; the `nodes` summary line is not an origin.
+      if (s.rfind("sinkdep guard ", 0) == 0 && s.find(" nodes ") == std::string::npos)
+        ++w.guardFacts;
       auto q = s.find("named \"");
       if (q != std::string::npos) {
         auto e = s.find('"', q + 7);
-        if (e != std::string::npos)
-          w.sinkNamed.insert(s.substr(q + 7, e - (q + 7)));
+        if (e != std::string::npos) {
+          std::string key = s.substr(q + 7, e - (q + 7));
+          w.sinkNamed.insert(key);
+          // Keep the lookup site so plantReturns can force the value when no
+          // model return already pins it (half_size: sinkdep only, no Ret).
+          std::istringstream is(s.substr(e + 1));
+          std::string lookupTok, atTok, lineTok;
+          Witness::SinkLookup sl;
+          sl.key = key;
+          if ((is >> lookupTok >> sl.callee >> atTok >> sl.caller >> lineTok >> sl.line) &&
+              lookupTok == "lookup" && atTok == "at" && lineTok == "line" && sl.line)
+            w.sinkLookups.push_back(std::move(sl));
+        }
       }
     } else if (head == "model") {
       std::string second;
@@ -2324,6 +2357,75 @@ static bool instanceMethod(Function *F) {
 // §3.12: choice 0 is the seed path, so the candidates whose value slot is
 // exactly G's return type come first; among those, and among the rest, the
 // order is by name.
+// Strip typedef/const/volatile/restrict/atomic wrappers to the type underneath.
+static DIType *stripCV(DIType *T) {
+  while (auto *D = dyn_cast_or_null<DIDerivedType>(T)) {
+    unsigned tag = D->getTag();
+    if (tag == dwarf::DW_TAG_typedef || tag == dwarf::DW_TAG_const_type ||
+        tag == dwarf::DW_TAG_volatile_type || tag == dwarf::DW_TAG_restrict_type ||
+        tag == dwarf::DW_TAG_atomic_type)
+      T = D->getBaseType();
+    else
+      break;
+  }
+  return T;
+}
+
+// A class/struct/union/array — an aggregate that holds no integer by value.
+// (An enum is a composite type but is integer-valued, so it is not aggregate.)
+static bool isAggregateDI(DIType *T) {
+  auto *C = dyn_cast_or_null<DICompositeType>(stripCV(T));
+  if (!C)
+    return false;
+  unsigned tag = C->getTag();
+  return tag == dwarf::DW_TAG_class_type || tag == dwarf::DW_TAG_structure_type ||
+         tag == dwarf::DW_TAG_union_type || tag == dwarf::DW_TAG_array_type;
+}
+
+// The source type of setter S's value slot j (its IR arg index), or null when
+// debug info does not line up with the IR arg list (an sret return slot or a
+// struct expanded across registers shifts the indices; then fall back to the
+// IR-type checks). The DISubroutineType array is [return, this, params...], so
+// IR arg j maps to element j + 1.
+static DIType *paramSourceType(Function *S, unsigned j) {
+  DISubprogram *SP = S->getSubprogram();
+  if (!SP)
+    return nullptr;
+  DISubroutineType *FT = SP->getType();
+  if (!FT)
+    return nullptr;
+  DITypeRefArray arr = FT->getTypeArray();
+  if (arr.size() != S->arg_size() + 1)
+    return nullptr;
+  return arr[j + 1];
+}
+
+// Whether value slot j of S can carry G's integer return. A by-value aggregate
+// (string_view, std::string) lowers to a plain `ptr` in IR — the same shape as
+// a genuine scalar pointer — so the IR type alone cannot tell them apart. But
+// &witness read back as such a struct is garbage {data, size}, which faults in
+// the setter's shallow code and drowns the search before the deep sink. The
+// source type in debug info distinguishes them: an aggregate value slot (by
+// value, or a pointer/reference to one) is not a candidate.
+static bool slotCarriesInt(Function *S, unsigned j) {
+  if (S->getArg(j)->hasByValAttr())
+    return false;
+  DIType *vt = paramSourceType(S, j);
+  if (!vt)
+    return true; // debug info unavailable or misaligned: defer to IR-type checks
+  DIType *b = stripCV(vt);
+  if (isAggregateDI(b))
+    return false;
+  if (auto *D = dyn_cast_or_null<DIDerivedType>(b)) {
+    unsigned tag = D->getTag();
+    if ((tag == dwarf::DW_TAG_pointer_type || tag == dwarf::DW_TAG_reference_type ||
+         tag == dwarf::DW_TAG_rvalue_reference_type) &&
+        isAggregateDI(D->getBaseType()))
+      return false; // pointer/reference to an aggregate
+  }
+  return true;
+}
+
 static std::vector<Setter> valueSetters(Module &M, Module *also, Function *G, unsigned fb,
                                         std::map<const Function *, bool> &look) {
   std::string cls = classOf(G->getName());
@@ -2342,6 +2444,12 @@ static std::vector<Setter> valueSetters(Module &M, Module *also, Function *G, un
   std::vector<Setter> out;
   for (auto &[name, S] : cands)
     for (unsigned j = 1; j < S->arg_size(); ++j) {
+      // The value slot must be able to carry G's integer return. An aggregate
+      // value slot (a by-value string_view/std::string, or a pointer/reference
+      // to one) cannot — see slotCarriesInt — and admitting it makes the read-
+      // back fault in the setter's shallow code and drown the search.
+      if (!slotCarriesInt(S, j))
+        continue;
       Type *V = S->getArg(j)->getType();
       bool exact = V->isIntegerTy() && V == G->getReturnType();
       if (!exact && !V->isPointerTy())
@@ -2384,6 +2492,10 @@ static void plantReadBack(Module &M, CallBase *CB, unsigned fb, int64_t witness,
   DebugLoc at = CB->getDebugLoc();
   BasicBlock *head = CB->getParent();
   BasicBlock *read = head->splitBasicBlock(CB, "setter.read");
+  // Mark the wrapped call so a later pass over the linked module does not wrap
+  // it again (block names do not survive optimization; instruction metadata
+  // survives linking). See the guard in plantReturns.
+  CB->setMetadata("sp.readback", MDNode::get(ctx, {}));
   head->getTerminator()->eraseFromParent();
   auto *dead = BasicBlock::Create(ctx, "setter.dead", F, read);
   IRBuilder<> X(dead);
@@ -2447,7 +2559,50 @@ static void plantReadBack(Module &M, CallBase *CB, unsigned fb, int64_t witness,
   auto *T = cast<IntegerType>(probe[fb]->getType());
   probe[fb] = ConstantInt::get(T, APInt(T->getBitWidth(), (uint64_t)witness, true) + 1);
   Value *got = K.CreateCall(CB->getFunctionType(), CB->getCalledOperand(), probe);
+  // The read-back probe is another call to the lookup at the same source line;
+  // mark it too so a later pass does not wrap it as if it were the site.
+  cast<CallInst>(got)->setMetadata("sp.readback", MDNode::get(ctx, {}));
   K.CreateCondBr(K.CreateICmpEQ(got, ConstantInt::get(got->getType(), (uint64_t)witness, true)), read, dead);
+}
+
+// The rets of every witness, merged. A read-back is planted per obligation
+// site, and a site's constraints are the path's reach-condition, consistent
+// across the witnesses that realize it (the per-site grouping still resolves
+// one value). The primary witness (state.txt) need not record every site a
+// later witness pinned, so merging is what lets a lookup whose reach-condition
+// only a non-primary path established still get its read-back planted.
+//
+// §3.12 sinkdep lookup sites with no model return at the same (G, F, line)
+// become a non-fallback obligation (pred "!=", empty k): plantReturns reads
+// the call site's fallback and forces fallback+1. A site that already has a
+// 정의 R return keeps that obligation — synthesizing ≠fallback would fight
+// e.g. HighlightMode == 0 where the fallback already satisfies the must.
+static std::vector<Witness::Ret> allWitnessRets(const std::vector<Witness> &ws) {
+  std::vector<Witness::Ret> out;
+  std::set<std::tuple<std::string, std::string, unsigned>> have;
+  for (const Witness &w : ws)
+    for (const Witness::Ret &r : w.rets) {
+      out.push_back(r);
+      if (r.line)
+        have.insert({r.callee, r.caller, r.line});
+    }
+  for (const Witness &w : ws)
+    for (const Witness::SinkLookup &s : w.sinkLookups) {
+      if (!s.line || s.callee.empty() || s.caller.empty())
+        continue;
+      if (!have.insert({s.callee, s.caller, s.line}).second)
+        continue;
+      Witness::Ret r;
+      r.callee = s.callee;
+      r.caller = s.caller;
+      r.line = s.line;
+      r.key = s.key;
+      r.lookup = true;
+      r.pred = "!=";
+      // Empty k: plantReturns treats this as ≠fallback (witness = fallback+1).
+      out.push_back(std::move(r));
+    }
+  return out;
 }
 
 void plantReturns(Module &M, Module *also, const std::vector<Witness::Ret> &rets) {
@@ -2493,27 +2648,40 @@ void plantReturns(Module &M, Module *also, const std::vector<Witness::Ret> &rets
     std::vector<std::pair<unsigned, int64_t>> cs;
     bool live = false;
     bool lookup = false;
+    // §3.12 sinkdep with no model return: force a value other than the
+    // call site's fallback (witness = fallback+1). cs stays empty.
+    bool nonFallback = false;
   };
   std::map<SiteKey, SiteFact> grouped;
   for (const Witness::Ret &r : rets) {
     auto pred = predOf(r.pred);
     if (!pred || !r.line)
       continue;
+    SiteFact &fact = grouped[{r.callee, r.caller, r.line, r.col}];
+    fact.live = fact.live || r.live;
+    fact.lookup = fact.lookup || r.lookup;
+    // Empty k + "!=": sinkdep-synthesized non-fallback obligation.
+    if (r.k.empty() && r.pred == "!=" && r.lookup) {
+      fact.nonFallback = true;
+      continue;
+    }
     int64_t k = 0;
     auto parsed = std::from_chars(r.k.data(), r.k.data() + r.k.size(), k);
     if (parsed.ec != std::errc())
       continue;
-    SiteFact &fact = grouped[{r.callee, r.caller, r.line, r.col}];
     fact.cs.push_back({(unsigned)*pred, k});
-    fact.live = fact.live || r.live;
-    fact.lookup = fact.lookup || r.lookup;
   }
   std::map<const Function *, bool> look;
   unsigned setters = 0, left = 0, choices = 0, widened = 0;
   for (const auto &gv : grouped) {
     Function *caller = M.getFunction(gv.first.caller);
-    if (!caller || caller->isDeclaration())
+    if (!caller || caller->isDeclaration()) {
+      if (std::getenv("SP_DBG_PLANT"))
+        errs() << "plant-skip-caller " << gv.first.callee << " caller " << gv.first.caller << " line "
+               << gv.first.line << " have " << (caller != nullptr) << " decl "
+               << (caller && caller->isDeclaration()) << "\n";
       continue;
+    }
     std::vector<CallBase *> sites;
     for (Instruction &I : instructions(*caller)) {
       auto *CB = dyn_cast<CallBase>(&I);
@@ -2528,6 +2696,14 @@ void plantReturns(Module &M, Module *also, const std::vector<Witness::Ret> &rets
       sites.push_back(CB);
     }
     for (CallBase *CB : sites) {
+      // Idempotent across passes. A call an earlier pass already wrapped carries
+      // the sp.readback marker; leave it. This lets a later pass run over the
+      // fully linked module (after closeLibrary) and reach only the sites the
+      // slice could not: a lookup in a function reached by virtual dispatch is a
+      // declaration in the slice and gets its body from closeLibrary, so its
+      // obligation is planted only in that later pass.
+      if (CB->getMetadata("sp.readback"))
+        continue;
       Function *Decl = calledFn(CB);
       Function *D = definedAs(M, also, Decl->getName());
       if (!D)
@@ -2537,9 +2713,23 @@ void plantReturns(Module &M, Module *also, const std::vector<Witness::Ret> &rets
       if (fb && *fb < CB->arg_size())
         if (auto *C = dyn_cast<ConstantInt>(CB->getArgOperand(*fb)))
           fallback = C->getSExtValue();
-      std::optional<int64_t> witness = satisfyingValue(gv.second.cs, fallback);
+      // Sinkdep non-fallback: same seed rule as CLIENT nameSet for sinkDep
+      // without a must the fallback already holds — select(s==d, d+1, s) at s=0
+      // yields d+1 when d≠0, and 1 when d=0.
+      std::optional<int64_t> witness;
+      if (gv.second.nonFallback && fallback)
+        witness = *fallback + 1;
+      else if (!gv.second.nonFallback)
+        witness = satisfyingValue(gv.second.cs, fallback);
       bool asLookup = (gv.second.lookup || lookupOnly(D)) && witness && !gv.second.live && CB->getType()->isIntegerTy();
       if (!asLookup || !fb || *fb >= CB->arg_size() || !CB->getArgOperand(*fb)->getType()->isIntegerTy()) {
+        if (std::getenv("SP_DBG_PLANT"))
+          errs() << "plant-left " << gv.first.callee << " caller " << gv.first.caller << " line " << gv.first.line
+                 << " asLookup " << asLookup << " lookup " << gv.second.lookup << " lookupOnly " << lookupOnly(D)
+                 << " wit " << (witness ? *witness : -999) << " live " << gv.second.live << " cbint "
+                 << CB->getType()->isIntegerTy() << " fb " << (fb ? (int)*fb : -1) << " argsz " << CB->arg_size()
+                 << " fbint " << (fb && *fb < CB->arg_size() ? CB->getArgOperand(*fb)->getType()->isIntegerTy() : 0)
+                 << " invoke " << isa<InvokeInst>(CB) << "\n";
         ++left;
         continue;
       }
@@ -2563,9 +2753,15 @@ void plantReturns(Module &M, Module *also, const std::vector<Witness::Ret> &rets
         chosen.push_back(std::move(s));
       }
       if (chosen.empty()) {
+        if (std::getenv("SP_DBG_PLANT"))
+          errs() << "plant-left-nosetter " << gv.first.callee << " caller " << gv.first.caller << " line "
+                 << gv.first.line << "\n";
         ++left;
         continue;
       }
+      if (std::getenv("SP_DBG_PLANT"))
+        errs() << "plant-ok " << gv.first.callee << " caller " << gv.first.caller << " line " << gv.first.line
+               << " invoke " << isa<InvokeInst>(CB) << " setters " << chosen.size() << "\n";
       plantReadBack(M, CB, *fb, *witness, chosen);
       ++setters;
       choices += chosen.size();
@@ -2905,6 +3101,7 @@ int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, cons
     ws.push_back({w.seq, w.phi});
     client.keyedIn.push_back(w.keyed);
     client.retsIn.push_back(clientRets(w));
+    client.guardFactsIn.push_back(w.guardFacts);
     client.sinkNamed.insert(w.sinkNamed.begin(), w.sinkNamed.end());
   }
   auto bound = [](const char *name, unsigned dflt) {
@@ -3036,8 +3233,8 @@ int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, cons
   // A named lookup is set on its object before the read. A parser result
   // stays the call. Neither comparison is assumed.
   if (!witnesses.empty()) {
-    plantReturns(*down2, up2.get(), witnesses[0].rets);
-    plantReturns(*up2, down2.get(), witnesses[0].rets);
+    plantReturns(*down2, up2.get(), allWitnessRets(witnesses));
+    plantReturns(*up2, down2.get(), allWitnessRets(witnesses));
   }
   Module ch("client", ctx);
   client.emit(plan, ch);
@@ -3058,7 +3255,15 @@ int mustSide(const fs::path &dir, const fs::path &outDir, LLVMContext &ctx, cons
   closeLibrary(ch, dir);
   markStInstallers(ch, plan.stInstallers);
   if (!witnesses.empty())
-    plantExternal(ch, witnesses[0].rets);
+    plantExternal(ch, allWitnessRets(witnesses));
+  // 정의 R, second pass. The slice pass (above) plants a lookup's read-back
+  // only where it holds the caller as a definition. A lookup reached by virtual
+  // dispatch (an ImageInput plugin's open, say) is a declaration in the slice;
+  // closeLibrary links its body only now. Re-run over the whole linked client
+  // so every obligation site the sink path constrains is covered; sites already
+  // wrapped by the slice pass are skipped.
+  if (!witnesses.empty())
+    plantReturns(ch, nullptr, allWitnessRets(witnesses));
   if (verifyModule(ch, &errs()))
     return 1;
   int r2 = finish(ch, ctx, outDir, "client", file, line);
@@ -3307,8 +3512,8 @@ int main(int argc, char **argv) {
   int rc = 0;
   if (model.exportFn()) {
   if (!witnesses.empty()) {
-    plantReturns(*down, up.get(), witnesses[0].rets);
-    plantReturns(*up, down.get(), witnesses[0].rets);
+    plantReturns(*down, up.get(), allWitnessRets(witnesses));
+    plantReturns(*up, down.get(), allWitnessRets(witnesses));
   }
   Module harness("harness", ctx);
   model.emit(harness);
@@ -3323,9 +3528,14 @@ int main(int argc, char **argv) {
     return 1;
   }
   if (!witnesses.empty())
-    plantExternal(harness, witnesses[0].rets);
+    plantExternal(harness, allWitnessRets(witnesses));
   // Same closing as the client: installed-image data and native residue.
   closeLibrary(harness, dir);
+  // 정의 R, second pass (see the client build): plant the read-back of a lookup
+  // whose caller the slice held only as a declaration and closeLibrary has now
+  // defined (e.g. a virtually dispatched plugin open). Wrapped sites are skipped.
+  if (!witnesses.empty())
+    plantReturns(harness, nullptr, allWitnessRets(witnesses));
   if (verifyModule(harness, &errs()))
     return 1;
   rc = finish(harness, ctx, outDir, "run", file, line);
