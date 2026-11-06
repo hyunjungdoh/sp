@@ -1224,6 +1224,29 @@ static uint64_t branchCmpConst(const ref<Expr> &cond) {
   return 0;
 }
 
+bool Executor::configForkWithinBound(ExecutionState &current, bool dir,
+                                     const ref<Expr> &condition) {
+  // The bound a flip has (DESIGN-D §6: one path flips the same branch
+  // instruction in the same direction at most K_f times, --concolic-flip-
+  // bound), applied to configuration forks. The first time a path meets a
+  // configuration branch both sides are points of C. The K_f-th+ time it
+  // meets the same branch in the same direction on the same constant it is
+  // a loop re-testing a bound derived from the configuration (a byte loop
+  // over a symbolic strip size); forking there once per iteration adds a
+  // pending state of the parent's generation and best order on every
+  // iteration -- a supply that never ends, and every state behind it in the
+  // order (the lineage inside the decoder among them) is never selected.
+  // Past the bound the branch is an ordinary one: the seeds' side, or the
+  // solver's, with a flip of the next generation if any.
+  unsigned &k = current.flips[{current.prevPC, dir, branchCmpConst(condition)}];
+  if (k >= ConcolicFlipBound) {
+    ++ledger.configBounded;
+    return false;
+  }
+  ++k;
+  return true;
+}
+
 Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
                                    bool isInternal, BranchType reason) {
   Solver::Validity res;
@@ -1265,7 +1288,8 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
       else
         res = decided ? Solver::True : Solver::False;
     } else if (ConcolicDataConcrete && !isInternal && !atSink &&
-               !dataOnly(condition)) {
+               !dataOnly(condition) &&
+               configForkWithinBound(current, decided == 1, condition)) {
       ++ledger.configForks;
       configFork = true;
       res = Solver::Unknown; // explore C; do not collapse to one alternative
@@ -1294,8 +1318,10 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
   } else if (ConcolicDataConcrete && Concolic && isSeeding && !isInternal &&
              !(statsTracker && userSearcherRequiresSink() &&
                sinkDistance(current) == 0) &&
-             !isa<ConstantExpr>(condition) && !dataOnly(condition)) {
+             !isa<ConstantExpr>(condition) && !dataOnly(condition) &&
+             configForkWithinBound(current, false, condition)) {
     // Config branch the seeds do not evaluate: skip the solver and fork.
+    // Past the bound it is an ordinary branch the solver decides below.
     ++ledger.configForks;
     configFork = true;
     res = Solver::Unknown;
@@ -2074,6 +2100,17 @@ void Executor::concolicAccount(ExecutionState &state,
     ++ledger.open[fate.substr(5)];
   else
     ++ledger.fates[fate];
+  // DIAG (temporary): account for the states that leave in the strip path.
+  if (!state.stack.empty()) {
+    llvm::StringRef fn = state.stack.back().kf->function->getName();
+    if (fn.contains("EncodedStrip") || fn.contains("FillStrip") ||
+        fn.contains("StartStrip") || fn.contains("JPEGPreDecode") ||
+        fn.contains("JPEGDecode"))
+      klee_message("DIAG fate=%s reason=%d at %s in %s (gen %u, pending %d)",
+                   fate.c_str(), (int)reason,
+                   state.pc->getSourceLocation().c_str(), fn.str().c_str(),
+                   state.gen, (int)state.pendingSeed);
+  }
 }
 
 void Executor::writeLedger(bool exhausted) {
@@ -2101,7 +2138,9 @@ void Executor::writeLedger(bool exhausted) {
      << "gates " << ledger.gates << "\n"
      << "data-concrete " << ledger.dataConcrete << "\n"
      << "config-forks " << ledger.configForks << "\n"
-     << "config-kept " << ledger.configKept << "\n";
+     << "config-kept " << ledger.configKept << "\n"
+     << "config-bounded " << ledger.configBounded << "\n"
+     << "progress-kept " << ledger.progressKept << "\n";
   for (auto &kv : ledger.fates)
     *f << "fate:" << kv.first << " " << kv.second << "\n";
 }
@@ -2156,27 +2195,53 @@ ExecutionState *Executor::selectConcolic() {
     return running;
   running = nullptr;
   runningSince = stats::instructions;
-  std::tuple<unsigned, unsigned, uint64_t, std::uint32_t> best{
-      ~0U, ~0U, ~0ULL, ~0U};
+  // Prefer a still-seeded state over a pending flip at the same
+  // (gen, hunt), before comparing sinkOrder. keepConfigGeneration parks
+  // every configuration alternative at the parent's generation (paper: C
+  // is first-class), but a large make/API surface then floods gen 0 with
+  // pending peers; some of those get a better T_W than the corpus
+  // continuation still mid-make, so ranking by g alone starves the seed
+  // (CVE-2020-6851: track_decode never entered under witsched+, while the
+  // same seed hits t1.c in <60s on xfixed/dataeager where pending config
+  // flips stayed at gen+1). Seeded-before-pending restores that
+  // continuation without demoting config flips to a later generation:
+  // once the seed lineage finishes, pending C peers still compete on T_W.
+  std::tuple<unsigned, unsigned, unsigned, uint64_t, std::uint32_t> best{
+      ~0U, ~0U, ~0U, ~0ULL, ~0U};
   size_t pending = 0;
+  static unsigned diagSel = 0; // DIAG (temporary)
+  ++diagSel;
   for (ExecutionState *s : states) {
     pending += s->pendingSeed;
     auto [gen, hunt, g] = orderKey(*s);
-    std::tuple<unsigned, unsigned, uint64_t, std::uint32_t> k{
-        gen, hunt, g, s->getID()};
+    std::tuple<unsigned, unsigned, unsigned, uint64_t, std::uint32_t> k{
+        gen, hunt, s->pendingSeed ? 1u : 0u, g, s->getID()};
     if (!running || k < best) {
       best = k;
       running = s;
     }
+    if ((diagSel % 500) == 0 && !s->stack.empty() &&
+        s->stack.back().kf->function->getName().contains("huff"))
+      klee_message("DIAG deep state id %u key {%u,%u,%" PRIu64 "} pending %d "
+                   "depth %zu at %s", s->getID(), gen, hunt, g,
+                   (int)s->pendingSeed, s->stack.size(),
+                   s->pc->getSourceLocation().c_str());
+  }
+  if ((diagSel % 500) == 0 && running) {
+    auto [bgen, bhunt, bg] = orderKey(*running);
+    klee_message("DIAG selected id %u key {%u,%u,%" PRIu64 "} pending %d "
+                 "depth %zu at %s in %s",
+                 running->getID(), bgen, bhunt, bg,
+                 (int)running->pendingSeed, running->stack.size(),
+                 running->pc->getSourceLocation().c_str(),
+                 running->stack.back().kf->function->getName().str().c_str());
   }
   // A deferred input is a state of the same order kept outside memory: it
   // runs when its key is the least and there is room for it. Room is in the
   // quantity prunePending bounds, the pending states; seeded states are not
   // bounded by it, so counting them would leave no room ever.
   if (!deferred.empty() && pending < ConcolicPending &&
-      (!running || deferred.front().key < std::make_tuple(std::get<0>(best),
-                                                          std::get<1>(best),
-                                                          std::get<2>(best))))
+      (!running || deferred.front().key < orderKey(*running)))
     running = nullptr;
   return running;
 }
@@ -2193,16 +2258,38 @@ void Executor::makePending(ExecutionState &state,
 
 void Executor::keepConfigGeneration(ExecutionState &pending,
                                     unsigned parentGen) {
-  // The generalization of the Π_I gate rule (spawnGateFlips) to every
-  // configuration fork the engine classifies: a harness choice is a sibling
-  // seed path, ordered by sinkOrder among the parent's peers, not a deeper
-  // generation. orderKey reads gen first, so this alone moves the flip
-  // ahead of every payload flip and every later generation; T_W (witness
-  // distance) then decides among the configurations of one generation.
-  if (pending.gen != parentGen) {
-    pending.gen = parentGen;
-    ++ledger.configKept;
-  }
+  // Intentionally a no-op for ordinary configuration forks.
+  //
+  // keepConfigGeneration was introduced as a generalization of the Π_I gate
+  // rule (spawnGateFlips, which still assigns gs->gen = state.gen itself):
+  // park every !dataOnly pending flip at the parent's generation so C is
+  // first-class under orderKey. That over-generalizes a sparse, analysis-
+  // directed gate into every configuration site. On a large make/API or
+  // library surface it floods gen 0 with pending peers, prunePending then
+  // respawns them as new seeded inputs, and the corpus continuation that
+  // still holds the DS seed is starved (CVE-2020-6851: same seed hits
+  // t1.c under xfixed/dataeager without this keep; witsched+ never enters
+  // openjpeg). Π_I gates keep their generation at the spawn site; ordinary
+  // config flips stay at makePending's gen+1 and run after the seed
+  // lineage of the current generation. configForkWithinBound remains the
+  // bound that stops loop-carried config treadmills (CVE-2020-35538).
+  (void)pending;
+  (void)parentGen;
+}
+
+void Executor::keepProgressGeneration(ExecutionState *side, unsigned parentGen,
+                                      uint64_t parentOrder) {
+  // Only a pending flip is ranked by gen; a side that already kept the
+  // parent's generation (config fork, gate) needs nothing.
+  if (!side || !side->pendingSeed || side->gen == parentGen)
+    return;
+  // sinkOrder 0 is "no sink information / unreachable" (orderKey maps it to
+  // the worst key), never progress.
+  uint64_t g = sinkOrder(*side);
+  if (!g || !parentOrder || g >= parentOrder)
+    return;
+  side->gen = parentGen;
+  ++ledger.progressKept;
 }
 
 bool Executor::dropUnreachable(ExecutionState *state) {
@@ -2210,6 +2297,11 @@ bool Executor::dropUnreachable(ExecutionState *state) {
       sinkDistance(*state) != 0)
     return false;
   state->fate = "unreachable";
+  klee_message("concolic: unreachable at %s in %s (gen %u, pending %d, "
+               "stInstalled %d)",
+               state->pc->getSourceLocation().c_str(),
+               state->stack.back().kf->function->getName().str().c_str(),
+               state->gen, (int)state->pendingSeed, (int)state->stInstalled);
   terminateStateEarlyAlgorithm(*state, "concolic: cannot reach sink",
                                StateTerminationType::Replay);
   return true;
@@ -3334,7 +3426,20 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       ref<Expr> cond = eval(ki, 0, state).value;
 
       cond = optimizer.optimizeExpr(cond, false);
+      // The generation at the branch, read before fork advances the side
+      // that becomes pending (keepProgressGeneration).
+      const unsigned parentGen = state.gen;
       Executor::StatePair branches = fork(state, cond, false, BranchType::Conditional);
+      // The parent's sink order at the branch. Both sides still stand on the
+      // branch instruction here with the parent's stack, so either side
+      // yields it; read it only when a side actually became pending (most
+      // branches are concrete, and sinkOrder per branch would cost
+      // throughput that the seed budget pays for).
+      uint64_t parentOrder = 0;
+      if (Concolic && branches.first && branches.second &&
+          ((branches.first->pendingSeed && branches.first->gen != parentGen) ||
+           (branches.second->pendingSeed && branches.second->gen != parentGen)))
+        parentOrder = sinkOrder(*branches.first);
 
       // NOTE: There is a hidden dependency here, markBranchVisited
       // requires that we still be in the context of the branch
@@ -3348,6 +3453,10 @@ void Executor::executeInstruction(ExecutionState &state, KInstruction *ki) {
       if (branches.second)
         transferToBasicBlock(bi->getSuccessor(1), bi->getParent(), *branches.second);
       if (Concolic) {
+        // Judged after the transfer: each side's pc is now its own
+        // successor, so sinkOrder tells which side moved toward the sink.
+        keepProgressGeneration(branches.first, parentGen, parentOrder);
+        keepProgressGeneration(branches.second, parentGen, parentOrder);
         // Π_I gate: the false side keeps scanning the dispatch table, so from
         // it assert the key that installs a sink-reaching handler directly --
         // whether or not the seed matched an earlier entry and returned. Done

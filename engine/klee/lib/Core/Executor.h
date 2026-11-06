@@ -481,6 +481,11 @@ private:
                                // forked instead of collapsed to one seed value
     uint64_t configKept = 0;   // pending flips of a config fork that kept the
                                // parent's generation (keepConfigGeneration)
+    uint64_t configBounded = 0; // configuration branches met past the flip
+                                // bound on one path (configForkWithinBound)
+    uint64_t progressKept = 0; // pending flips whose side measurably advances
+                               // toward the sink and so kept the parent's
+                               // generation (keepProgressGeneration)
     std::map<std::string, uint64_t> fates, open;
   } ledger;
   void concolicAccount(ExecutionState &state, StateTerminationType reason);
@@ -492,8 +497,7 @@ private:
   /// (advanceCheckpoint); decisions before floor are not flipped again.
   /// Nothing is discarded for lack of memory.
   struct Deferred {
-    // orderKey: {gen, pending, hunt, sinkOrder}
-    std::tuple<unsigned, unsigned, unsigned, uint64_t> key;
+    std::tuple<unsigned, unsigned, uint64_t> key; // orderKey of the deferred state
     unsigned floor;
     std::vector<KTest *> inputs; // the state's seeds, re-run together
     std::set<std::string> fixed;
@@ -561,8 +565,7 @@ private:
   /// gate is not starved by siblings still approaching T_st; then its sink
   /// order g (sinkOrder, or 1 without a sink guide; unreachable sorts last).
   /// Selection takes the least key, deferral the greatest.
-  std::tuple<unsigned, unsigned, unsigned, uint64_t>
-  orderKey(ExecutionState &state);
+  std::tuple<unsigned, unsigned, uint64_t> orderKey(ExecutionState &state);
 
   /// Concolic mode. The input-carrying state now running: it runs for a
   /// quantum of --batch-instructions, or until it ends, is deferred, or loses
@@ -592,6 +595,29 @@ private:
   /// still advance the generation. Call after makePending with the
   /// generation the parent had before it.
   void keepConfigGeneration(ExecutionState &pending, unsigned parentGen);
+
+  /// Concolic mode (--concolic-data-concrete). Whether a configuration
+  /// branch may fork both sides here: the flip bound (--concolic-flip-bound,
+  /// K_f per branch instruction, direction and compared constant along one
+  /// path) applied to configuration forks, so a loop re-testing a
+  /// configuration-derived bound does not add a kept pending state per
+  /// iteration. Counts the path's use of the bound when it returns true.
+  bool configForkWithinBound(ExecutionState &current, bool dir,
+                             const ref<Expr> &condition);
+
+  /// Concolic mode. The generalization of keepConfigGeneration and the gate
+  /// rule to measured progress: a pending flip whose side is strictly closer
+  /// to the sink (sinkOrder) than the branch it split from is progress along
+  /// the witness, not a deeper generation, so it keeps the parent's
+  /// generation. Otherwise orderKey (gen first) ranks it behind every state
+  /// of the shallower generation however far those are from the sink, and
+  /// prunePending defers it first; a lineage that must advance several
+  /// generations to pass the decoder's checks then starves behind siblings
+  /// that churn in the shallower one. Call after the sides' pcs have been
+  /// transferred to their successors (sinkOrder reads state.pc), with the
+  /// generation and sinkOrder the parent had at the branch.
+  void keepProgressGeneration(ExecutionState *side, unsigned parentGen,
+                              uint64_t parentOrder);
 
   /// Concolic mode. Keep at most --concolic-pending flips in memory; the
   /// greatest keys are deferred first.

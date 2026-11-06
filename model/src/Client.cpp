@@ -6405,7 +6405,9 @@ struct Builder {
     // shared input; the rest is zero. Still one client file, not a new
     // symbolic domain.
     Value *p = B.CreateCall(mallocF, {B.getInt64(size)});
-    B.CreateCall(memcpyF, {p, data, B.getInt64(n)});
+    // p holds only `size` bytes; when n exceeds the 64 KiB cap, copy the
+    // prefix that fits rather than all n.
+    B.CreateCall(memcpyF, {p, data, B.getInt64(std::min<uint64_t>(n, size))});
     if (size > n)
       B.CreateMemSet(B.CreateGEP(B.getInt8Ty(), p, B.getInt64(n)), B.getInt8(0), B.getInt64(size - n),
                      MaybeAlign(1));
