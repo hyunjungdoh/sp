@@ -27,6 +27,8 @@ Candidate configurations are then replayed with the same fixed \(X\) to confirm 
 For memory-corruption bugs, confirmation requires an AddressSanitizer report of the same error class as the upstream PoC on an execution that reaches \(f_v\).
 For denial-of-service bugs, confirmation requires a hang or abort that matches the upstream PoC failure mode.
 
+
+
 \PP{Dataset}
 We use two complementary datasets.
 For \textbf{RQ1}, which asks whether \sys can reassess pairs that prior supply-chain analysis left as reachable but untriggered, we reuse the 13 ChainFuzz~\cite{deng2025chainfuzz} pairs in which replaying the upstream PoC through the downstream program reaches the vulnerable function but does not trigger the sink.
@@ -36,9 +38,9 @@ That corpus alone is insufficient for \textbf{RQ2}, which compares \sys with inp
 The ChainFuzz pairs are already filtered as reachable-but-untriggered under PoC transfer, so they do not show how the tools behave on independently collected cases.
 We therefore build a second dataset with no overlapping CVE identifiers.
 We start from seven widely used C/C++ libraries (OpenSSL, libxslt, libheif, Jasper, FFmpeg, libpng, and zlib).
-From NVD feeds covering 1~January~2024 through 3~November~2026, we collect 260 CVEs associated with these libraries and retain 11 that provide a public trigger artifact, are reproducible on an affected upstream version, and have an identifiable vulnerable operation from the advisory and fix.
+From NVD feeds covering January~2024 through November~2026, we collect 260 CVEs associated with these libraries and retain 11 that provide a public trigger artifact, are reproducible on an affected upstream version, and have an identifiable vulnerable operation from the advisory and fix.
 For each retained CVE, we identify dependent downstream programs, build them against the affected upstream version, and select a realistic public entry point for PoC replay.
-To avoid evaluating pairs that are statically unreachable, we mark the sink basic block as an AFLGo~\cite{chen2017directed} \texttt{BBtargets} entry and keep a pair only when AFLGo's distance analysis reports a finite path from the downstream entry to that sink over call and control-flow edges.
+To avoid evaluating pairs that are statically unreachable, we mark the sink basic block as an AFLGo~\cite{bohme2017aflgo} \texttt{BBtargets} entry and keep a pair only when AFLGo's distance analysis reports a finite path from the downstream entry to that sink over call and control-flow edges.
 This filter yields 25 (CVE, downstream) pairs covering the 11 CVEs, 7 upstream libraries, and 10 downstream programs in \autoref{tab:exploitability-comparison}, including both memory-corruption and denial-of-service vulnerabilities.
 
 \PP{Baselines}
@@ -48,25 +50,29 @@ Both baselines search for triggering inputs, whereas \sys recovers the downstrea
 ChainFuzz focuses on software supply chains.
 It replays the upstream PoC through the downstream program, seeds fuzzing with the PoC and a valid downstream input, and, when replay does not trigger the sink, applies cross-layer differential directed fuzzing and bottom-up PoC generation.
 
-TrigFuzz uses a pre-trained LLM (\eg, GPT-5~\cite{openai2025introducing}) to propose triggering conditions from the vulnerable source and bug report, then guides directed greybox fuzzing with those conditions.
-Triggering an upstream bug through a downstream program typically requires reaching both the downstream call into the library and the advisory sink inside it.
-To test whether retargeting directed fuzzing alone suffices, we keep TrigFuzz fixed in program, seeds, arguments, and budget, and vary only the directed target.
-\emph{TrigFuzz-Up} aims at the upstream vulnerable site, and \emph{TrigFuzz-Down} aims at the downstream call site into the library.
-The Up/Down split therefore compares two target placements of the same fuzzer, not two different tools.
+TrigFuzz combines an LLM-proposed trigger-condition unit~(TCU) with directed greybox fuzzing~\cite{chen2026trigfuzz}.
+The LLM reads the vulnerable source and bug report and emits conditions that the TCU monitors at the advisory sink.
+Directed search, based on AFLGo-style distances~\cite{bohme2017aflgo}, steers inputs toward a chosen basic-block target.
+Triggering an upstream bug through a downstream program typically requires both reaching a downstream call into the library and satisfying the sink conditions inside it.
+We therefore keep TrigFuzz fixed in program, seeds, arguments, budget, and TCU, and vary only the directed target.
+\emph{TrigFuzz-Down} directs search to the downstream call site into the upstream library, while the TCU still checks the sink conditions.
+\emph{TrigFuzz-Up} directs search to the advisory sink itself, with the same TCU.
+The Up and Down split thus compares two placements of the distance target for one fuzzer, not two different tools.
 
 \PP{Environment}
 All experiments ran on a machine with an AMD Ryzen Threadripper PRO 7965WX (24 cores, 48 threads) and 377\,GB RAM under Ubuntu 22.04.5 LTS.
 
+
 \subsection{Exploitability Assessment (RQ1)}
 \label{subsec:rq1}
 
-RQ1 asks whether pairs that prior supply-chain analysis left as reachable but untriggered become exploitable once the downstream configuration context is recovered.
-We reuse ChainFuzz's three outcome labels~\cite{deng2025chainfuzz} and instantiate them for \sys as follows.
+Q1 asks whether pairs that prior supply-chain analysis left as reachable but untriggered become exploitable once the downstream configuration context is recovered.
+We reuse ChainFuzz's three outcome labels~\cite{deng2025chainfuzz} and define them for \sys as follows:
 \begin{itemize}
     \setlength\itemsep{0.2em}
-    \item \textbf{unreachable.} P1 finds no constructible client of the downstream public API that can reach the vulnerable function~$f_v$.
-    \item \textbf{reachable.} Some client reaches~$f_v$, but no recovered configuration confirms a trigger of the fixed upstream PoC~$X$ within the exploration budget.
-    \item \textbf{exploitable.} A recovered configuration makes that same~$X$ trigger the sink through the downstream interface.
+    \item \textbf{unreachable:} P1 finds no constructible client of the downstream public API that can reach the vulnerable function~$f_v$.
+    \item \textbf{reachable:} some client reaches~$f_v$, but no recovered configuration confirms a trigger of the fixed upstream PoC~$X$ within the exploration budget.
+    \item \textbf{exploitable:} a recovered configuration makes that same~$X$ trigger the sink through the downstream interface.
 \end{itemize}
 Reaching~$f_v$ alone is not a trigger.
 For each pair, \sys recovers configuration contexts, emits a client harness that installs them while keeping~$X$ fixed, and explores the setup choices under \S\ref{subsec:eval-setup}.
@@ -76,21 +82,21 @@ A candidate is confirmed only by AddressSanitizer replay of the same~$X$ with th
 ChainFuzz labels all 13 of its pairs reachable, and leaves CVE-2023-1729 reachable until a downstream option is enabled by hand.
 \sys reports 7 exploitable, 6 reachable, and 1 unreachable.
 
-\PP{Exploitable.}
+\PP{Exploitable}
 The 7 exploitable pairs answer RQ1 directly.
 Prior work could reach~$f_v$ without triggering, and \sys triggers with the original PoC after installing a missing downstream setting or API setup, such as an OpenImageIO option, a MuPDF or libheif decode entry, or a libtiff JPEG color path.
 No new crashing input is required.
 Each label rests on a recovered configuration and an ASan-confirmed manifestation, so the reclassification is evidence-backed rather than optimistic.
 RQ4 examines how those configurations are recovered.
 
-\PP{Unreachable.}
+\PP{Unreachable}
 CVE-2019-7317 is the only unreachable pair.
 ChainFuzz could reach the vulnerable function without triggering it, so it labeled the pair reachable.
-\sys finds no constructible client execution path from a public libgd entry to the FreeType sink, so it labels the pair unreachable.
-Under \sys's criterion, reachability requires a public client that can be built to~$f_v$.
-That path is missing here, and neither tool confirms an exploit.
+In contrast, \sys finds no constructible execution path from a public libgd entry to the FreeType sink under its client model, and thus labels the pair unreachable. 
+Under this model, a pair is reachable only if a client using public APIs can be constructed to reach $f_v$.
+No such path exists here, and neither tool confirms an exploit.
 
-\PP{Reachable.}
+\PP{Reachable}
 The remaining six pairs stay reachable.
 Exploration reaches~$f_v$ or a nearby site, yet no recovered configuration confirms a trigger for the fixed~$X$ within the budget.
 \sys therefore keeps ChainFuzz's reachable verdict.
@@ -103,7 +109,7 @@ RQ1 thus shows that configuration recovery can turn ChainFuzz-reachable pairs in
 
 \begin{table*}[t]
 \centering
-\caption{Per-pair comparison of ChainFuzz and \sys on the 14 pairs.}
+\caption{Comparison of ChainFuzz and \sys on the 14 pairs.}
 \label{tab:chainfuzz-comparison}
 \footnotesize
 \setlength{\tabcolsep}{5pt}
@@ -130,7 +136,7 @@ LibRaw
 & Heap Buffer Overflow
 & OpenImageIO
 & reachable$^{\dag}$
-& \textbf{exploitable} \\
+& \textcolor{tomato}{\textbf{exploitable}} \\
 
 libpng
 & 1.6.37
@@ -154,7 +160,7 @@ FreeType
 & Heap Buffer Overflow
 & MuPDF
 & reachable
-& \textbf{exploitable} \\
+& \textcolor{tomato}{\textbf{exploitable}} \\
 
 OpenJPEG
 & 2.3.1
@@ -162,7 +168,7 @@ OpenJPEG
 & Heap Buffer Overflow
 & MuPDF/libheif
 & reachable
-& \textbf{exploitable}  \\
+& \textcolor{tomato}{\textbf{exploitable}}  \\
 
 libde265
 & 1.0.10
@@ -170,7 +176,7 @@ libde265
 & Null Pointer Dereference
 & libheif
 & reachable
-& \textbf{exploitable} \\
+& \textcolor{tomato}{\textbf{exploitable}} \\
 
 libde265
 & 1.0.10
@@ -178,7 +184,7 @@ libde265
 & Null Pointer Dereference
 & libheif
 & reachable
-& \textbf{exploitable} \\
+& \textcolor{tomato}{\textbf{exploitable}} \\
 
 libde265
 & 1.0.10
@@ -186,7 +192,7 @@ libde265
 & Null Pointer Dereference
 & libheif
 & reachable
-& \textbf{exploitable} \\
+& \textcolor{tomato}{\textbf{exploitable}} \\
 
 libde265
 & 1.0.10
@@ -210,7 +216,7 @@ libjpeg
 & Null Pointer Dereference
 & libtiff
 & reachable
-& \textbf{exploitable} \\
+& \textcolor{tomato}{\textbf{exploitable}} \\
 
 libtiff
 & b51bb157
@@ -247,279 +253,388 @@ $^{\dag}$Later labeled exploitable by the ChainFuzz authors only after they manu
 \end{table*}
 
 
-\subsection{Effectiveness of \sys (RQ2)}
-~\autoref{tab:exploitability-comparison}
-memory 취약점 외 탐지 여부도 확인하기 위해 평가셋에 DoS 등 추가, 관련 취약점들은 crash로 판단하기 어려워 abort/hang으로 replay 확인
-x가 진짜 x인 걸 찾아내는데 이걸 정확도..?로 표기..?
+\subsection{Comparative Effectiveness (RQ2)}
+\label{subsec:rq2}
+We run ChainFuzz, TrigFuzz-Up, TrigFuzz-Down, and \sys on the $25$ reachability-selected pairs (\autoref{subsec:eval-setup}) under the same 24-hour budget.
+Each fuzzing campaign uses $1$ core and is repeated $10$ times per tool per pair.
+A pair counts as triggered only when replay under the recovered or fuzzed setup matches the confirmation rule in \S\ref{subsec:eval-setup}.
+Memory-corruption bugs require an AddressSanitizer report of the same error class on an execution that reaches~$f_v$.
+Denial-of-service bugs require a hang or abort that matches the upstream PoC failure mode.
+\autoref{tab:exploitability-comparison} lists every pair.
+Where ChainFuzz already triggers a pair, we mark TrigFuzz as not evaluated~({--}) and spend the remaining budget on unresolved pairs.
 
-\begin{table*}[t]
-\centering
-\caption{Comparison of downstream vulnerability exploitability.}
-\label{tab:exploitability-comparison}
-\scriptsize
-\setlength{\tabcolsep}{4pt}
-\renewcommand{\arraystretch}{1.12}
+\PP{Trigger rates.}
+On the full set of $25$ pairs, \sys triggers $9$~($36\%$), ChainFuzz triggers $4$~($16\%$), TrigFuzz-Down triggers $1$~($4\%$), and TrigFuzz-Up triggers none.
+The four ChainFuzz successes are a strict subset of the nine \sys successes, so \sys triggers $2.25\times$ as many pairs as ChainFuzz.
+The single TrigFuzz-Down success (CVE-2024-55549 through WebKitGTK) is also in that subset.
+All reported findings are confirmed under the rule above before they are counted.
 
-\resizebox{\textwidth}{!}{%
-\begin{tabular}{llll||c|c|c|c}
-\hline
-\textbf{Upstream}
-& \textbf{CVE}
-& \textbf{Type}
-& \textbf{Downstream}
-& \textbf{ChainFuzz}
-& \textbf{TrigFuzz-up}
-& \textbf{TrigFuzz-down}
-& \textbf{\sys} \\
-\hline\hline
+\PP{Why \sys succeeds where baselines fail.}
+The four pairs triggered by ChainFuzz share a direct mapping between the upstream PoC and a standard downstream entry point, such as a file argument or a public parse API.
+Binary-and-file fuzzing is then enough, and no additional configuration context is required.
+TrigFuzz-Down's one success falls in the same class.
+It reaches the downstream call into libxslt and satisfies the TCU at the advisory sink, without needing a recovered option or network peer.
+The five \sys-only pairs each need a downstream configuration context that the upstream PoC does not install.
+CVE-2025-8836 requires the GraphicsMagick encoder option \texttt{-define jp2:cblkwidth=0}, which the upstream Jasper PoC never sets.
+CVE-2026-107695 and CVE-2026-107696 expose the vulnerable FFmpeg path only through an M3U8 playlist or an RTSP redirect peer in ffms2 and mpv, neither of which appears in the upstream PoC.
+\sys recovers these contexts under the fixed PoC, and \autoref{tab:sys-binding} groups all nine triggered pairs by the form of the recovered binding.
 
-ffmpeg
-& CVE-2026-107696
-& DoS
-& ffms2
-& \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{red}{\cmark} \\
+\PP{Directed fuzzing cannot substitute for context recovery.}
+TrigFuzz-Up directs search to the upstream advisory sink and TrigFuzz-Down directs search to the downstream call site into the library, with the same TCU in both variants.
+TrigFuzz-Down's success on CVE-2024-55549 shows that aiming at the downstream call site can help when a standard entry already exposes the sink.
+It does not help on the five \sys-only pairs.
+On those pairs, more than $140$ independent 24-hour runs of ChainFuzz and TrigFuzz still produce no confirmed sink trigger.
+Average edge coverage ranges from $7.6\%$ to $25.6\%$ for ChainFuzz and from $6.8\%$ to $24.8\%$ for TrigFuzz, and coverage plateaus within the first few hours in most campaigns.
+Insufficient exploration time is therefore unlikely to be the cause.
+TrigFuzz-Up and TrigFuzz-Down also reach nearly the same coverage on every pair (maximum difference $0.5$ percentage points).
+The bottleneck on the \sys-only pairs is the missing downstream configuration context, not the choice of directed target.
 
-ffmpeg
-& CVE-2026-107696
-& DoS
-& mpv
-& \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{red}{\cmark} \\
-
-ffmpeg
-& CVE-2026-107695
-& DoS
-& ffms2
-& \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{red}{\cmark} \\
-
-ffmpeg
-& CVE-2026-107695
-& DoS
-& mpv
-& \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{red}{\cmark} \\
-
-libpng
-& CVE-2026-34757
-& Use-After-Free
-& GraphicsMagick
-& \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
-
-libpng
-& CVE-2026-34757
-& Use-After-Free
-& ImageMagick
-& \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
-
-libpng
-& CVE-2026-34757
-& Use-After-Free
-& Leptonica
-& \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
-
-libpng
-& CVE-2026-34757
-& Use-After-Free
-& libvips
-& \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
-
-libpng
-& CVE-2026-34757
-& Use-After-Free
-& pngquant
-& \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
-
-libpng
-& CVE-2026-33416
-& Use-After-Free
-& GraphicsMagick
-& \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
-
-libpng
-& CVE-2026-33416
-& Use-After-Free
-& ImageMagick
-& \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
-
-libpng
-& CVE-2026-33416
-& Use-After-Free
-& Leptonica
-& \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
-
-libpng
-& CVE-2026-33416
-& Use-After-Free
-& libvips
-& \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
-
-libpng
-& CVE-2026-33416
-& Use-After-Free
-& pngquant
-& \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
-
-zlib
-& CVE-2026-27171
-& DoS
-& CPython
-& \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
-
-libpng
-& CVE-2025-28164
-& Stack Buffer Overflow
-& GraphicsMagick
-& \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
-
-libpng
-& CVE-2025-28164
-& Stack Buffer Overflow
-& ImageMagick
-& \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
-
-libpng
-& CVE-2025-28164
-& Stack Buffer Overflow
-& Leptonica
-& \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
-
-libpng
-& CVE-2025-28164
-& Stack Buffer Overflow
-& libvips
-& \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
-
-libpng
-& CVE-2025-28164
-& Stack Buffer Overflow
-& pngquant
-& \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
-
-openssl
-& CVE-2025-11187
-& Stack Buffer Overflow
-& curl
-& \textcolor{red}{\cmark} &  &  & \textcolor{red}{\cmark} \\
-
-jasper
-& CVE-2025-8836
-& DoS
-& GraphicsMagick
-& \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{red}{\cmark} \\
-
-gnome/libxslt
-& CVE-2025-7425
-& Use-After-Free
-& WebKitGTK/libxslt
-& \textcolor{red}{\cmark} &  &  & \textcolor{red}{\cmark} \\
-
-libxslt
-& CVE-2024-55549
-& Use-After-Free
-& WebKitGTK
-& \textcolor{red}{\cmark} &  &  & \textcolor{red}{\cmark} \\
-
-libheif
-& CVE-2024-41311
-& Out-Of-Bounds Read/Write
-& libvips
-& \textcolor{red}{\cmark} &  &  & \textcolor{red}{\cmark} \\
-
-\hline
-\end{tabular}%
-}
-
-\vspace{2pt}
-\parbox{\textwidth}{\scriptsize
-\textcolor{red}{\cmark}: successful; \textcolor{black}{\xmark}: unsuccessful (T.O); --: not evaluated.}
-\end{table*}
-
-
-\subsection{Ablation Study (RQ3)}
-
-\subsection{Case Studies}
-\label{subsec:casestudy}
-
-In this section, we discuss two cases in which replaying an upstream PoC through a downstream program reaches the vulnerable function but fails to trigger the sink.
-We present two case studies: Case Study~1 analyzes CVE-2023-1729 in LibRaw through OpenImageIO, where a missing downstream configuration prevents the overflow; Case Study~2 analyzes CVE-2020-35538 in libjpeg through libtiff, where the downstream program does not expose the upstream API sequence and a different public API argument must establish the same trigger state.
-Both cases reflect documented public APIs and show that recovering the configuration context---not merely transferring the PoC---is necessary to assess downstream exploitability.
-
-\PP{Case Study 1: Missing Downstream Configuration}
-CVE-2023-1729 is a heap buffer overflow in LibRaw that is reachable through OpenImageIO.
-Although ChainFuzz reaches the vulnerable code, triggering the overflow requires a configuration that the upstream PoC does not establish through OpenImageIO.
-
-The overflow occurs in \texttt{raw2image.cpp}, where LibRaw copies a full-width row into a buffer that has been reduced when \texttt{IO.shrink} is enabled.
-This flag is derived from \texttt{imgdata.params.half\_size}.
-When OpenImageIO opens a raw image, \texttt{RawInput::open\_raw} obtains this value from the named attribute \texttt{raw:half\_size} in the caller-supplied \texttt{ImageSpec} and writes it into the LibRaw parameter block.
-If the attribute is absent, OpenImageIO uses the default value~0, leaving \texttt{IO.shrink} disabled.
-Consequently, the same PoC reaches the vulnerable code but does not trigger the overflow.
-
-The missing condition is therefore not a control-flow condition but a downstream configuration setting.
-Since the path to the vulnerable operation does not depend on \texttt{half\_size = 1}, reachability analysis alone does not identify this requirement.
-\sys recovers the setting by tracing the value read by \texttt{config.get\_int\_attribute("raw:half\_size", 0)} back to the public setter \texttt{ImageSpec::attribute}.
-
-\autoref{tab:1729-setup} contrasts PoC transfer with the recovered setup.
-PoC transfer opens the image without installing \texttt{raw:half\_size}, so OpenImageIO leaves \texttt{IO.shrink} disabled.
-\sys instead sets the attribute to~1 before the same entry point, enabling the reduced-width buffer that the overflow requires.
-With this setting, the same upstream PoC triggers the overflow through OpenImageIO, and \sys classifies the pair as exploitable.
-
-% \begin{table}[t]
-% \centering
-% \caption{Client setup for CVE-2023-1729: PoC transfer versus the configuration recovered by \sys.}
-% \label{tab:1729-setup}
-% \scriptsize
-% \setlength{\tabcolsep}{3pt}
-% \renewcommand{\arraystretch}{1.15}
-% \begin{tabular}{@{}lp{0.68\columnwidth}@{}}
-% \hline
-% \textbf{Approach}
-% & \textbf{Client setup} \\
-% \hline
-% PoC transfer
-% & \textcolor{gray}{\texttt{ImageSpec::attribute("raw:half\_size", 1)}$^{\dag}$}
-%   \newline$\rightarrow$
-%   \texttt{ImageInput::open(path)}
-%   \newline$\rightarrow$
-%   \textcolor{red}{\underline{\texttt{raw2image} copy}}
-%   \quad\textcolor{gray}{(\texttt{IO.shrink}=0)} \\
-% \hline
-% \sys
-% & \textcolor{blue}{\textbf{\texttt{ImageSpec::attribute("raw:half\_size", 1)}}}
-%   \newline$\rightarrow$
-%   \texttt{ImageInput::open(path, \&spec)}
-%   \newline$\rightarrow$
-%   \textcolor{red}{\underline{\texttt{raw2image} copy}}
-%   \quad(\texttt{IO.shrink}=1) \\
-% \hline
-% \end{tabular}
-
-% \vspace{2pt}
-% \parbox{\linewidth}{\scriptsize
-% $^{\dag}$Absent under PoC transfer; OpenImageIO defaults the attribute to~0.
-% \textcolor{blue}{\textbf{Bold}}: recovered configuration that enables the overflow.
-% \textcolor{red}{\underline{Sink}}: shared fault site.}
-% \end{table}
-
-\PP{Case Study 2: Alternative API Path to the Same Trigger State}
-CVE-2020-35538 is a null-pointer dereference in \texttt{jcopy\_sample\_rows} during merged upsampling.
-The sink is reached when \texttt{merged\_2v\_upsample} passes a NULL output row to \texttt{jcopy\_sample\_rows}.
-Although the upstream PoC triggers this condition through libjpeg's scanline-skipping API, libtiff does not use that API.
-Thus, replaying the PoC through libtiff cannot reproduce the same sequence of calls.
-
-In the upstream PoC, \texttt{jpeg\_skip\_scanlines} advances the decoder without a real output buffer, leaving the next scanline pointer NULL.
-A subsequent call to \texttt{jpeg\_read\_scanlines} processes this NULL row.
-With fancy upsampling disabled, execution enters \texttt{merged\_2v\_upsample} and reaches the vulnerable sink.
-
-\sys instead recovers a different path through libtiff.
-On this path, \texttt{JPEGDecode} forwards the strip buffer supplied to \texttt{TIFFReadEncodedStrip} to \texttt{jpeg\_read\_scanlines} as the output row.
-Passing a NULL buffer therefore establishes the same NULL output row that the upstream PoC creates through \texttt{jpeg\_skip\_scanlines}, without invoking that API.
-Merged upsampling must also be selected, which requires YCbCr input with fancy upsampling disabled; in libtiff this is established through \texttt{TIFFSetField(\ldots, TIFFTAG\_JPEGCOLORMODE, JPEGCOLORMODE\_RGB)}.
-
-\autoref{tab:35538-path} contrasts the two setups in the same format as \autoref{tab:1729-setup}.
-The upstream PoC uses \texttt{jpeg\_skip\_scanlines} to produce a NULL row, whereas the recovered libtiff path obtains the same state from the caller-supplied strip buffer.
-Thus, the two paths differ in how they establish the required state but converge at the same vulnerable operation.
+\PP{Sixteen pairs remain unresolved.}
+The remaining $16$ of $25$ pairs~($64\%$) yield no trigger under any tool within the budget.
+Fifteen of them are the three libpng CVEs (CVE-2026-34757, CVE-2026-33416, CVE-2025-28164) across five downstream clients each, and the last is CVE-2026-27171 in zlib through CPython.
+AFLGo distance analysis still reports a finite static path to the advisory sink in each of these $16$ cases, so the failures are not due to an empty call graph.
+What is missing is a client-visible configuration context that makes the fixed upstream PoC exercise the sink through that particular downstream API.
+Across the fifteen libpng pairs, every downstream exposes a different public entry and option surface, and neither fuzzing nor our recovered contexts establish a setup that reproduces the advisory failure mode within the budget.
+The zlib/CPython pair likewise reaches a statically connected sink but does not reproduce the upstream hang under any tool.
+We therefore leave these $16$ pairs as unresolved rather than as evidence that the sinks are unexploitable through those clients.
 
 \begin{table}[t]
 \centering
-\caption{Client setup for CVE-2020-35538: upstream PoC versus the $D{\to}U$ path recovered by \sys.}
+\caption{Downstream binding recovered by \sys for each of the nine triggered pairs,
+grouped by recovery class.
+\textbf{CF}: whether ChainFuzz also triggers the pair
+(\cmark~yes, \xmark~no).
+All nine are confirmed under the rule in \S\ref{subsec:eval-setup}.}
+\label{tab:sys-binding}
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\renewcommand{\arraystretch}{1.12}
+\begin{tabular}{@{}llll c@{}}
+\hline
+\textbf{Class} & \textbf{CVE} & \textbf{Downstream} & \textbf{Recovered binding} & \textbf{CF} \\
+\hline
+\multirow{4}{*}{\shortstack[l]{Standard\\entry}} 
+ & CVE-2025-11187 & curl           & CLI flag \texttt{--cert-type P12}            & \textcolor{tomato}{\cmark} \\
+ & CVE-2024-55549 & WebKitGTK      & XSLT parse API (\texttt{xsltproc})           & \textcolor{tomato}{\cmark} \\
+ & CVE-2025-7425  & WebKitGTK      & XSLT apply API (\texttt{xsltproc})           & \textcolor{tomato}{\cmark} \\
+ & CVE-2024-41311 & libvips        & HEIF load (\texttt{vips copy})               & \textcolor{tomato}{\cmark} \\
+\hline
+Option gate
+ & CVE-2025-8836  & GraphicsMagick & Encoder option \texttt{-define jp2:cblkwidth=0} & \textcolor{black}{\xmark} \\
+\hline
+\multirow{4}{*}{\shortstack[l]{Network\\entry}}
+ & CVE-2026-107695 & ffms2  & Playlist entry point (M3U8)              & \textcolor{black}{\xmark} \\
+ & CVE-2026-107695 & mpv    & Playlist entry point (M3U8)              & \textcolor{black}{\xmark} \\
+ & CVE-2026-107696 & ffms2  & Network peer harness (RTSP 302 redirect) & \textcolor{black}{\xmark} \\
+ & CVE-2026-107696 & mpv    & Network peer harness (RTSP 302 redirect) & \textcolor{black}{\xmark} \\
+\hline
+\end{tabular}
+\end{table}
+
+
+
+\begin{table*}[t]
+    \centering
+    \caption{Comparison of Downstream Exploitability in Reachable Cases.}
+    \label{tab:exploitability-comparison}
+    \scriptsize
+    \setlength{\tabcolsep}{4pt}
+    \renewcommand{\arraystretch}{1.12}
+    
+    \resizebox{\textwidth}{!}{%
+    \begin{tabular}{llll||c|c|c|c}
+    \hline
+    \textbf{Upstream}
+    & \textbf{CVE}
+    & \textbf{Type}
+    & \textbf{Downstream}
+    & \textbf{ChainFuzz}
+    & \textbf{TrigFuzz-up}
+    & \textbf{TrigFuzz-down}
+    & \textbf{\sys} \\
+    \hline\hline
+    
+    ffmpeg
+    & CVE-2026-107696
+    & DoS
+    & ffms2
+    & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{tomato}{\cmark} \\
+    
+    ffmpeg
+    & CVE-2026-107696
+    & DoS
+    & mpv
+    & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{tomato}{\cmark} \\
+    
+    ffmpeg
+    & CVE-2026-107695
+    & DoS
+    & ffms2
+    & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{tomato}{\cmark} \\
+    
+    ffmpeg
+    & CVE-2026-107695
+    & DoS
+    & mpv
+    & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{tomato}{\cmark} \\
+    
+    libpng
+    & CVE-2026-34757
+    & Use-After-Free
+    & GraphicsMagick
+    & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
+    
+    libpng
+    & CVE-2026-34757
+    & Use-After-Free
+    & ImageMagick
+    & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
+    
+    libpng
+    & CVE-2026-34757
+    & Use-After-Free
+    & Leptonica
+    & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
+    
+    libpng
+    & CVE-2026-34757
+    & Use-After-Free
+    & libvips
+    & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
+    
+    libpng
+    & CVE-2026-34757
+    & Use-After-Free
+    & pngquant
+    & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
+    
+    libpng
+    & CVE-2026-33416
+    & Use-After-Free
+    & GraphicsMagick
+    & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
+    
+    libpng
+    & CVE-2026-33416
+    & Use-After-Free
+    & ImageMagick
+    & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
+    
+    libpng
+    & CVE-2026-33416
+    & Use-After-Free
+    & Leptonica
+    & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
+    
+    libpng
+    & CVE-2026-33416
+    & Use-After-Free
+    & libvips
+    & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
+    
+    libpng
+    & CVE-2026-33416
+    & Use-After-Free
+    & pngquant
+    & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
+    
+    zlib
+    & CVE-2026-27171
+    & DoS
+    & CPython
+    & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
+    
+    libpng
+    & CVE-2025-28164
+    & Stack Buffer Overflow
+    & GraphicsMagick
+    & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
+    
+    libpng
+    & CVE-2025-28164
+    & Stack Buffer Overflow
+    & ImageMagick
+    & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
+    
+    libpng
+    & CVE-2025-28164
+    & Stack Buffer Overflow
+    & Leptonica
+    & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
+    
+    libpng
+    & CVE-2025-28164
+    & Stack Buffer Overflow
+    & libvips
+    & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
+    
+    libpng
+    & CVE-2025-28164
+    & Stack Buffer Overflow
+    & pngquant
+    & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} \\
+    
+    openssl
+    & CVE-2025-11187
+    & Stack Buffer Overflow
+    & curl
+    & \textcolor{tomato}{\cmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{tomato}{\cmark} \\
+    
+    jasper
+    & CVE-2025-8836
+    & DoS
+    & GraphicsMagick
+    & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{black}{\xmark} & \textcolor{tomato}{\cmark} \\
+    
+    gnome
+    & CVE-2025-7425
+    & Use-After-Free
+    & WebKitGTK/libxslt
+    & \textcolor{tomato}{\cmark} & -- & -- & \textcolor{tomato}{\cmark} \\
+    
+    libxslt
+    & CVE-2024-55549
+    & Use-After-Free
+    & WebKitGTK
+    & \textcolor{tomato}{\cmark} & \textcolor{black}{\xmark} & \textcolor{tomato}{\cmark} & \textcolor{tomato}{\cmark} \\
+    
+    libheif
+    & CVE-2024-41311
+    & Out-Of-Bounds Read/Write
+    & libvips
+    & \textcolor{tomato}{\cmark} & -- & -- & \textcolor{tomato}{\cmark} \\
+    
+    \hline
+    \end{tabular}%
+    }
+    
+    \vspace{2pt}
+    \parbox{\textwidth}{\scriptsize
+    \textcolor{tomato}{\cmark}: triggered and confirmed under \S\ref{subsec:eval-setup};
+    \textcolor{black}{\xmark}: not triggered within the 24-hour budget;
+    {--}: TrigFuzz not evaluated.}
+    \end{table*}
+
+
+\subsection{Ablation Study (RQ3)}
+\label{subsec:rq3}
+
+\subsection{Case Studies (RQ4)}
+\label{subsec:rq4}
+
+RQ4 asks how \sys recovers the downstream conditions that PoC transfer leaves unset, and how it validates a trigger under those conditions.
+We study two pairs that ChainFuzz already labeled reachable.
+In both pairs the upstream PoC~$X$ reaches~$f_v$ through the downstream program, yet the sink does not fire until an additional client-side condition is installed.
+The two pairs need different recovery rules, so together they show the full pipeline from \S\ref{subsec:p1}--\S\ref{subsec:p3}.
+
+Each case follows the same logical order.
+Why transfer fails.
+What condition must be established.
+How P1 and P2 recover a public API that establishes it.
+How P3 confirms the trigger with the original~$X$.
+
+\PP{Case Study 1: Configuration-Dependency Recovery}
+CVE-2023-1729 is a heap buffer overflow in LibRaw when OpenImageIO opens a raw image.
+The fault site is the row copy in \texttt{raw2image}.
+LibRaw allocates a reduced-width buffer when \texttt{IO.shrink} is enabled, then still copies a full-width row into it.
+\texttt{IO.shrink} is derived from \texttt{imgdata.params.half\_size}.
+OpenImageIO writes that field inside \texttt{RawInput::open\_raw} by reading the caller attribute \texttt{raw:half\_size} through \texttt{config.get\_int\_attribute("raw:half\_size", 0)}.
+Under PoC transfer the client only opens the file path.
+The attribute is therefore absent, the lookup returns the default~0, \texttt{IO.shrink} stays disabled, and the same~$X$ reaches~$f_v$ without overflowing.
+
+This failure is not a missing path to~$f_v$.
+P1 finds public entries such as \texttt{ImageInput::open} that already reach the copy.
+The overflow condition is also not a branch predicate on that path, so ordinary path-condition recovery does not emit a cell that forces \texttt{half\_size = 1}.
+Moreover, the LibRaw object is stored in OpenImageIO's private \texttt{m\_processor}.
+It is not an argument of the public entry, so the required field is not an entry-relative cell that a client can write directly.
+
+P2 therefore runs configuration-dependency recovery (\S\ref{subsec:p2}).
+Starting from the overflow operands, it walks definitions and field writes backward along the trigger path, restricted to functions reachable from the entry under their calling contexts.
+At \texttt{open\_raw} it observes the lookup \texttt{config.get\_int\_attribute("raw:half\_size", 0)}.
+That call returns an integer, does not write caller-visible memory, and can return its default argument unchanged, so \sys classifies it as a configuration lookup.
+The constant string supplies the setting name, and the matched public setter on the same object is \texttt{ImageSpec::attribute}, which writes the attribute store that the lookup reads.
+The recovered configuration context is therefore the shared open entry together with the named setting \texttt{raw:half\_size}.
+
+P2 compiles that context into a client harness.
+The harness may skip the setter, leaving the OpenImageIO default, or call \texttt{ImageSpec::attribute("raw:half\_size", $v$)} before \texttt{ImageInput::open}.
+Those alternatives are retained as configuration choices.
+P3 then explores them while keeping~$X$ fixed.
+The assignment~$v{=}1$ enables \texttt{IO.shrink}, reproduces the reduced-width buffer, and triggers the overflow.
+AddressSanitizer reports the same error class as the upstream PoC on an execution that reaches~$f_v$, so \sys labels the pair exploitable.
+\autoref{tab:1729-setup} shows the recovered client next to PoC transfer.
+The call sequence is the same.
+Only the recovered setter changes the state that the sink depends on.
+
+\begin{table}[t]
+\centering
+\caption{Client setup for CVE-2023-1729.}
+\label{tab:1729-setup}
+\scriptsize
+\setlength{\tabcolsep}{3pt}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{@{}lp{0.68\columnwidth}@{}}
+\hline
+\textbf{Approach}
+& \textbf{Client setup} \\
+\hline
+PoC transfer
+& \textcolor{gray}{\texttt{ImageSpec::attribute("raw:half\_size", 1)}$^{\dag}$}
+  \newline$\rightarrow$
+  \texttt{ImageInput::open(path)}
+  \newline$\rightarrow$
+  \textcolor{gray}{\texttt{IO.shrink}=0}
+  \newline$\rightarrow$
+  \textcolor{red}{\underline{\texttt{raw2image}}} \\
+\hline
+\sys
+& \textcolor{blue}{\textbf{\texttt{ImageSpec::attribute("raw:half\_size", 1)}}}
+  \newline$\rightarrow$
+  \texttt{ImageInput::open(path, \&spec)}
+  \newline$\rightarrow$
+  \texttt{IO.shrink}=1
+  \newline$\rightarrow$
+  \textcolor{red}{\underline{\texttt{raw2image}}} \\
+\hline
+\end{tabular}
+
+\vspace{2pt}
+\parbox{\linewidth}{\scriptsize
+$^{\dag}$Absent under PoC transfer. OpenImageIO defaults the attribute to~0.
+\textcolor{blue}{\textbf{Bold}} recovered setting.
+\textcolor{gray}{\texttt{IO.shrink}} resulting LibRaw state after open, not a client call.
+\textcolor{red}{\underline{Sink}} shared fault site.}
+\end{table}
+
+\PP{Case Study 2: Entry-Relative Setup on an Alternative Path}
+CVE-2020-35538 is a null-pointer dereference in libjpeg's \texttt{jcopy\_sample\_rows}.
+The sink is reached when \texttt{merged\_2v\_upsample} passes a NULL output row into that copy.
+In the upstream PoC, \texttt{jpeg\_skip\_scanlines} advances the decoder without a real output buffer and leaves the next scanline pointer NULL.
+A later \texttt{jpeg\_read\_scanlines} then consumes that NULL row.
+With fancy upsampling disabled, execution enters \texttt{merged\_2v\_upsample} and hits the sink.
+libtiff does not expose or call \texttt{jpeg\_skip\_scanlines}.
+Replaying~$X$ through libtiff therefore cannot reproduce the upstream call sequence, even when the vulnerable function is reachable.
+
+P1 first builds the cross-boundary call graph and retains public libtiff entries that reach~$f_v$, including \texttt{TIFFReadEncodedStrip}.
+On the path from that entry, \texttt{JPEGDecode} forwards the strip buffer supplied by the caller into \texttt{jpeg\_read\_scanlines} as the output row.
+P1 expresses that buffer as an entry-relative cell of the read entry.
+A NULL value of the cell installs the same NULL output row that the upstream skip API produced, without calling the missing skip function.
+Reachability of the merged-upsampling arm still depends on additional state.
+P1 recovers the predicates that select that arm and attributes the deciding store to the keyed public setter \texttt{TIFFSetField}.
+The recovered key is \texttt{TIFFTAG\_JPEGCOLORMODE} (${=}65538$) with value \texttt{JPEGCOLORMODE\_RGB}, which selects merged upsampling for YCbCr input when fancy upsampling is off.
+The resulting configuration context is therefore an alternative $D{\to}U$ path.
+It uses a public libtiff entry, a keyed color-mode setter, and a NULL strip buffer to rebuild the upstream trigger state.
+
+P2 turns that context into a harness.
+The harness calls \texttt{TIFFSetField} for the recovered tag, then invokes a read entry whose strip-buffer argument is a configuration choice that may be NULL.
+P3 explores those choices under the fixed~$X$.
+The satisfying assignment sets the JPEG color mode, passes a NULL buffer, reaches \texttt{merged\_2v\_upsample}, and triggers \texttt{jcopy\_sample\_rows}.
+AddressSanitizer confirms the same error class at~$f_v$, so \sys labels the pair exploitable.
+\autoref{tab:35538-path} places the recovered client beside the upstream PoC in the same format as \autoref{tab:1729-setup}.
+The two rows diverge in how they install the NULL row and converge again at the shared sink.
+
+\begin{table}[t]
+\centering
+\caption{Client setup for CVE-2020-35538.}
 \label{tab:35538-path}
 \scriptsize
 \setlength{\tabcolsep}{3pt}
@@ -555,23 +670,20 @@ Upstream PoC
 
 \vspace{2pt}
 \parbox{\linewidth}{\scriptsize
-$^{\dag}$Unavailable under $D$; this is where PoC replay fails.
-\textcolor{blue}{\textbf{Bold}}: NULL output row, installed either as a side effect of skip or as the strip-buffer argument.
-\textcolor{red}{\underline{Sink}}: shared fault site.
-$*$: indirect call.}
+$^{\dag}$Unavailable under libtiff. This is where PoC replay fails.
+\textcolor{blue}{\textbf{Bold}} NULL output row.
+\textcolor{red}{\underline{Sink}} shared fault site.
+$*$ indirect call.}
 \end{table}
 
-Using the recovered path, \sys generates a libtiff harness that sets the JPEG color mode and passes a NULL strip buffer.
-Concolic execution confirms that this harness triggers the CVE-2020-35538 sink, and \sys classifies the pair as exploitable.
+The same recovered path also exposed a separate NULL-propagation defect in libtiff.
+\texttt{TIFFReadEncodedStrip} documents that \texttt{buf} may be NULL, and \texttt{JPEGDecode} forwards that pointer to \texttt{jpeg\_read\_scanlines} without a guard.
+An ordinary JPEG strip can therefore fault in \texttt{null\_convert} through \texttt{sep\_upsample}, which is a different sink from \texttt{jcopy\_sample\_rows}.
+We reported this issue to the LibTIFF maintainers.
+It is a side finding of path recovery, not the criterion used to label CVE-2020-35538 exploitable.
 
-The recovered API path also exposed a separate NULL-propagation defect in libtiff's JPEG decoding.
-The \texttt{TIFFReadEncodedStrip} interface documents that \texttt{buf} may be NULL, and \texttt{JPEGDecode} forwards this pointer to \texttt{jpeg\_read\_scanlines} without a guard.
-Even without the skip API or the merged-upsampling condition, an ordinary JPEG strip can therefore trigger a NULL-pointer dereference in \texttt{null\_convert} through \texttt{sep\_upsample}.
-This is a different sink from \texttt{jcopy\_sample\_rows}; a valid JPEG TIFF and a call to \texttt{TIFFReadEncodedStrip(\ldots, NULL, \ldots)} are sufficient to reproduce it.
-We reported this additional issue to the LibTIFF maintainers.
-This finding illustrates that recovering the downstream API path can reveal not only whether an upstream vulnerability is exploitable through a downstream application, but also additional defects in the downstream integration.
-
-Together, the two case studies demonstrate two distinct reasons why upstream PoC transfer may fail.
-In CVE-2023-1729, the PoC omits a downstream configuration setting required to trigger the vulnerability.
-In CVE-2020-35538, the downstream application does not use the API sequence in the upstream PoC, but a different public API argument can establish the same trigger state.
-\sys recovers these missing conditions through the downstream interface and validates them by executing the synthesized harness with the original input.
+The two cases answer RQ4 with complementary recovery mechanisms.
+In CVE-2023-1729 the required value lives in a privately owned object, so configuration-dependency recovery lifts an internal lookup to a public named setter and P3 selects the non-default value.
+In CVE-2020-35538 the upstream call sequence is absent, so entry-relative cells and a keyed setter rebuild the same trigger state on a public downstream path.
+In both cases the harness keeps the original PoC fixed, and AddressSanitizer validates the trigger under the recovered client.
+ 
