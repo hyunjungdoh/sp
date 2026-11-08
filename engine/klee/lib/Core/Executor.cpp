@@ -89,6 +89,7 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <vector>
@@ -302,6 +303,13 @@ cl::opt<unsigned> ConcolicPending(
     cl::desc("Concolic mode: at most this many unsolved flips are kept in "
              "memory; the farthest from the sink are solved and deferred to a "
              "later run from the initial state (default=2000)"),
+    cl::cat(SeedingCat));
+
+cl::opt<bool> ConcolicProgressGeneration(
+    "concolic-progress-generation", cl::init(true),
+    cl::desc("Concolic mode: a pending flip whose side moved toward the sink "
+             "keeps its parent's generation (keepProgressGeneration) instead "
+             "of the next one (default=true)"),
     cl::cat(SeedingCat));
 
 cl::opt<unsigned> ConcolicFlipBound(
@@ -1132,9 +1140,9 @@ void Executor::branch(ExecutionState &state,
       // Targets no seed took are flips: solved once when selected. Those of
       // a configuration switch are sibling seed paths and keep the
       // generation they split from (keepConfigGeneration).
-      std::shared_ptr<const Assignment> parent;
+      std::shared_ptr<const ExecutionState::InputSnapshot> parent;
       if (!seeds.empty())
-        parent = std::make_shared<Assignment>(seeds.front().assignment);
+        parent = snapshotInput(seeds.front().assignment);
       for (unsigned i=0; i<N; ++i)
         if (result[i] && !seedMap.count(result[i])) {
           makePending(*result[i], parent);
@@ -1462,9 +1470,9 @@ Executor::StatePair Executor::fork(ExecutionState &current, ref<Expr> condition,
       }
       
       bool swapInfo = false;
-      std::shared_ptr<const Assignment> parent;
+      std::shared_ptr<const ExecutionState::InputSnapshot> parent;
       if (Concolic && !seeds.empty())
-        parent = std::make_shared<Assignment>(seeds.front().assignment);
+        parent = snapshotInput(seeds.front().assignment);
       // Both sides start from the parent's generation (branch() copied it);
       // read it before makePending advances the side that becomes pending.
       const unsigned parentGen = current.gen;
@@ -1563,9 +1571,9 @@ void Executor::addConstraint(ExecutionState &state, ref<Expr> condition) {
           return !(CE && CE->isFalse());
         });
     if (kept == seeds.begin()) {
-      std::shared_ptr<const Assignment> parent;
+      std::shared_ptr<const ExecutionState::InputSnapshot> parent;
       if (!seeds.empty())
-        parent = std::make_shared<Assignment>(seeds.front().assignment);
+        parent = snapshotInput(seeds.front().assignment);
       seedMap.erase(it);
       makePending(state, parent);
     } else {
@@ -1634,12 +1642,100 @@ void Executor::bindLocal(KInstruction *target, ExecutionState &state,
   // (observed deep in LibRaw identify / parse_tiff_ifd). Config-dependent
   // values are not dataOnly and stay symbolic for the search; their already
   // concretized data operands keep them small.
+  getDestCell(state, target).value = collapseDataOnly(state, value);
+}
+
+ref<Expr> Executor::collapseDataOnly(ExecutionState &state, ref<Expr> value) {
   if (ConcolicDataConcrete && !isa<ConstantExpr>(value) &&
       concolicSeeded(state) && dataOnly(value)) {
     if (ref<ConstantExpr> cv = getValueFromSeeds(state, value))
-      value = cv;
+      return cv;
   }
-  getDestCell(state, target).value = value;
+  return value;
+}
+
+bool Executor::executeBulkMemOp(ExecutionState &state, KInstruction *ki,
+                                Function *f,
+                                std::vector<ref<Expr>> &arguments) {
+  if (interpreterOpts.MakeConcreteSymbolic)
+    return false;
+  StringRef name = f->getName();
+  bool isSet = name == "memset";
+  if (!isSet && name != "memcpy" && name != "memmove")
+    return false;
+  if (arguments.size() < 3)
+    return false;
+
+  auto *dstCE = dyn_cast<ConstantExpr>(arguments[0]);
+  auto *lenCE = dyn_cast<ConstantExpr>(arguments[2]);
+  if (!dstCE || !lenCE || lenCE->getWidth() > 64)
+    return false;
+  uint64_t len = lenCE->getZExtValue();
+
+  // A range [addr, addr+len) handled here lies inside one fixed-size object.
+  // Anything else (symbolic size, overflow, unmapped) is left to the runtime,
+  // which produces the same out-of-bounds report it always did.
+  auto locate = [&](ConstantExpr *addr, ObjectPair &op,
+                    uint64_t &off) -> bool {
+    if (!state.addressSpace.resolveOne(ref<ConstantExpr>(addr), op))
+      return false;
+    const MemoryObject *mo = op.first;
+    if (mo->symSize)
+      return false;
+    off = addr->getZExtValue() - mo->address;
+    return off <= mo->size && len <= mo->size - off;
+  };
+
+  ObjectPair dop;
+  uint64_t doff;
+  if (!locate(dstCE, dop, doff) || dop.second->readOnly)
+    return false;
+
+  if (isSet) {
+    ref<Expr> v = arguments[1];
+    if (v->getWidth() > Expr::Int8)
+      v = ExtractExpr::create(v, 0, Expr::Int8);
+    v = collapseDataOnly(state, v);
+    ObjectState *wos = state.addressSpace.getWriteable(dop.first, dop.second);
+    if (auto *cv = dyn_cast<ConstantExpr>(v)) {
+      uint8_t b = cv->getZExtValue(8);
+      for (uint64_t i = 0; i < len; ++i)
+        wos->write8(doff + i, b);
+    } else {
+      for (uint64_t i = 0; i < len; ++i)
+        wos->write(doff + i, v);
+    }
+  } else {
+    auto *srcCE = dyn_cast<ConstantExpr>(arguments[1]);
+    if (!srcCE)
+      return false;
+    ObjectPair sop;
+    uint64_t soff;
+    if (!locate(srcCE, sop, soff))
+      return false;
+
+    ObjectState *wos = state.addressSpace.getWriteable(dop.first, dop.second);
+    if (dop.first == sop.first) {
+      // Same object: the writable copy is now the source too, and the ranges
+      // may overlap (memmove). Read everything before writing anything.
+      std::vector<ref<Expr>> bytes;
+      bytes.reserve(len);
+      for (uint64_t i = 0; i < len; ++i)
+        bytes.push_back(collapseDataOnly(state, wos->read8(soff + i)));
+      for (uint64_t i = 0; i < len; ++i)
+        wos->write(doff + i, bytes[i]);
+    } else {
+      const ObjectState *sos = sop.second;
+      for (uint64_t i = 0; i < len; ++i)
+        wos->write(doff + i, collapseDataOnly(state, sos->read8(soff + i)));
+    }
+  }
+
+  if (!ki->inst->getType()->isVoidTy())
+    bindLocal(ki, state, arguments[0]);
+  if (InvokeInst *ii = dyn_cast<InvokeInst>(ki->inst))
+    transferToBasicBlock(ii->getNormalDest(), ii->getParent(), state);
+  return true;
 }
 
 void Executor::bindArgument(KFunction *kf, unsigned index, 
@@ -1867,16 +1963,27 @@ int Executor::solveInput(ExecutionState &state,
                     state.queryMetaData, values);
 }
 
-bool Executor::fixedDataBytes(const Array *a, const Assignment *parent,
+std::shared_ptr<const ExecutionState::InputSnapshot>
+Executor::snapshotInput(const Assignment &a) {
+  // Every binding: data objects for fixedDataBytes, the rest for the bytes a
+  // pending path does not read (solveInput keeps the parent's values there).
+  auto snap = std::make_shared<ExecutionState::InputSnapshot>();
+  for (const auto &b : a.bindings)
+    snap->emplace(b.first, internInput(b.second));
+  return snap;
+}
+
+bool Executor::fixedDataBytes(const Array *a,
+                              const ExecutionState::InputSnapshot *parent,
                               const std::vector<const Array *> &objects,
                               std::vector<unsigned char> &out) {
   const bool length = a->name.rfind("length:", 0) == 0;
   if (!length && !isDataObject(a))
     return false;
   if (parent) {
-    auto p = parent->bindings.find(a);
-    if (p != parent->bindings.end() && p->second.size() == a->size) {
-      out = p->second;
+    auto p = parent->find(a);
+    if (p != parent->end() && p->second->size() == a->size) {
+      out = *p->second;
       return true;
     }
   }
@@ -1905,7 +2012,8 @@ bool Executor::fixedDataBytes(const Array *a, const Assignment *parent,
 
 int Executor::solveInput(const ConstraintSet &path,
                          const std::vector<const Array *> &objects,
-                         const Assignment *parent, SolverQueryMetaData &meta,
+                         const ExecutionState::InputSnapshot *parent,
+                         SolverQueryMetaData &meta,
                          std::vector<std::vector<unsigned char>> &values) {
   for (auto &c : path) // rewritten to false: no solver needed
     if (ConstantExpr *CE = dyn_cast<ConstantExpr>(c))
@@ -2032,13 +2140,14 @@ int Executor::solveInput(const ConstraintSet &path,
     if (fixed.bindings.count(a) || whole.count(a) ||
         values[k].size() != a->size)
       continue;
-    auto p = parent->bindings.find(a);
-    if (p == parent->bindings.end() || p->second.size() != a->size)
+    auto p = parent->find(a);
+    if (p == parent->end() || p->second->size() != a->size)
       continue;
+    const std::vector<unsigned char> &pv = *p->second;
     auto r = read.find(a);
     for (unsigned i = 0; i < a->size; ++i)
       if (r == read.end() || !r->second[i])
-        values[k][i] = p->second[i];
+        values[k][i] = pv[i];
   }
   return 1;
 }
@@ -2246,8 +2355,9 @@ ExecutionState *Executor::selectConcolic() {
   return running;
 }
 
-void Executor::makePending(ExecutionState &state,
-                           std::shared_ptr<const Assignment> parent) {
+void Executor::makePending(
+    ExecutionState &state,
+    std::shared_ptr<const ExecutionState::InputSnapshot> parent) {
   if (!state.pendingSeed) {
     state.pendingSeed = true;
     ++state.gen;
@@ -2281,7 +2391,8 @@ void Executor::keepProgressGeneration(ExecutionState *side, unsigned parentGen,
                                       uint64_t parentOrder) {
   // Only a pending flip is ranked by gen; a side that already kept the
   // parent's generation (config fork, gate) needs nothing.
-  if (!side || !side->pendingSeed || side->gen == parentGen)
+  if (!ConcolicProgressGeneration || !side || !side->pendingSeed ||
+      side->gen == parentGen)
     return;
   // sinkOrder 0 is "no sink information / unreachable" (orderKey maps it to
   // the worst key), never progress.
@@ -2335,9 +2446,10 @@ void Executor::spawnGateFlips(ExecutionState &state, const ref<Expr> &cond,
   // The inputs to carry into the gate state's model: the seed the false side
   // still follows, or (if the seed matched an earlier entry and this side is
   // already a pending flip) its inherited parent input.
-  std::shared_ptr<const Assignment> parent = state.parentInput;
+  std::shared_ptr<const ExecutionState::InputSnapshot> parent =
+      state.parentInput;
   if (auto it = seedMap.find(&state); it != seedMap.end() && !it->second.empty())
-    parent = std::make_shared<Assignment>(it->second.front().assignment);
+    parent = snapshotInput(it->second.front().assignment);
 
   for (std::uint64_t K : *keys) {
     // The memory cap closes the gate: no extra state is created near it.
@@ -2432,6 +2544,18 @@ void Executor::defer(ExecutionState &state) {
                                StateTerminationType::Replay);
 }
 
+Executor::InputBuffer
+Executor::internInput(const std::vector<unsigned char> &bytes) {
+  uint64_t h = std::hash<std::string_view>{}(std::string_view(
+      reinterpret_cast<const char *>(bytes.data()), bytes.size()));
+  std::vector<InputBuffer> &bucket = inputPool[h];
+  for (const InputBuffer &b : bucket)
+    if (*b == bytes)
+      return b;
+  bucket.push_back(std::make_shared<const std::vector<unsigned char>>(bytes));
+  return bucket.back();
+}
+
 KTest *Executor::storeInput(
     const std::vector<std::string> &names,
     const std::vector<std::vector<unsigned char>> &values) {
@@ -2442,15 +2566,16 @@ KTest *Executor::storeInput(
   for (unsigned i = 0; i < kt->numObjects; ++i) {
     kt->objects[i].name = new char[names[i].size() + 1];
     std::memcpy(kt->objects[i].name, names[i].c_str(), names[i].size() + 1);
-    kt->objects[i].numBytes = values[i].size();
-    kt->objects[i].bytes = new unsigned char[values[i].size()];
-    std::memcpy(kt->objects[i].bytes, values[i].data(), values[i].size());
+    InputBuffer buf = internInput(values[i]);
+    kt->objects[i].numBytes = buf->size();
+    // The KTest reads the pooled buffer; pooledBuffers keeps it alive for as
+    // long as deferredInputs keeps the KTest. Seeds copy from it on respawn.
+    kt->objects[i].bytes = const_cast<unsigned char *>(buf->data());
+    pooledBuffers.push_back(std::move(buf));
   }
   deferredInputs.emplace_back(kt, [](KTest *k) {
-    for (unsigned i = 0; i < k->numObjects; ++i) {
+    for (unsigned i = 0; i < k->numObjects; ++i)
       delete[] k->objects[i].name;
-      delete[] k->objects[i].bytes;
-    }
     delete[] k->objects;
     delete k;
   });
@@ -2534,8 +2659,7 @@ bool Executor::concolicAssume(ExecutionState &state, ref<Expr> e) {
   if (d == 0) {
     // No seed satisfies the assumption: the path continues only for other
     // inputs, which the flip step must produce.
-    auto parent =
-        std::make_shared<Assignment>(seedMap[&state].front().assignment);
+    auto parent = snapshotInput(seedMap[&state].front().assignment);
     seedMap.erase(&state);
     makePending(state, parent);
   } else if (d == 2) {
@@ -3126,6 +3250,16 @@ void Executor::executeCall(ExecutionState &state, KInstruction *ki, Function *f,
       transferToBasicBlock(ii->getNormalDest(), i->getParent(), state);
     }
   } else {
+    // The freestanding memcpy/memmove/memset are interpreted one byte per
+    // load/store pair. A library that reads its whole input (fz_read_all,
+    // fread, FT_Stream reads) copies every input byte several times, and on
+    // a megabyte input those copies were 2/3 of all executed instructions
+    // (memcpy 620M + memset 430M of 1.65G), so the client never got past the
+    // parsers to the sink in budget. Do the copy in one step when it is
+    // provably in bounds; otherwise fall through to the runtime.
+    if (executeBulkMemOp(state, ki, f, arguments))
+      return;
+
     // Check if maximum stack size was reached.
     // We currently only count the number of stack frames
     if (RuntimeMaxStackFrames && state.stack.size() > RuntimeMaxStackFrames) {

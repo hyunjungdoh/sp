@@ -3055,11 +3055,13 @@ void markStInstallers(Module &M, const std::vector<std::string> &names) {
 // starts reaches file:line, 0 every sequence was tried and none is, -1 when
 // the path budget ran out or the line is not a sink.
 int probeReach(const Model &prepared, const std::set<std::string> &iface, const std::string &f, unsigned l,
-               const std::set<std::string> &starts, bool exact = false) {
+               const std::set<std::string> &starts, bool exact = false,
+               std::function<unsigned(Function *)> cost = {}) {
   Model m(prepared, f, l);
   m.interfaceNames = iface;
   m.startNames = starts;
   m.exactStarts = exact;
+  m.startCost = std::move(cost);
   m.probeBudget = true;
   m.emitInputs = false;
   std::string buf;
@@ -3392,18 +3394,27 @@ int main(int argc, char **argv) {
       if (!w.seq.empty())
         ws.push_back(w);
     }
+    // witnesses.txt is the concatenation of whole run() outputs, each opening
+    // with its "starts" line. One output may hold several sat candidates, a
+    // later dispatch-open rejecting an earlier one, so it is parsed whole, as
+    // the search parsed it.
     std::ifstream all((outDir / "witnesses.txt").string());
     std::string block;
-    for (std::string s; std::getline(all, s);) {
-      block += s + "\n";
-      if (s != "sat")
-        continue;
+    auto flush = [&] {
+      if (block.empty())
+        return;
       std::istringstream in(block);
       Witness v = parseWitness(in);
       if (!v.seq.empty())
         ws.push_back(v);
       block.clear();
+    };
+    for (std::string s; std::getline(all, s);) {
+      if (s.rfind("starts ", 0) == 0)
+        flush();
+      block += s + "\n";
     }
+    flush();
     return mustSide(dir, outDir, ctx, ws, table, file, line, 0);
   }
   SMDiagnostic err;
@@ -3444,7 +3455,8 @@ int main(int argc, char **argv) {
     auto key = std::make_tuple(f, l, starts);
     if (auto it = p1Probes.find(key); it != p1Probes.end())
       return it->second;
-    return p1Probes[key] = probeReach(prepared, iface, f, l, starts);
+    return p1Probes[key] = probeReach(prepared, iface, f, l, starts, false,
+                                      [&](Function *F) { return client.callCost(F); });
   };
   // P1 feasibility = φ SAT ∧ no open Definition-D dispatch edge.
   model.openDispatch = [&](const std::vector<Function *> &fn) {
@@ -3454,6 +3466,9 @@ int main(int argc, char **argv) {
       seq.push_back(F->getName().str());
     return client.openDispatchEdges(seq);
   };
+  // B_entry midpoint test (§3.12): keep a cheaper public origin even when a
+  // heavier interface function in R(s) calls it.
+  model.startCost = [&](Function *F) { return client.callCost(F); };
   errs() << "interface " << model.interfaceNames.size() << " entry-starts " << model.startNames.size() << "\n";
   model.run(seqPick, out);
   {
@@ -3490,6 +3505,7 @@ int main(int argc, char **argv) {
       next.interfaceNames = model.interfaceNames;
       next.startNames = model.startNames;
       next.openDispatch = model.openDispatch;
+      next.startCost = model.startCost;
       std::string buf;
       raw_string_ostream o(buf);
       next.run(n, o);

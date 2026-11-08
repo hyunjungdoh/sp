@@ -754,7 +754,18 @@ fip.field_bit)`를 실행하므로, 마스크 비트가 상수가 아니라 상�
 규칙(첫 함수가 호출 가능한 인터페이스면 그것, 아니면 호출 거리가 최소인 호출 가능한 인터페이스
 함수들)이다.
 
-**증인의 열거.** 후보 시퀀스는 시작점에서 sink까지의 단순 경로이고, (간접 간선 수, 길이) 순으로
+**시작점 \(B_{\mathrm{entry}}\).** \(I^{\star}\)는 보유 인자가 모두 생산 가능한 인터페이스(\(\mathrm{entryCallable}\)).
+\[
+B_{\mathrm{entry}}=\{f\in I^{\star}\cap R(s)\mid \nexists\, c\in R(s)\cap I:\ (c\to f)\in E \land \mathrm{cost}(c)<\mathrm{cost}(f)\}.
+\]
+\(\mathrm{cost}\)는 정의 4의 호출 비용(보유 인자 생산 비용 합). **엄격히 더 싼** 인터페이스
+호출자만 \(f\)를 미드포인트로 증언한다. 같거나 더 비싼 호출자는 다른 보유 ADT를 요구할 수
+있으므로 \(f\)를 없애지 않는다 — §3.12의 시드는 가장 단순한 공개 기원이다.
+측정(24757): `heif_region_get_mask_image`만 `heif_decode_image`를 부르고 둘 다
+\(\mathrm{callCost}=4\)라, \(\le\) 규칙에서는 decode_image가 탈락했다(PoC는 정지
+HEIC+`heif_decode_image`). \(<\)로 바꾸면 decode_image가 \(B_{\mathrm{entry}}\)에 남는다.
+
+**증인의 열거.** 후보 시퀀스는 시작점\(B_{\mathrm{entry}}\)에서 sink까지의 단순 경로이고, (간접 간선 수, 길이) 순으로
 나온다. 시퀀스 \(\pi = f_0 \cdots f_n\)의 **출구** \(x(\pi)\)는 \(f_k\)가 \(D\)의 인터페이스 함수가 아닌
 첫 간선 \(f_{k-1} \to f_k\)이다(모두 인터페이스면 마지막 간선). 후보 하나를 낼 때마다 그 출구를 금지하고
 다음 후보를 찾으며, 만족하는(SAT) 후보가 증인이다. 간선은 유한하므로 열거는 끝난다.
@@ -803,11 +814,13 @@ fip.field_bit)`를 실행하므로, 마스크 비트가 상수가 아니라 상�
 3. **Key** — 정의 3.8.4의 실현 조건을 만족하는 \(\kappa \in \mathcal{K}_k\)가 \(c\)를 덮는다.
 4. **Write** — \(c\)가 값 원자(=, ≠, has, lacks)이고 \(\mathrm{Wr}_k(c) \neq \varnothing\)이며 \(c\)가
    아래 덮개에 들어간다.
-5. **Construct** — \(c\)가 입력 이름 칸이 아니고, 그 필드를 쓰는 함수가 없거나, 정의 E가 \(c\)를
-   확립된 것으로 판정한다.
-6. **File** — \(c\)가 입력 이름 칸이 아니고 경계·전위 셀이며, entry(또는 \(c\)의 보유 근의 생산자와
+5. **File** — \(c\)가 입력 이름 칸이 아니고 경계·전위 셀이며, entry(또는 \(c\)의 보유 근의 생산자와
    그 의존 호출)가 입력을 읽으면서 \(c\), 그 복사 소스, 또는 관계 원자의 다른 끝에 비상수를 쓴다(§7
-   닫힌 세계).
+   닫힌 세계). 같은 셀에 File 후보가 있으면 Construct보다 앞선다(Λ2 입력 상태; 배제-only Key→File과
+   같은 양보). Construct를 먼저 두면 경로에 비민감한 확립이 빈 핸들·트랙을 고르고 PoC 바이트를
+   건너뛴다.
+6. **Construct** — \(c\)가 입력 이름 칸이 아니고 File 후보가 없으며, 그 필드를 쓰는 함수가 없거나,
+   정의 E가 \(c\)를 확립된 것으로 판정한다(Λ3 내부 상태).
 7. **Open** — 위 어느 것도 아니다.
 
 여기서 \(e = \mathrm{entries}(E_k)\)의 첫 원소, \(\mathrm{setters}(e, c)\)는 \(e\)가 \(c\)로 복사하는
@@ -1101,6 +1114,15 @@ id)를 붙인다. 지역 링크가 아닌 함수는 \(D\)·\(U\)에서 이름이
 무엇이 들었는지)는 \(\Phi\)에 셀이 없을 때가 많다. 런타임 컨테이너가 상태를 쥐는 C++가 특히 그렇다.
 6851의 증인은 셀이 하나도 없다. 그런데 `heif_context_get_track`은 문맥이 트랙을 가질 때만 트랙을
 준다. 그 문맥 상태가 \(\Lambda_2\)이다. 이런 상태의 층은 그것을 들여오는 호출이 정한다.
+**실현 기록.** entry의 보유 근 \(r\)에 대해 \(\mathrm{Ob}\)가 \(r\)을 덮는 셀을 하나도 없고, \(r\)의
+타입의 생산자(또는 그 의존) 중 \(\lambda \neq \mathrm{None}\)인 호출 \(W\)가 있으면, 증인은 합성
+\(\rho = \mathrm{File}\) 항목을 남긴다(\(W\)가 `by`). 셀의 `op`는 비워 \(\mathrm{Ob}\)·통과 판정에
+넣지 않는다. 보고만 이 기록을 본다. 하네스가 만드는 것(인자 필드 채움, §4 문법의 비단말, 실현 판정의
+install)은 의무 셀에서만 정해진다. 측정(27406): 기록이 `need`에 들어가자 `fz_outline_glyph`의
+`fz_context` 인자 필드에 입력 사본 두 개와 null 선택 7개를 가진 객체 체인이 심겼고, 같은 entry를
+고정한 900초 실행에서 `ftobjs.c:3417`에 닿지 않았다(이전 클라이언트는 20초). 측정(24757): 타일·영역 증인의 φ는
+`model … unknown`뿐이라 셀 단위 Λ2가 돌지 않았고 witness `file 0`·obligations `file 1`이
+갈라졌다. 루트 기록이 그 간격을 메운다.
 
 **정의 L (입력 통로).** 호출 \(F\)가 입력을 받는 통로 \(\lambda(F)\)는 다음 셋 중 하나다.
 
@@ -1290,6 +1312,15 @@ store가 LibRaw 쪽 적재와 다른 열쇠가 되어 `half_size`의 store 0개)
 경로의 집합은 선택지 순서와 무관하다. 순서는 시드 경로(모든 선택 0)만 정한다(§6). 호출을 0번
 선택지로 두어 시드 경로가 계획의 실현 \(\rho\)를 따르게 한다. 이는 설정의 select 규칙과 같은
 근거이고, 생략은 선택 변수 하나의 뒤집기다. 생산자와 의존의 순서는 §3.11 정의 O가 정한다.
+여러 entry가 있을 때 main이 고르는 시드 entry(선택 0)는 (seedable, sinkLabels, 최소 반환 의무 수,
+trunk, guard open, 최단 증인 길이) 사전식이다. 반환 의무(정의 R)는 s 앞에서 시드 경로가 요구하는
+피호출자 결과로 E의 인자가 정하지 못한다. 그 수는 시드가 우연히 맞춰야 하는 조건의 수이지 슬라이스
+크기가 아니다(27406: fz_bound_glyph는 글리프 bbox 캐시가 빗나갈 때만(`get_gid_bbox != 0`)
+FT_Request_Size에 닿고, 같은 길이의 fz_outline_glyph에는 그런 조건이 없다). File 셀 수는 순위에 쓰지 않는다. Λ2가 모든 증인에 루트
+File 기록을 두므로 그 수는 긴 증인이 지나는 경계 셀 수를 따라 커질 뿐, s의 실행 근거가 아니다
+(27406: 13호출에 File 6개인 pdf_run_glyph가 sink 경로인 4호출 fz_outline_glyph를 앞질렀다). **trunk**는 다른 entry의 실현 경로(π₀가 아님)에 나타나는
+entry다 — \(B_{\mathrm{entry}}\) 안의 공유 줄기로, 형제 API보다 단순한 공개 기원이다(24757:
+`region→decode→s`라 decode가 trunk, track은 더 짧아도 병렬이라 시드가 되면 안 된다).
 
 **witness 강제 (AEE 식 20에 대응).** witness의 셀 제약 중 entry가 바꾸지 못하는
 것이 가드다. 클라이언트 객체 안의 셀은 설정이다. entry 호출 직전에 다음을 수행한다.
@@ -1754,7 +1785,7 @@ H2의 상한 \(K, N, L, d\)는 탐색 예산이다. 케이스별로 조정하지
 | 보류 상태는 버려질 때 테스트를 쓰지 않음; 배열 없는 상수 false 인자를 독립 솔버가 불만족으로 보고(`IndependentSolver`) | §6 정당성 | 추가 |
 | 구조적(Open) 의무를 fact 층에서 may 층의 `file`로 되살려 보존 | §3.5 구조적 의무 보존 | 유지 |
 | 충족 불가능 입력 이름 칸을 Construct 아닌 Open으로 집계 | §3.5 구조적 의무 보존 | 유지 |
-| 계획을 셀마다 하나의 실현 \(\rho(c)\)(Own→Lever→Key→Write→Construct→File→Open)와 조종으로 재정의; 덮개 상한 = 쓰기 슬롯 \(K\); 추가 호출은 통과한 증인에서만 | §3.9 | 교체 |
+| 계획을 셀마다 하나의 실현 \(\rho(c)\)(Own→Lever→Key→Write→File→Construct→Open)와 조종으로 재정의; File 후보가 있으면 Construct보다 앞(Λ2); 덮개 상한 = 쓰기 슬롯 \(K\); 추가 호출은 통과한 증인에서만 | §3.9 | 교체 |
 | entry만 쓰는 경계 셀을 복사 맵 \(c \leftarrow d\)로 소스 필드의 세터에 환원 | §3.6 복사-환원 | 유지 |
 | 세터가 전부 \(U\)인 경계 셀(U-내부 하위 객체)을 construct로 집계 | §3.6 정리 B(a) | 유지 |
 | 경계 셀의 writer를 인자 전방 taint(클라이언트 레버)로만 인정 | §3.6 클라이언트 레버 | 유지 |
@@ -1801,6 +1832,13 @@ H2의 상한 \(K, N, L, d\)는 탐색 예산이다. 케이스별로 조정하지
 | 싱크 의존 `sinkdep`(`Sink.cpp`): 필드 기반 def-use(소스 이름 열쇠, \(f_0\) 닫힘 안 store), 호출 문자열 문맥(깊이 8), φ 간선 조건, 할당 정수 인자, 출처 `named`/`file`/`arg`/`global`/`ext` | §3.12 정의 SD | 추가 |
 | 이름 설정 \((S\mid\text{skip})\)의 선택지 순서: `sinkdep … named "κ"`면 set이 0번(`Named::sinkDep`, `Client::sinkNamed`); set 값은 \(V\setminus\{d\}\)(`select(s=d, d+1, s)`) | §3.12 하네스에서의 쓰임, §4 순서 규칙 | 교체(이전: 항상 skip이 0번, set의 시드 값 \(0=d\)) |
 | `isAlloc`을 `Model.h`로 옮겨 Origin·Sink가 한 정의를 씀 | §3.1 할당 호출 | 유지 |
+| \(B_{\mathrm{entry}}\) 미드포인트: \(\mathrm{cost}(c)<\mathrm{cost}(f)\)인 공개 호출자만 \(f\)를 탈락(`startCost`, `findStarts`) | §3.9 시작점 \(B_{\mathrm{entry}}\) | 교체 |
+| φ에 셀이 없는 보유 근의 Λ2: 생산자 의존이 입력을 받으면 합성 File 기록(`realize`) | §3.11 Λ2 실현 기록 | 추가 |
+| 시드 entry 순서: sinkLabels 다음 trunk(`seedOrder`) | \(B_{\mathrm{entry}}\) 줄기 | 추가 |
+| 시드 entry 순서에서 File 셀 수 제거 (Λ2 루트 기록 뒤로 길이의 대리값) | §3.12 `seedOrder` | 삭제 |
+| 시드 entry 순서: sinkLabels 다음 최소 반환 의무 수, 그다음 trunk | 정의 R, §3.12 `seedOrder` | 추가 |
+| `plan()`이 `WitnessPlan::seq`에 may 시퀀스를 보존 (`W.length`만 두면 trunk 공허) | §3.12 trunk / `seedOrder` | 추가 |
+| Λ2 루트 기록(`Realized::record`)을 하네스 인자 필드 채움·문법 `wantType`·install 판정에서 제외 (기록이 entry 인자 필드에 File 객체 체인을 심었다) | §3.11 실현 기록 | 교체 |
 
 ### 열린 문제
 

@@ -391,6 +391,23 @@ private:
   void bindLocal(KInstruction *target, 
                  ExecutionState &state, 
                  ref<Expr> value);
+
+  /// --concolic-data-concrete: a value that depends only on fixed data bytes
+  /// has the same value on every path, so it is collapsed to its seed value
+  /// as soon as it is produced. Returns the value unchanged otherwise.
+  ref<Expr> collapseDataOnly(ExecutionState &state, ref<Expr> value);
+
+  /// Perform memcpy/memmove/memset in one step when every operand is concrete
+  /// and both ranges lie inside single, fixed-size objects. Byte for byte this
+  /// is what interpreting the freestanding runtime does, without executing one
+  /// load/store pair per byte. Returns false (nothing done) when the call must
+  /// go through the runtime, e.g. a symbolic length, a symbolic-size object,
+  /// or a range that leaves its object: the runtime then reports the memory
+  /// error exactly as before.
+  bool executeBulkMemOp(ExecutionState &state, KInstruction *ki,
+                        llvm::Function *f,
+                        std::vector<ref<Expr>> &arguments);
+
   void bindArgument(KFunction *kf, 
                     unsigned index,
                     ExecutionState &state,
@@ -457,15 +474,25 @@ private:
   /// substituted (a conjunct they refute makes the path infeasible).
   int solveInput(const ConstraintSet &path,
                  const std::vector<const Array *> &objects,
-                 const Assignment *parent, SolverQueryMetaData &meta,
+                 const ExecutionState::InputSnapshot *parent,
+                 SolverQueryMetaData &meta,
                  std::vector<std::vector<unsigned char>> &values);
   /// --concolic-data-concrete: the bytes a data object (or the length of
   /// one) keeps while a flip is solved: the parent input's, else the one
   /// corpus file's. False for a configuration object, or when no value is
   /// known (the solver then assigns it).
-  bool fixedDataBytes(const Array *a, const Assignment *parent,
+  bool fixedDataBytes(const Array *a,
+                      const ExecutionState::InputSnapshot *parent,
                       const std::vector<const Array *> &objects,
                       std::vector<unsigned char> &out);
+  /// A seed's bindings as a parent input for the pending states split from
+  /// it, with every buffer interned by content, so the snapshot of a 1 MiB
+  /// input costs a map entry per fork, not a copy. Copying the whole
+  /// assignment per fork held the input once per pending or deferred state:
+  /// thousands of them, and the memory check that defers states to free
+  /// memory then ran away.
+  std::shared_ptr<const ExecutionState::InputSnapshot>
+  snapshotInput(const Assignment &a);
 
   /// Concolic mode. The fate of every state the search ends, and the
   /// candidates (pending flips) it creates. The run is exhaustive within its
@@ -503,12 +530,22 @@ private:
     std::set<std::string> fixed;
     std::vector<std::string> names; // of the symbolic objects, in order
     std::optional<ConstraintSet> path; // a pending flip's path condition
-    std::shared_ptr<const Assignment> parent;
+    std::shared_ptr<const ExecutionState::InputSnapshot> parent;
     std::vector<const Array *> objects;
     bool concretized = false;
   };
   std::vector<Deferred> deferred; // min-heap on key
   std::vector<std::unique_ptr<KTest, void (*)(KTest *)>> deferredInputs;
+  /// Stored inputs share their byte buffers, one per distinct content. A
+  /// deferred state's data object is a copy of its parent's (data bytes never
+  /// flip; solveInput takes them from the parent), so every deferral along a
+  /// path carries the same bytes. Copying them per deferral made the memory
+  /// check, which defers states to free memory, grow memory with each state
+  /// it deferred: at a megabyte input that ran away within seconds.
+  typedef std::shared_ptr<const std::vector<unsigned char>> InputBuffer;
+  std::unordered_map<uint64_t, std::vector<InputBuffer>> inputPool;
+  std::vector<InputBuffer> pooledBuffers; // keep objects[i].bytes alive
+  InputBuffer internInput(const std::vector<unsigned char> &bytes);
   KTest *storeInput(const std::vector<std::string> &names,
                     const std::vector<std::vector<unsigned char>> &values);
   ExecutionState *pristine = nullptr;
@@ -578,7 +615,7 @@ private:
   /// Concolic mode. Turn a seeded state into a pending flip of the next
   /// generation; parent is the input it followed (kept if null).
   void makePending(ExecutionState &state,
-                   std::shared_ptr<const Assignment> parent);
+                   std::shared_ptr<const ExecutionState::InputSnapshot> parent);
 
   /// Concolic mode, witness-guided scheduling (DESIGN-D §6). A pending
   /// flip of a configuration fork -- the side no seed took of a branch

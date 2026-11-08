@@ -5365,15 +5365,20 @@ Client::WitnessPlan Client::realize(Function *E, const std::vector<Cell> &phi, c
       // writer must receive the input file name, not fresh text.
       if (entry && fills(entry, c))
         nameCells.insert(W.cells.size());
+    } else if (fileBy) {
+      // Λ2 (DESIGN-D): a boundary/prefix cell with an input filler is input
+      // state — File, not Construct. Construct before File let path-insensitive
+      // establishment (empty Track/handle) win and skip the PoC bytes; same
+      // yield-to-File idea as excludesOnly Key above. Cells without fileBy still
+      // fall through to Construct.
+      r.how = Realize::File;
+      r.by = fileBy;
     } else if (const WitnessPlan *via = nullptr; !c.file && establishedBy(E, entry, c, via, at)) {
       r.how = Realize::Construct;
       if (via) {
         vias[W.cells.size()] = {via, c.type + "+" + std::to_string(c.off) + " at " + at};
         r.by = body(via->seq.back());
       }
-    } else if (fileBy) {
-      r.how = Realize::File;
-      r.by = fileBy;
     } else if (k) {
       r.how = Realize::Key;
       r.by = body(k->fn);
@@ -5384,6 +5389,56 @@ Client::WitnessPlan Client::realize(Function *E, const std::vector<Cell> &phi, c
     W.cells.push_back(r);
     if (decide && r.how == Realize::Open)
       return W;
+  }
+  // §3.11 Λ2 at root granularity: Φ often carries no atom on an opaque held
+  // object (shared_ptr chains, containers), yet the whole object is input
+  // state when a producer dependence reads the input (보조정리 L). Without a
+  // cell, §3.9 rule 5 never runs and the witness reports file 0 even though
+  // obligations.file is 1 (24757 tile/region). Record File for each uncovered
+  // held root whose producer chain has a non-None channel — seedOrder and the
+  // report can see that the witness consumes PoC bytes. op stays empty so the
+  // record is not an Ob cell and does not change pass.
+  if (entry) {
+    std::set<int> covered;
+    for (const Realized &r : W.cells)
+      if (r.cell.root >= 0)
+        covered.insert(r.cell.root);
+    auto sig = signature(entry);
+    auto at = irParams(entry);
+    for (unsigned i = 0; i < at.size(); ++i) {
+      if (at[i] < 0 || covered.count((int)i))
+        continue;
+      const Param &p = sig[at[i]];
+      if (!held(p))
+        continue;
+      Function *loader = nullptr;
+      if (auto pit = producers.find(p.type); pit != producers.end()) {
+        for (const Producer &pr : pit->second) {
+          if (opensFile(pr.fn)) {
+            loader = pr.fn;
+            break;
+          }
+          for (Function *D : dependences(pr.fn, p.type))
+            if (opensFile(D)) {
+              loader = D;
+              break;
+            }
+          if (loader)
+            break;
+        }
+      }
+      if (!loader)
+        continue;
+      Cell syn;
+      syn.root = (int)i;
+      syn.type = p.type;
+      syn.boundary = true;
+      Realized r{syn};
+      r.how = Realize::File;
+      r.by = loader;
+      r.record = true;
+      W.cells.push_back(r);
+    }
   }
   std::set<std::tuple<std::string, std::string, std::string, unsigned>> seenRet;
   for (const Ret &rt : rets) {
@@ -5595,6 +5650,10 @@ Client::Plan Client::plan(const Witnesses &ws) const {
       continue;
     WitnessPlan W = realize(E, phi, wi < keyedIn.size() ? keyedIn[wi] : std::vector<Keyed>{},
                             wi < retsIn.size() ? retsIn[wi] : std::vector<Ret>{});
+    // seedOrder trunk (§3.12): needs the may sequence, not only its length —
+    // without this, trunk never fires (seq stays empty) and a parallel short
+    // entry (track) outranks a shared mid-path entry (decode on region→s).
+    W.seq = seq;
     W.length = seq.size();
     W.guardFacts = wi < guardFactsIn.size() ? guardFactsIn[wi] : 0;
     if (std::find(P.firsts.begin(), P.firsts.end(), E) == P.firsts.end())
@@ -5719,7 +5778,8 @@ Client::Plan Client::plan(const Witnesses &ws) const {
   // Direct starts with zero client cells remain realized when dispatch is closed
   // ("의무 없음" at a real entry). Elevated vacuous plans stay unrealized.
   for (WitnessPlan &W : P.witnesses) {
-    bool install = !W.cells.empty() || !W.files.empty() || !W.levers.empty() || !W.keyed.empty();
+    bool install = std::any_of(W.cells.begin(), W.cells.end(), [](const Realized &r) { return !r.record; }) ||
+                   !W.files.empty() || !W.levers.empty() || !W.keyed.empty();
     for (Function *F : W.entries) {
       auto nit = P.named.find(F);
       if (nit != P.named.end() && !nit->second.empty())
@@ -5762,7 +5822,8 @@ void Client::grammar(Plan &P) const {
   // under ImageInfo) are not entry formals, but the harness must still make them.
   for (const WitnessPlan &W : P.witnesses)
     for (const Realized &r : W.cells)
-      wantType(r.cell.type);
+      if (!r.record)
+        wantType(r.cell.type);
   for (std::vector<std::string> work(need.begin(), need.end()); !work.empty();) {
     std::string T = work.back();
     work.pop_back();
@@ -6033,6 +6094,8 @@ std::vector<Function *> Client::seedOrder(const Plan &P) const {
   // witness — the sink is reached only if the constant happens to be right,
   // and nothing the harness or the input sets can change it.
   std::map<Function *, bool, FnOrder> guardOpen;
+  // 정의 R: the fewest return obligations on a realized witness through E.
+  std::map<Function *, size_t, FnOrder> fewestReturns;
   for (const WitnessPlan &W : P.witnesses)
     if (W.realized)
       for (Function *E : W.entries) {
@@ -6042,6 +6105,9 @@ std::vector<Function *> Client::seedOrder(const Plan &P) const {
         if (it == shortest.end() || W.length < it->second)
           shortest[E] = W.length;
         guardOpen[E] = guardOpen[E] || W.guardFacts > 0;
+        auto rt = fewestReturns.find(E);
+        if (rt == fewestReturns.end() || W.returns.size() < rt->second)
+          fewestReturns[E] = W.returns.size();
       }
   if (entries.empty() && !P.firsts.empty())
     entries = {P.firsts.front()};
@@ -6060,17 +6126,33 @@ std::vector<Function *> Client::seedOrder(const Plan &P) const {
   //      before its call installs nothing, whatever names it could set.
   //   2. L(E): the sink facts the seed realizes — names the sink depends on
   //      (§3.12 sinkdep) and lookups the sink path obliges (정의 R).
-  //   3. guard open: some witness through E gives the sink guard an origin
+  //   3. fewest return obligations (정의 R): each is a callee result the seed
+  //      path needs before s and that no argument of E sets — a condition
+  //      the seed must happen to meet. Unlike guard origins (below), the
+  //      count is what the seed must satisfy, not the size of a slice
+  //      (27406: fz_bound_glyph reaches FT_Request_Size only when its glyph
+  //      bbox cache misses, `get_gid_bbox != 0`; fz_outline_glyph, equally
+  //      short, has no such condition and is the sink's path).
+  //   4. trunk: E lies on some other entry's realized path to s (not as π₀).
+  //      §3.12 / B_entry: that shared trunk is a simpler public origin than a
+  //      sibling API that only reaches s on its own (24757: region→decode→s
+  //      so decode is trunk; track is parallel and shorter, so length alone
+  //      wrongly seeded track for a still-HEIC PoC).
+  //   5. guard open: some witness through E gives the sink guard an origin
   //      (`sinkdep guard …`). With none, the guard's operands come from
   //      constants of the closure alone (35538: on the TIFFWrite* witnesses
   //      the row count at jutils.c:110 is fixed by the encoder; on the
   //      TIFFRead* ones it is the decoder's state from the input) — SAVIOR's
   //      distinction between an unverified and a verified label. A count is
   //      not used: more origins means a larger slice, not a surer sink.
-  //   4. the shortest realized witness through E.
+  //   6. the shortest realized witness through E.
   // Whether E has a key setter does not rank it: a key is a means of ρ, not
   // evidence that s is executed (35538: the key put TIFFWrite* ahead of the
-  // TIFFRead* witnesses the sink's input actually flows through).
+  // TIFFRead* witnesses the sink's input actually flows through). Neither does
+  // the number of File cells: Λ2 gives every witness its root File record, so
+  // the count only grows with the boundary cells a longer witness crosses
+  // (27406: pdf_run_glyph, 6 cells over 13 calls, outranked the 4-call
+  // fz_outline_glyph whose font load is the sink's path).
   auto sinkLabels = [&](Function *E) {
     std::set<std::string> ks;
     if (auto it = P.named.find(E); it != P.named.end())
@@ -6078,6 +6160,20 @@ std::vector<Function *> Client::seedOrder(const Plan &P) const {
         if (n.sinkDep || n.must)
           ks.insert(n.key);
     return ks.size();
+  };
+  auto trunk = [&](Function *E) {
+    if (!E)
+      return false;
+    const std::string name = E->getName().str();
+    for (const WitnessPlan &W : P.witnesses) {
+      if (!W.realized || W.seq.size() < 2)
+        continue;
+      if (W.seq.front() == name)
+        continue;
+      if (std::find(W.seq.begin(), W.seq.end(), name) != W.seq.end())
+        return true;
+    }
+    return false;
   };
   std::stable_sort(entries.begin(), entries.end(), [&](Function *A, Function *B) {
     bool sa = seedable.count(A) == 0 || seedable.at(A);
@@ -6087,6 +6183,11 @@ std::vector<Function *> Client::seedOrder(const Plan &P) const {
     size_t a = sinkLabels(A), b = sinkLabels(B);
     if (a != b)
       return a > b;
+    if (fewestReturns[A] != fewestReturns[B])
+      return fewestReturns[A] < fewestReturns[B];
+    bool ta = trunk(A), tb = trunk(B);
+    if (ta != tb)
+      return ta;
     if (guardOpen[A] != guardOpen[B])
       return guardOpen[A];
     return shortest[A] < shortest[B];
@@ -6146,13 +6247,15 @@ void Client::report(const Plan &P, raw_ostream &out) const {
       if (auto it = P.named.find(order[i]); it != P.named.end())
         for (const Named &nm : it->second)
           n += nm.sinkDep;
-      size_t len = 0;
+      size_t len = 0, rets = SIZE_MAX;
       for (const WitnessPlan &W : P.witnesses)
-        if (W.realized && std::find(W.entries.begin(), W.entries.end(), order[i]) != W.entries.end())
+        if (W.realized && std::find(W.entries.begin(), W.entries.end(), order[i]) != W.entries.end()) {
           len = len ? std::min(len, W.length) : W.length;
+          rets = std::min(rets, W.returns.size());
+        }
       bool keyed = P.keyed.count(order[i]) && !P.keyed.at(order[i]).empty();
       out << "seed " << i << " " << order[i]->getName() << " sinkdep " << n << " key " << (keyed ? 1 : 0)
-          << " length " << len;
+          << " length " << len << " returns " << (rets == SIZE_MAX ? 0 : rets);
       if (auto s = seedable.find(order[i]); s != seedable.end())
         out << " seedable " << (s->second ? 1 : 0);
       out << "\n";
@@ -6399,18 +6502,24 @@ struct Builder {
   Value *bytes(IRBuilder<> &B, uint64_t elem = 1) {
     uint64_t size = capacity(elem) * elem;
     lastBytes = "input";
-    if (size == n)
+    // The buffer needs `size` bytes and `client.input` already holds `n`. When
+    // size <= n its prefix *is* those bytes, so hand back the input object
+    // itself: no fresh allocation, no copy. The length the library reads is
+    // bounded by capacity(elem) <= size <= n (see the length emission), so no
+    // read runs past the input. This is the same aliasing the size == n case
+    // always used, now covering every size that fits — a client that reads its
+    // one input, not a per-call copy of it. The copy it replaces grew with the
+    // input: at n = 1.4 MiB a 64 KiB memcpy ran at every buffer argument, so a
+    // factory that takes many buffers never returned within budget.
+    if (size <= n)
       return data;
-    // Wider element stride: capacity*elem may exceed n. Prefix is the
-    // shared input; the rest is zero. Still one client file, not a new
-    // symbolic domain.
+    // Wider element stride: capacity*elem may exceed n. Prefix is the shared
+    // input; the rest is zero. Still one client file, not a new symbolic
+    // domain. Only this overshoot needs its own object, bounded by the stride.
     Value *p = B.CreateCall(mallocF, {B.getInt64(size)});
-    // p holds only `size` bytes; when n exceeds the 64 KiB cap, copy the
-    // prefix that fits rather than all n.
-    B.CreateCall(memcpyF, {p, data, B.getInt64(std::min<uint64_t>(n, size))});
-    if (size > n)
-      B.CreateMemSet(B.CreateGEP(B.getInt8Ty(), p, B.getInt64(n)), B.getInt8(0), B.getInt64(size - n),
-                     MaybeAlign(1));
+    B.CreateCall(memcpyF, {p, data, B.getInt64(n)});
+    B.CreateMemSet(B.CreateGEP(B.getInt8Ty(), p, B.getInt64(n)), B.getInt8(0), B.getInt64(size - n),
+                   MaybeAlign(1));
     return p;
   }
   std::string lastBytes;
@@ -7946,6 +8055,8 @@ void Client::emit(const Plan &P, Module &H) const {
         if (!here)
           continue;
         for (const Realized &r : W.cells) {
+          if (r.record)
+            continue;
           std::string k = norm(r.cell.type);
           if (make.count(k))
             need.insert(k);
@@ -8083,13 +8194,16 @@ void Client::emit(const Plan &P, Module &H) const {
     // callback of its type — the reader that delivers the input, the
     // seeker/teller that move its cursor. Fill each that the producer left
     // null (select, not a fork: no new choice, the seed path is unchanged).
+    // A field whose type the client has no callback of (a by-value aggregate
+    // parameter has no IR type) keeps the producer's value: filling it must
+    // not end the path on which the producer succeeded.
     if (auto cit = composite.find(h.first); cit != composite.end())
       for (const DIDerivedType *M : members(cit->second)) {
         const DIType *BT = strip(M->getBaseType());
         if (!isPointer(BT))
           continue;
         const DIType *Pointee = strip(cast<DIDerivedType>(BT)->getBaseType());
-        if (!Pointee || !isa<DISubroutineType>(Pointee))
+        if (!Pointee || !isa<DISubroutineType>(Pointee) || !fnTypeOf(M->getBaseType()))
           continue;
         int64_t o = (int64_t)(M->getOffsetInBits() / 8);
         Value *slot = X.CreateGEP(X.getInt8Ty(), got, X.getInt64(o));

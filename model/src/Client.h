@@ -183,6 +183,9 @@ public:
     Function *by = nullptr;
     // For an open cell, the condition that left it open.
     std::string why;
+    // §3.11 실현 기록: a root-level File record, not an obligation. Only the
+    // report reads it; the harness, grammar and install test do not.
+    bool record = false;
   };
   struct WitnessPlan {
     Function *first = nullptr;
@@ -327,8 +330,11 @@ public:
   void emit(const Plan &P, Module &H) const;
   // The entries main offers, seed (choice 0) first: the entry whose seed
   // path is seedable (reaches its call) and realizes the most sink facts
-  // (§3.12 sinkdep, 정의 R), then the shortest witness.
+  // (§3.12 sinkdep, 정의 R), then File cells (Λ2 / sinkdep file), then the
+  // shortest witness.
   std::vector<Function *> seedOrder(const Plan &P) const;
+  // Definition 4 call cost: used by Model::findStarts' B_entry midpoint test.
+  unsigned callCost(Function *F) const;
   // §4 시드 가능: whether the emitted seed body of an entry reaches the
   // entry call (no constant-false require). emit() fills it before taking
   // the final order; empty until then (every entry counts as seedable).
@@ -431,8 +437,6 @@ private:
   bool opensFile(Function *F) const { return channel(F) != Channel::None; }
   // The pointer formals of F that integer formal j bounds (A3).
   std::vector<unsigned> boundBy(Function *F, unsigned j) const;
-  // 1 + the cost of the held inputs of a call of F (Definition 4).
-  unsigned callCost(Function *F) const;
   // The values a call of F leaves to the client's choice: its formals that
   // are neither held nor out.
   unsigned freeArgs(Function *F) const;

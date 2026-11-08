@@ -500,6 +500,10 @@ class Model {
   // Definition D; those hops are banned and the search continues.
   std::function<std::vector<std::pair<std::string, std::string>>(const std::vector<Function *> &)>
       openDispatch;
+  // §3.12 / B_entry: held-setup cost of an I★ start (Client::callCost). When
+  // set, an interface caller in R(s) disqualifies f as a midpoint only if
+  // its cost is ≤ f's — a heavier caller is not a simpler public origin.
+  std::function<unsigned(Function *)> startCost;
   Model(Module &down, Module &up, StringRef file, unsigned line) : down(down), up(up), dl(down.getDataLayout()), sinkFile(file), sinkLine(line) {}
   // A prepared model aimed at another sink. The index is a function of the
   // modules and interfaceNames only, so the copy runs without rebuilding it;

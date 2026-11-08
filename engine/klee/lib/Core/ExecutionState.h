@@ -298,10 +298,16 @@ public:
   /// the search may switch from approaching St to approaching the sink.
   bool stInstalled = false;
 
-  /// @brief Concolic mode: an input of the state this pending state was split
-  /// from. Its model keeps these bytes wherever the path condition does not
-  /// read them (Executor::solveInput).
-  std::shared_ptr<const Assignment> parentInput;
+  /// @brief Concolic mode: the data bytes (data and length objects) of an
+  /// input of the state this pending state was split from. Its model keeps
+  /// these bytes wherever the path condition does not read them
+  /// (Executor::solveInput). The buffers are shared by content
+  /// (Executor::snapshotInput): a fork of a seeded state copies no input
+  /// bytes, so pending and deferred states cost no memory in the input size.
+  typedef std::map<const Array *,
+                   std::shared_ptr<const std::vector<unsigned char>>>
+      InputSnapshot;
+  std::shared_ptr<const InputSnapshot> parentInput;
 
   /// @brief Mapping symbolic address expressions to concrete base addresses
   using base_addrs_t = std::map<ref<Expr>, ref<ConstantExpr>>;

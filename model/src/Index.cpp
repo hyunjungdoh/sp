@@ -2295,11 +2295,16 @@ std::unordered_set<Function *> Model::reachSink() {
   }
 
 std::vector<Function *> Model::findStarts() {
-    // B_entry = { f ∈ I★ ∩ R(s) | ∄ c ∈ R(s) ∩ I : (c → f) ∈ E }.
+    // B_entry = { f ∈ I★ ∩ R(s) | ∄ c ∈ R(s) ∩ I : (c → f) ∈ E ∧ cost(c) < cost(f) }.
     // I★ = startNames when set (entryCallable subset of I); else I.
     // Only another interface symbol may witness that f is a midpoint: a
     // non-interface caller in R(s) is library-internal and must not
-    // disqualify a public origin.
+    // disqualify a public origin. An equal-or-heavier interface caller
+    // also must not: §3.12 wants the simplest public origin of s, and a
+    // same-cost caller that needs a different held ADT is not evidence
+    // that f is dispensable (24757: heif_region_get_mask_image calls
+    // heif_decode_image; both callCost 4 under ≤, so decode_image was
+    // still dropped while the PoC is still-HEIC + decode_image).
     std::vector<Function *> v;
     if (exactStarts) {
       for (const std::string &n : startNames)
@@ -2307,16 +2312,22 @@ std::vector<Function *> Model::findStarts() {
           v.push_back(F);
       return v;
     }
+    auto costOf = [&](Function *F) -> unsigned { return startCost ? startCost(F) : 0; };
     for (Function *E : exports) {
       if (!cone.count(E) || (!startNames.empty() && !startNames.count(E->getName().str())))
         continue;
       bool inside = false;
+      unsigned eCost = costOf(E);
       auto it = callersOf.find(E);
       if (it != callersOf.end())
         for (Function *C : it->second) {
           if (!cone.count(C))
             continue;
           if (!interfaceNames.empty() && !interfaceNames.count(C->getName().str()))
+            continue;
+          // Strictly cheaper caller only. Equal cost keeps f (same-cost
+          // wrappers with different held types must both stay as origins).
+          if (startCost && costOf(C) >= eCost)
             continue;
           inside = true;
           break;
